@@ -88,7 +88,7 @@ Transfer column = what a gzipping static host would send (measured offline, size
   async function runDuckdb(dicts, verify) {
     const t0 = performance.now();
     const duckdb = await import("./node_modules/@duckdb/duckdb-wasm/dist/duckdb-browser.mjs");
-    const base = "./node_modules/@duckdb/duckdb-wasm/dist/";
+    const base = new URL("./node_modules/@duckdb/duckdb-wasm/dist/", location.href).href;
     const bundle = await duckdb.selectBundle({
       mvp: { mainModule: base + "duckdb-mvp.wasm", mainWorker: base + "duckdb-browser-mvp.worker.js" },
       eh: { mainModule: base + "duckdb-eh.wasm", mainWorker: base + "duckdb-browser-eh.worker.js" },
