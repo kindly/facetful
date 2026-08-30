@@ -11,6 +11,15 @@
   .muted { opacity: .65; font-size: .85em; }
   #status { margin-left: .75rem; }
 </style>
+<script type="importmap">
+{
+  "imports": {
+    "apache-arrow": "./node_modules/@duckdb/duckdb-wasm/node_modules/apache-arrow/Arrow.dom.mjs",
+    "flatbuffers": "./node_modules/@duckdb/duckdb-wasm/node_modules/flatbuffers/mjs/flatbuffers.js",
+    "tslib": "./node_modules/tslib/tslib.es6.mjs"
+  }
+}
+</script>
 <h1>facetful — M1 spike benchmark</h1>
 <p>200K-row synthetic facet workload: per interaction, <strong>correct filters-except-own
 facet counts over 6 dimensions + totals + top-50 sort</strong>. Lanes are verified to
