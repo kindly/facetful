@@ -1,9 +1,11 @@
-// Generate spikes/facet-spike/data-200000.parquet using hyparquet-writer
+// Generate spikes/facet-spike/data-${N}.parquet using hyparquet-writer
 // (snappy-free default; a typical published parquet file).
 import { readFileSync, writeFileSync } from "node:fs";
 import { parquetWriteBuffer } from "hyparquet-writer";
 
-const csv = readFileSync(new URL("../../spikes/facet-spike/data-200000.csv", import.meta.url), "utf8");
+const N = process.argv[2] || "200000";
+
+const csv = readFileSync(new URL(`../../spikes/facet-spike/data-${N}.csv`, import.meta.url), "utf8");
 const lines = csv.trim().split("\n");
 const header = lines[0].split(",");
 const cols = header.map(() => []);
@@ -17,5 +19,5 @@ const columnData = header.map((name, c) => {
   return { name, data: cols[c], type: "STRING" };
 });
 const buf = parquetWriteBuffer({ columnData });
-writeFileSync(new URL("../../spikes/facet-spike/data-200000.parquet", import.meta.url), new Uint8Array(buf));
-console.log(`data-200000.parquet: ${buf.byteLength} bytes`);
+writeFileSync(new URL(`../../spikes/facet-spike/data-${N}.parquet`, import.meta.url), new Uint8Array(buf));
+console.log(`data-${N}.parquet: ${buf.byteLength} bytes`);

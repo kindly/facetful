@@ -14,11 +14,12 @@ let facLane = null;
 self.onmessage = async (e) => {
   try {
     if (e.data.cmd === "run") {
+      const n = e.data.n || 200000;
       status("fetching assets…");
       const [wasmRes, fileRes, csvRes, cfRes] = await Promise.all([
         fetch("/target/wasm32-unknown-unknown/release/facetful_wasm.wasm"),
-        fetch("/spikes/facet-spike/data-200000.facetful"),
-        fetch("/spikes/facet-spike/data-200000.csv"),
+        fetch(`/spikes/facet-spike/data-${n}.facetful`),
+        fetch(`/spikes/facet-spike/data-${n}.csv`),
         fetch("/web/spike-bench/node_modules/crossfilter2/crossfilter.min.js"),
       ]);
       const wasmBytes = await wasmRes.arrayBuffer();

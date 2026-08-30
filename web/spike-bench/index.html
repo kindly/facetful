@@ -26,6 +26,7 @@ facet counts over 6 dimensions + totals + top-50 sort</strong>. Lanes are verifi
 produce identical counts before timing. DuckDB runs via its own worker machinery
 (async query round trips — its real interface); everything else runs in one module worker.</p>
 <p>
+  <select id="nsel"><option value="200000" selected>200,000 rows</option><option value="1000000">1,000,000 rows</option></select>
   <button id="run">Run benchmark</button>
   <label class="muted"><input type="checkbox" id="withDuck" checked> include DuckDB-WASM reference</label>
   <span id="status" class="muted"></span>
@@ -51,14 +52,16 @@ Transfer column = what a gzipping static host would send (measured offline, size
   const status = (m) => (el("status").textContent = m);
   let payload = { results: [] };
   let sizes = {};
+  let curN = "200000";
   const MBPS_4G = 9e6 / 8; // bytes/sec
 
   const laneTransfer = (name) => {
-    if (name.startsWith(".facetful")) return sizes.facetfulGz + sizes.engineWasmGz;
-    if (name.startsWith("JS objects")) return sizes.csvGz;
-    if (name.startsWith("crossfilter")) return sizes.csvGz + sizes.crossfilterGz;
-    if (name.startsWith("parquet")) return (sizes.parquetGz || 0) + sizes.hyparquetGz;
-    if (name.startsWith("DuckDB")) return sizes.csvGz + sizes.duckdbGz;
+    const ds = (sizes.datasets || {})[curN] || {};
+    if (name.startsWith(".facetful")) return ds.facetfulGz + sizes.engineWasmGz;
+    if (name.startsWith("JS objects")) return ds.csvGz;
+    if (name.startsWith("crossfilter")) return ds.csvGz + sizes.crossfilterGz;
+    if (name.startsWith("parquet")) return (ds.parquetGz || 0) + sizes.hyparquetGz;
+    if (name.startsWith("DuckDB")) return ds.csvGz + sizes.duckdbGz;
     return 0;
   };
 
@@ -96,7 +99,7 @@ Transfer column = what a gzipping static host would send (measured offline, size
     const w = new Worker(bundle.mainWorker);
     const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), w);
     await db.instantiate(bundle.mainModule);
-    const csv = await (await fetch("/spikes/facet-spike/data-200000.csv")).arrayBuffer();
+    const csv = await (await fetch(`/spikes/facet-spike/data-${curN}.csv`)).arrayBuffer();
     await db.registerFileBuffer("data.csv", new Uint8Array(csv));
     const conn = await db.connect();
     await conn.query(`CREATE TABLE t AS SELECT * FROM read_csv_auto('data.csv')`);
@@ -166,8 +169,9 @@ Transfer column = what a gzipping static host would send (measured offline, size
     el("results").hidden = true;
     payload = { results: [] };
     sizes = await (await fetch("./sizes.json")).json().catch(() => ({}));
+    curN = el("nsel").value;
     status("starting worker lanes…");
-    worker.postMessage({ cmd: "run" });
+    worker.postMessage({ cmd: "run", n: curN });
   };
 
   worker.onmessage = async (e) => {
@@ -185,7 +189,7 @@ Transfer column = what a gzipping static host would send (measured offline, size
         `${d.meta.rows.toLocaleString()} rows · engine wasm ${(d.meta.wasmBytes / 1024).toFixed(1)} KB raw · ${d.meta.ua}`;
 
       // hyparquet lane (needs the pre-generated parquet file)
-      const pq = await fetch("/spikes/facet-spike/data-200000.parquet");
+      const pq = await fetch(`/spikes/facet-spike/data-${curN}.parquet`);
       if (pq.ok) {
         const buf = await pq.arrayBuffer();
         worker.postMessage({ cmd: "hyparquet", parquet: buf }, [buf]);
@@ -212,7 +216,7 @@ Transfer column = what a gzipping static host would send (measured offline, size
       status("DuckDB reference lane: loading (large download)…");
       // cheap local recompute for verification: use the js-objects lane in-page
       const { laneJsObjects } = await import("./lanes.js");
-      const csvText = await (await fetch("/spikes/facet-spike/data-200000.csv")).text();
+      const csvText = await (await fetch(`/spikes/facet-spike/data-${curN}.csv`)).text();
       const jso = laneJsObjects(csvText);
       const duck = await runDuckdb(laneData.dicts, (sel) => {
         const r = jso.interact(sel);

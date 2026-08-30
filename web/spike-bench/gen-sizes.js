@@ -14,14 +14,20 @@ const hyGz = readdirSync(hySrc)
   .filter((f) => f.endsWith(".js"))
   .reduce((a, f) => a + gz(new URL(f, hySrc)), 0);
 
-const parquetPath = new URL("spikes/facet-spike/data-200000.parquet", root);
+const datasets = {};
+for (const N of ["200000", "1000000"]) {
+  const pq = new URL(`spikes/facet-spike/data-${N}.parquet`, root);
+  datasets[N] = {
+    csvGz: gz(new URL(`spikes/facet-spike/data-${N}.csv`, root)),
+    facetfulGz: gz(new URL(`spikes/facet-spike/data-${N}.facetful`, root)),
+    parquetGz: existsSync(pq) ? gz(pq) : null,
+  };
+}
 const sizes = {
-  csvGz: gz(new URL("spikes/facet-spike/data-200000.csv", root)),
-  facetfulGz: gz(new URL("spikes/facet-spike/data-200000.facetful", root)),
+  datasets,
   engineWasmGz: gz(new URL("target/wasm32-unknown-unknown/release/facetful_wasm.wasm", root)),
   crossfilterGz: gz(new URL("./node_modules/crossfilter2/crossfilter.min.js", import.meta.url)),
   hyparquetGz: hyGz,
-  parquetGz: existsSync(parquetPath) ? gz(parquetPath) : null,
   duckdbGz: gz(dd("duckdb-eh.wasm")) + gz(dd("duckdb-browser.mjs")) + gz(dd("duckdb-browser-eh.worker.js")),
 };
 writeFileSync(new URL("./sizes.json", import.meta.url), JSON.stringify(sizes, null, 2));
