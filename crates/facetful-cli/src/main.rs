@@ -71,9 +71,10 @@ fn parse_csv(data: &str) -> (Vec<String>, Vec<Vec<String>>) {
 // ---------------- inference ----------------
 
 enum Typed {
-    /// Integers plus the narrowest type that fits.
-    Int(Vec<i64>, ColumnType),
-    Float(Vec<f64>),
+    /// Integers plus the narrowest type that fits; valid[i] = false means null
+    /// (empty CSV cell) and the value is a 0 placeholder.
+    Int(Vec<i64>, ColumnType, Option<Vec<bool>>),
+    Float(Vec<f64>, Option<Vec<bool>>),
     Dict { codes: Vec<u16>, dict: Vec<String> },
     Text(Vec<String>),
 }
@@ -91,9 +92,16 @@ fn narrowest_int(min: i64, max: i64) -> ColumnType {
 }
 
 fn infer_column(values: Vec<String>) -> Typed {
+    // Empty cells are nulls for numeric columns; for string columns the empty
+    // string is just a dictionary value (facet UIs show a "(blank)" bucket).
     let mut all_int = true;
     let mut all_float = true;
+    let mut non_empty = 0usize;
     for v in &values {
+        if v.is_empty() {
+            continue;
+        }
+        non_empty += 1;
         if all_int && v.parse::<i64>().is_err() {
             all_int = false;
         }
@@ -104,14 +112,22 @@ fn infer_column(values: Vec<String>) -> Typed {
             break;
         }
     }
-    if all_int {
-        let ints: Vec<i64> = values.iter().map(|v| v.parse().unwrap()).collect();
-        let min = ints.iter().copied().min().unwrap_or(0);
-        let max = ints.iter().copied().max().unwrap_or(0);
-        return Typed::Int(ints, narrowest_int(min, max));
+    let has_nulls = non_empty < values.len();
+    let valids = || -> Option<Vec<bool>> {
+        if has_nulls { Some(values.iter().map(|v| !v.is_empty()).collect()) } else { None }
+    };
+    if all_int && non_empty > 0 {
+        let ints: Vec<i64> =
+            values.iter().map(|v| if v.is_empty() { 0 } else { v.parse().unwrap() }).collect();
+        let present = ints.iter().zip(&values).filter(|(_, v)| !v.is_empty());
+        let min = present.clone().map(|(i, _)| *i).min().unwrap_or(0);
+        let max = present.map(|(i, _)| *i).max().unwrap_or(0);
+        return Typed::Int(ints, narrowest_int(min, max), valids());
     }
-    if all_float {
-        return Typed::Float(values.iter().map(|v| v.parse().unwrap()).collect());
+    if all_float && non_empty > 0 {
+        let floats: Vec<f64> =
+            values.iter().map(|v| if v.is_empty() { 0.0 } else { v.parse().unwrap() }).collect();
+        return Typed::Float(floats, valids());
     }
     // distinct count for dictionary decision
     let mut index: HashMap<String, u16> = HashMap::new();
@@ -199,8 +215,8 @@ fn convert(args: &[String]) {
             .zip(&typed)
             .map(|(name, t)| {
                 let (ty, flags) = match t {
-                    Typed::Int(_, ty) => (*ty, 0),
-                    Typed::Float(_) => (ColumnType::Float64, 0),
+                    Typed::Int(_, ty, _) => (*ty, 0),
+                    Typed::Float(_, _) => (ColumnType::Float64, 0),
                     Typed::Dict { dict, .. } => (
                         ColumnType::Utf8,
                         fmt::flags::DICTIONARY
@@ -214,8 +230,14 @@ fn convert(args: &[String]) {
     };
     for (c, t) in schema.columns.iter().zip(&typed) {
         let kind = match t {
-            Typed::Int(_, ty) => format!("{ty:?}").to_lowercase(),
-            Typed::Float(_) => "float64".into(),
+            Typed::Int(_, ty, nulls) => format!(
+                "{}{}",
+                format!("{ty:?}").to_lowercase(),
+                if nulls.is_some() { " (nullable)" } else { "" }
+            ),
+            Typed::Float(_, nulls) => {
+                format!("float64{}", if nulls.is_some() { " (nullable)" } else { "" })
+            }
             Typed::Dict { dict, .. } => format!(
                 "utf8/dict[{}] (u{} codes)",
                 dict.len(),
@@ -246,13 +268,19 @@ fn convert(args: &[String]) {
             .iter()
             .zip(&schema.columns)
             .map(|(t, def)| match t {
-                Typed::Int(v, ty) => OwnedChunk::Fixed(match ty {
-                    ColumnType::Int8 => v[start..end].iter().map(|&x| x as i8 as u8).collect(),
-                    ColumnType::Int16 => v[start..end].iter().flat_map(|&x| (x as i16).to_le_bytes()).collect(),
-                    ColumnType::Int32 => v[start..end].iter().flat_map(|&x| (x as i32).to_le_bytes()).collect(),
-                    _ => v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect(),
-                }),
-                Typed::Float(v) => OwnedChunk::Fixed(v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect()),
+                Typed::Int(v, ty, nulls) => OwnedChunk::Fixed(
+                    match ty {
+                        ColumnType::Int8 => v[start..end].iter().map(|&x| x as i8 as u8).collect(),
+                        ColumnType::Int16 => v[start..end].iter().flat_map(|&x| (x as i16).to_le_bytes()).collect(),
+                        ColumnType::Int32 => v[start..end].iter().flat_map(|&x| (x as i32).to_le_bytes()).collect(),
+                        _ => v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect(),
+                    },
+                    validity_bitmap(nulls, start, end),
+                ),
+                Typed::Float(v, nulls) => OwnedChunk::Fixed(
+                    v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect(),
+                    validity_bitmap(nulls, start, end),
+                ),
                 Typed::Dict { codes, .. } => {
                     if def.code_width() == 1 {
                         OwnedChunk::Codes8(codes[start..end].iter().map(|&c| c as u8).collect())
@@ -268,15 +296,23 @@ fn convert(args: &[String]) {
             .collect();
         let chunks: Vec<ColumnChunk> = owned
             .iter()
-            .map(|o| ColumnChunk {
-                data: match o {
-                    OwnedChunk::Fixed(b) => SegmentData::Fixed(b),
-                    OwnedChunk::Codes8(c) => SegmentData::Codes8(c),
-                    OwnedChunk::Codes16(c) => SegmentData::Codes16(c),
-                    OwnedChunk::Utf8 { off, bytes } => SegmentData::Utf8 { offsets: off, bytes },
-                },
-                validity: None,
-                null_count: 0,
+            .map(|o| {
+                let (data, validity) = match o {
+                    OwnedChunk::Fixed(b, v) => (SegmentData::Fixed(b), v.as_ref()),
+                    OwnedChunk::Codes8(c) => (SegmentData::Codes8(c), None),
+                    OwnedChunk::Codes16(c) => (SegmentData::Codes16(c), None),
+                    OwnedChunk::Utf8 { off, bytes } => {
+                        (SegmentData::Utf8 { offsets: off, bytes }, None)
+                    }
+                };
+                let null_count = validity
+                    .map(|(bits, nulls)| *nulls)
+                    .unwrap_or(0);
+                ColumnChunk {
+                    data,
+                    validity: validity.map(|(bits, _)| bits.as_slice()),
+                    null_count,
+                }
             })
             .collect();
         w.write_group(rows_here as u32, &chunks);
@@ -288,10 +324,29 @@ fn convert(args: &[String]) {
 }
 
 enum OwnedChunk {
-    Fixed(Vec<u8>),
+    /// data bytes + optional (validity bitmap, null count) for this group slice
+    Fixed(Vec<u8>, Option<(Vec<u8>, u32)>),
     Codes8(Vec<u8>),
     Codes16(Vec<u16>),
     Utf8 { off: Vec<u32>, bytes: Vec<u8> },
+}
+
+/// Bitmap for rows [start, end) of a column's valid flags; None if that slice
+/// has no nulls.
+fn validity_bitmap(valids: &Option<Vec<bool>>, start: usize, end: usize) -> Option<(Vec<u8>, u32)> {
+    let valids = valids.as_ref()?;
+    let slice = &valids[start..end];
+    let nulls = slice.iter().filter(|&&v| !v).count() as u32;
+    if nulls == 0 {
+        return None;
+    }
+    let mut bits = vec![0u8; (slice.len() + 7) / 8];
+    for (i, &v) in slice.iter().enumerate() {
+        if v {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+    }
+    Some((bits, nulls))
 }
 
 // ---------------- inspect ----------------

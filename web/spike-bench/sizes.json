@@ -1,17 +1,17 @@
 {
   "datasets": {
     "200000": {
-      "csvGz": 2708356,
-      "facetfulGz": 1815989,
-      "parquetGz": 1643227
+      "csvGz": 2695737,
+      "facetfulGz": 1816846,
+      "parquetGz": 1628284
     },
     "1000000": {
-      "csvGz": 13550597,
-      "facetfulGz": 9024013,
-      "parquetGz": 8175678
+      "csvGz": 13489096,
+      "facetfulGz": 9042284,
+      "parquetGz": 8098837
     }
   },
-  "engineWasmGz": 20515,
+  "engineWasmGz": 20954,
   "crossfilterGz": 5739,
   "hyparquetGz": 52438,
   "duckdbGz": 8260651

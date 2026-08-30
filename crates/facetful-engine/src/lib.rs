@@ -84,6 +84,14 @@ impl<S: ReadAt> Table<S> {
         })
     }
 
+    /// Validity bitmap for (group, col): None when the chunk has no nulls.
+    fn validity(&mut self, group: usize, col: usize) -> Result<Option<Vec<u8>>, FormatError> {
+        if self.cat.groups[group].cols[col].null_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.segment(group, col, 2)?.to_vec()))
+    }
+
     fn f64s(&mut self, group: usize, col: usize) -> Result<Vec<f64>, FormatError> {
         debug_assert_eq!(self.cat.schema.columns[col].ty, ColumnType::Float64);
         let rows = self.cat.groups[group].row_count as usize;
@@ -149,6 +157,9 @@ impl<S: ReadAt> Table<S> {
                 .map(|&c| self.codes(g, c))
                 .collect::<Result<_, _>>()?;
             let measure = self.f64s(g, q.measure)?;
+            let mvalid = self.validity(g, q.measure)?;
+            let is_valid =
+                |row: usize| mvalid.as_ref().map_or(true, |v| v[row / 8] & (1 << (row % 8)) != 0);
 
             for row in 0..rows {
                 let mut fails = 0u32;
@@ -167,7 +178,9 @@ impl<S: ReadAt> Table<S> {
                 if fails == 0 {
                     mask[base + row] = 1;
                     pass_count += 1;
-                    sum += measure[row];
+                    if is_valid(row) {
+                        sum += measure[row]; // SQL sum(): nulls don't contribute
+                    }
                     for k in 0..d {
                         counts[k][dim_codes[k][row] as usize] += 1;
                     }
@@ -189,8 +202,12 @@ impl<S: ReadAt> Table<S> {
         for g in 0..self.cat.groups.len() {
             let rows = self.cat.groups[g].row_count as usize;
             let vals = self.f64s(g, by)?;
+            let valid = self.validity(g, by)?;
             for row in 0..rows {
-                if mask[base + row] != 0 {
+                if mask[base + row] != 0
+                    && valid.as_ref().map_or(true, |v| v[row / 8] & (1 << (row % 8)) != 0)
+                {
+                    // nulls sort last in DESC (SQLite semantics) — beyond top-k they vanish
                     pairs.push((vals[row], (base + row) as u32));
                 }
             }

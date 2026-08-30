@@ -27,38 +27,48 @@ self.onmessage = async (e) => {
       const csvText = await csvRes.text();
       (0, eval)(await cfRes.text()); // UMD -> self.crossfilter
 
-      status("loading lanes…");
+      const heap = () => (performance.memory ? performance.memory.usedJSHeapSize : null);
+
+      // facetful first (cold), kept alive as the correctness reference
+      status("benchmarking .facetful → wasm…");
+      const h0 = heap();
       const fac = await laneFacetful(wasmBytes, fileBytes);
       facLane = fac;
       facDicts = fac.dicts;
-      const jso = laneJsObjects(csvText);
-      const cfl = await laneCrossfilter(csvText, self.crossfilter);
-
       const script = makeScript(fac.dicts, 140);
+      const rFac = runScript(fac, script);
+      const results = [{
+        name: rFac.name, loadMs: fac.loadMs, firstMs: rFac.firstMs,
+        median: rFac.median, p95: rFac.p95,
+        heapMB: heap() !== null && h0 !== null ? (heap() - h0) / 1048576 : null,
+        wasmMB: fac.wasmMemoryBytes ? fac.wasmMemoryBytes() / 1048576 : null,
+      }];
 
-      // benchmark BEFORE verification so each lane's first query is honestly cold
-      const results = [];
-      for (const lane of [jso, cfl, fac]) {
-        status(`benchmarking ${lane.name}…`);
+      // other lanes: create -> bench -> verify vs facetful -> drop (heap honesty)
+      const others = [
+        ["JS objects", () => laneJsObjects(csvText)],
+        ["crossfilter2", async () => laneCrossfilter(csvText, self.crossfilter)],
+      ];
+      for (const [label, make] of others) {
+        status(`benchmarking ${label}…`);
         await new Promise((r) => setTimeout(r, 30));
+        const hBefore = heap();
+        let lane = await make();
         const r = runScript(lane, script);
+        const hAfter = heap();
+        for (const i of [0, 60, 119]) {
+          const err = sameResult(fac.interact(script[i]), fac.dicts, lane.interact(script[i]), lane.dicts);
+          if (err) throw new Error(`facetful vs ${label} @${i}: ${err}`);
+        }
         results.push({
-          name: r.name,
-          loadMs: lane.loadMs,
-          firstMs: r.firstMs,
-          median: r.median,
-          p95: r.p95,
+          name: r.name, loadMs: lane.loadMs, firstMs: r.firstMs,
+          median: r.median, p95: r.p95,
+          heapMB: hAfter !== null && hBefore !== null ? (hAfter - hBefore) / 1048576 : null,
         });
+        lane = null;
       }
-
-      status("verifying correctness…");
-      for (const i of [0, 7, 60, 119]) {
-        const a = fac.interact(script[i]);
-        let err = sameResult(a, fac.dicts, jso.interact(script[i]), jso.dicts);
-        if (err) throw new Error(`facetful vs js-objects @${i}: ${err}`);
-        err = sameResult(a, fac.dicts, cfl.interact(script[i]), cfl.dicts);
-        if (err) throw new Error(`facetful vs crossfilter @${i}: ${err}`);
-      }
+      // stable presentation order: JS objects, crossfilter, facetful
+      results.push(results.shift());
       postMessage({
         type: "lanes-done",
         results,
@@ -76,20 +86,27 @@ self.onmessage = async (e) => {
     if (e.data.cmd === "hyparquet") {
       const script = makeScript(facDicts, 140);
       const out = [];
+      const heap = () => (performance.memory ? performance.memory.usedJSHeapSize : null);
       for (const [label, maker] of [
         ["objects", laneHyparquet],
         ["column chunks", laneHyparquetChunks],
       ]) {
         status(`hyparquet (${label}): decoding parquet…`);
-        const lane = await maker(e.data.parquet.slice(0), hyparquet);
+        const hBefore = heap();
+        let lane = await maker(e.data.parquet.slice(0), hyparquet);
         status(`benchmarking hyparquet (${label})…`);
         const r = runScript(lane, script);
+        const hAfter = heap();
         if (facLane) {
           const a = facLane.interact(script[60]);
           const err = sameResult(a, facDicts, lane.interact(script[60]), lane.dicts);
           if (err) throw new Error(`facetful vs hyparquet (${label}) @60: ${err}`);
         }
-        out.push({ name: r.name, loadMs: lane.loadMs, firstMs: r.firstMs, median: r.median, p95: r.p95 });
+        out.push({
+          name: r.name, loadMs: lane.loadMs, firstMs: r.firstMs, median: r.median, p95: r.p95,
+          heapMB: hAfter !== null && hBefore !== null ? (hAfter - hBefore) / 1048576 : null,
+        });
+        lane = null;
       }
       postMessage({ type: "hyparquet-done", results: out });
     }

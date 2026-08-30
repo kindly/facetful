@@ -97,6 +97,7 @@ export async function laneFacetful(wasmBytes, fileBytes) {
     name: ".facetful → wasm engine",
     loadMs,
     dicts,
+    wasmMemoryBytes: () => w.memory.buffer.byteLength,
     meta: { rows: w.table_total_rows(table), fileBytes: fileBytes.byteLength },
     interact(values) {
       const lens = new Uint32Array(mem(), selLensPtr, nd);
@@ -137,7 +138,7 @@ export function parseCsv(text) {
     const parts = lines[i].split(",");
     const o = {};
     for (let c = 0; c < header.length; c++) o[header[c]] = parts[c];
-    o[MEASURE] = +o[MEASURE];
+    o[MEASURE] = parts[header.indexOf(MEASURE)] === "" ? NaN : +o[MEASURE]; // empty cell = null
     rows[i - 1] = o;
   }
   return rows;
@@ -183,11 +184,13 @@ export function laneJsObjects(csvText) {
           if (sets[j] !== null && !sets[j].has(r[DIM_NAMES[j]])) continue outer;
         }
         pass++;
-        sum += r[MEASURE];
+        const m = r[MEASURE];
+        if (!Number.isNaN(m)) sum += m; // sum() skips nulls
         filtered.push(r);
       }
-      filtered.sort((a, b) => b[MEASURE] - a[MEASURE]);
-      const top = filtered.slice(0, TOPK);
+      const sortable = filtered.filter((r) => !Number.isNaN(r[MEASURE]));
+      sortable.sort((a, b) => b[MEASURE] - a[MEASURE]);
+      const top = sortable.slice(0, TOPK);
       // normalize counts to arrays in dict order for comparison
       const countArrays = counts.map((m, k) => dicts[k].map((v) => m.get(v) || 0));
       return { pass, sum, counts: countArrays, top };
@@ -203,10 +206,11 @@ export async function laneCrossfilter(csvText, crossfilterFactory) {
   const cf = crossfilterFactory(rows);
   const dims = DIM_NAMES.map((d) => cf.dimension((r) => r[d]));
   const groups = dims.map((d) => d.group());
-  const measureDim = cf.dimension((r) => r[MEASURE]);
+  // NaN (null) breaks crossfilter's ordering — dimension on -Infinity instead
+  const measureDim = cf.dimension((r) => (Number.isNaN(r[MEASURE]) ? -Infinity : r[MEASURE]));
   const totals = cf.groupAll().reduce(
-    (p, r) => ({ n: p.n + 1, s: p.s + r[MEASURE] }),
-    (p, r) => ({ n: p.n - 1, s: p.s - r[MEASURE] }),
+    (p, r) => ({ n: p.n + 1, s: p.s + (Number.isNaN(r[MEASURE]) ? 0 : r[MEASURE]) }),
+    (p, r) => ({ n: p.n - 1, s: p.s - (Number.isNaN(r[MEASURE]) ? 0 : r[MEASURE]) }),
     () => ({ n: 0, s: 0 }),
   );
   const dicts = DIM_NAMES.map((d, k) => groups[k].all().map((g) => g.key));
@@ -321,7 +325,8 @@ function typedFacetLane(name, loadMs, n, dicts, codesArr, measure) {
         if (fails === 0) {
           mask[row] = 1;
           pass++;
-          sum += measure[row];
+          const m = measure[row];
+          if (!Number.isNaN(m)) sum += m; // sum() skips nulls
           for (let k = 0; k < nd; k++) counts[k][codesArr[k][row]]++;
         } else {
           mask[row] = 0;
@@ -329,7 +334,9 @@ function typedFacetLane(name, loadMs, n, dicts, codesArr, measure) {
         }
       }
       const idx = [];
-      for (let row = 0; row < n; row++) if (mask[row]) idx.push(row);
+      for (let row = 0; row < n; row++) {
+        if (mask[row] && !Number.isNaN(measure[row])) idx.push(row);
+      }
       idx.sort((a, b) => measure[b] - measure[a]);
       const top = idx.slice(0, TOPK);
       return { pass, sum, counts: counts.map((c) => Array.from(c)), top };
@@ -361,7 +368,10 @@ export async function laneHyparquet(parquetBuffer, hp) {
     codesArr.push(codes);
   }
   const measure = new Float64Array(n);
-  for (let i = 0; i < n; i++) measure[i] = Number(rows[i][MEASURE]);
+  for (let i = 0; i < n; i++) {
+    const raw = rows[i][MEASURE];
+    measure[i] = raw == null ? NaN : Number(raw);
+  }
   const loadMs = performance.now() - t0;
   return typedFacetLane(
     "parquet → hyparquet (objects) → JS kernels", loadMs, n, dicts, codesArr, measure,
@@ -385,7 +395,10 @@ export async function laneHyparquetChunks(parquetBuffer, hp) {
     onChunk(chunk) {
       const { columnName, columnData, rowStart } = chunk;
       if (columnName === MEASURE) {
-        for (let i = 0; i < columnData.length; i++) measure[rowStart + i] = Number(columnData[i]);
+        for (let i = 0; i < columnData.length; i++) {
+          const raw = columnData[i];
+          measure[rowStart + i] = raw == null ? NaN : Number(raw);
+        }
         return;
       }
       const k = dimIdx.get(columnName);

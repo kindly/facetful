@@ -36,13 +36,15 @@ produce identical counts before timing. DuckDB runs via its own worker machinery
     <tr><th>lane</th><th class="num">transfer (gz)</th><th class="num">load</th>
         <th class="num">first query</th>
         <th class="num">est. cold @ 4G*</th>
-        <th class="num">interaction median</th><th class="num">p95</th><th class="num">vs JS objects</th></tr>
+        <th class="num">interaction median</th><th class="num">p95</th><th class="num">mem Δ†</th><th class="num">vs JS objects</th></tr>
   </thead>
   <tbody></tbody>
 </table>
 <p class="muted">*estimated: gzipped asset bytes at 9 Mbps + measured load/init + the cold FIRST query — an
 approximation of a first visit on a mid 4G connection through to first correct facets; local serving hides real network cost.
-Transfer column = what a gzipping static host would send (measured offline, sizes.json).</p>
+Transfer column = what a gzipping static host would send (measured offline, sizes.json).
+†mem Δ: JS-heap growth across the lane's load+bench (Chrome only, no forced GC — approximate);
+for the wasm lane, its linear-memory size is shown where heap data is unavailable.</p>
 <p id="meta" class="muted"></p>
 <p><button id="copy" hidden>Copy results JSON</button></p>
 <script type="module">
@@ -82,6 +84,7 @@ Transfer column = what a gzipping static host would send (measured offline, size
         `<td class="num">${(cold / 1000).toFixed(2)} s</td>` +
         `<td class="num"><strong>${r.median.toFixed(2)} ms</strong></td>` +
         `<td class="num">${r.p95.toFixed(2)} ms</td>` +
+        `<td class="num">${r.heapMB != null ? r.heapMB.toFixed(0) + " MB" : r.wasmMB != null ? r.wasmMB.toFixed(0) + " MB (wasm)" : "—"}</td>` +
         `<td class="num">${base ? (base.median / r.median).toFixed(1) + "×" : "—"}</td>`;
       tb.appendChild(tr);
     }

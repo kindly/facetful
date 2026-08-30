@@ -14,7 +14,7 @@ for (let i = 1; i < lines.length; i++) {
   for (let c = 0; c < header.length; c++) cols[c].push(parts[c]);
 }
 const columnData = header.map((name, c) => {
-  if (name === "capacity") return { name, data: cols[c].map(Number), type: "DOUBLE" };
+  if (name === "capacity") return { name, data: cols[c].map((v) => (v === "" ? null : Number(v))), type: "DOUBLE", nullable: true };
   if (name === "id") return { name, data: cols[c].map((v) => BigInt(v)), type: "INT64" };
   return { name, data: cols[c], type: "STRING" };
 });

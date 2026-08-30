@@ -410,3 +410,13 @@ Remaining M2 gate items: memory measurement, real map dataset (with nulls).
 
 With multi-select, first-query-included cold, the fair-rival chunks adapter, and both browsers at both scales, the review's benchmark-qualification list is cleared except: **memory measurement** and **the real map dataset (with nulls)**.
 </sv-prose>
+
+<sv-prose id="d16">
+## M2: nulls + memory measurement (2026-08-31)
+
+**Nulls are in, with a deliberate split**: empty cells in *string/facet* columns are ordinary dictionary values (the "(blank)" bucket a facet UI shows anyway — no null machinery needed), while empty cells in *numeric* columns are true nulls — a validity bitmap in segment slot 2 (present only when the chunk has nulls, per spec), placeholder zeros in the data, null-skipping min/max stats, SQL-semantics `sum()` (nulls don't contribute; `count(*)` still counts the row), and nulls-last top-k. The synthetic dataset now has ~3% empty measure cells; every lane handles them (NaN-null in the JS lanes, nullable DOUBLE in the parquet file) and all lanes still agree exactly. Cost: +125 KB raw at 1M rows.
+
+**Memory measurement** (review item): the worker now creates each lane, benches it, verifies it against facetful, then drops it — reporting per-lane JS-heap growth (Chrome only, no forced GC, labeled approximate) and the wasm lane's linear-memory size. Run in Chromium to populate the column.
+
+Remaining M2 gate item: **the real map dataset** — everything else from the review's checklist is done.
+</sv-prose>

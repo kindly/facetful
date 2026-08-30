@@ -27,7 +27,9 @@ pub enum SegmentData<'a> {
 
 pub struct ColumnChunk<'a> {
     pub data: SegmentData<'a>,
-    /// Validity bitmap (1 = present); None = no nulls. Nulls are out of spike scope.
+    /// Validity bitmap (bit i set = row i present), ceil(rows/8) bytes;
+    /// None = no nulls in this chunk. Stored in segment slot 2. Null rows'
+    /// data values are placeholders (zeros) and must be masked by readers.
     pub validity: Option<&'a [u8]>,
     pub null_count: u32,
 }
@@ -146,15 +148,21 @@ impl Writer {
 
         for (ci, chunk) in cols.iter().enumerate() {
             let def = &self.schema.columns[ci];
-            assert!(chunk.validity.is_none(), "nulls not implemented in spike writer");
+            if let Some(v) = chunk.validity {
+                assert_eq!(v.len(), (row_count as usize + 7) / 8, "col {ci} validity length");
+                assert!(chunk.null_count > 0, "validity present but null_count = 0");
+            } else {
+                assert_eq!(chunk.null_count, 0, "null_count > 0 requires a validity bitmap");
+            }
             let mut segs: [Option<&[u8]>; MAX_SEGS] = [None, None, None];
+            segs[2] = chunk.validity; // slot 2 is validity for every column kind
             let stats;
             match (&chunk.data, def.ty, def.is_dict()) {
                 (SegmentData::Fixed(bytes), ty, false) => {
                     let w = ty.fixed_width().expect("fixed type");
                     assert_eq!(bytes.len(), row_count as usize * w, "col {ci} length");
                     segs[0] = Some(bytes);
-                    stats = compute_numeric_stats(bytes, ty);
+                    stats = compute_numeric_stats(bytes, ty, chunk.validity);
                 }
                 (SegmentData::Bool(bits), ColumnType::Bool, false) => {
                     assert_eq!(bits.len(), (row_count as usize + 7) / 8);
@@ -278,20 +286,24 @@ fn u16s_as_bytes(v: &[u16]) -> Vec<u8> {
     out
 }
 
-fn compute_numeric_stats(bytes: &[u8], ty: ColumnType) -> Stats {
+fn compute_numeric_stats(bytes: &[u8], ty: ColumnType, validity: Option<&[u8]>) -> Stats {
+    let valid = |i: usize| validity.map_or(true, |v| v[i / 8] & (1 << (i % 8)) != 0);
     match ty {
-        ColumnType::Int8 => int_stats(bytes, 1, |b| b[0] as i8 as i64),
-        ColumnType::Int16 => int_stats(bytes, 2, |b| i16::from_le_bytes([b[0], b[1]]) as i64),
+        ColumnType::Int8 => int_stats(bytes, 1, valid, |b| b[0] as i8 as i64),
+        ColumnType::Int16 => int_stats(bytes, 2, valid, |b| i16::from_le_bytes([b[0], b[1]]) as i64),
         ColumnType::Int32 | ColumnType::Date => {
-            int_stats(bytes, 4, |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+            int_stats(bytes, 4, valid, |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
         }
-        ColumnType::Int64 | ColumnType::Timestamp => int_stats(bytes, 8, |b| {
+        ColumnType::Int64 | ColumnType::Timestamp => int_stats(bytes, 8, valid, |b| {
             i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
         }),
         ColumnType::Float64 => {
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
-            for c in bytes.chunks_exact(8) {
+            for (i, c) in bytes.chunks_exact(8).enumerate() {
+                if !valid(i) {
+                    continue;
+                }
                 let v = f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
                 if v < min {
                     min = v;
@@ -306,10 +318,18 @@ fn compute_numeric_stats(bytes: &[u8], ty: ColumnType) -> Stats {
     }
 }
 
-fn int_stats(bytes: &[u8], w: usize, f: impl Fn(&[u8]) -> i64) -> Stats {
+fn int_stats(
+    bytes: &[u8],
+    w: usize,
+    valid: impl Fn(usize) -> bool,
+    f: impl Fn(&[u8]) -> i64,
+) -> Stats {
     let mut min = i64::MAX;
     let mut max = i64::MIN;
-    for c in bytes.chunks_exact(w) {
+    for (i, c) in bytes.chunks_exact(w).enumerate() {
+        if !valid(i) {
+            continue;
+        }
         let v = f(c);
         if v < min {
             min = v;
