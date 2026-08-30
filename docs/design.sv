@@ -385,3 +385,28 @@ Remaining M2 gate items: multi-value facet selections (per-dim code sets), optim
 
 Remaining M2 gate items: memory measurement, real map dataset (with nulls).
 </sv-prose>
+
+<sv-prose id="d15">
+## M2: 1M-row multi-select results (2026-08-31, Firefox + Chromium)
+
+**Firefox, 1M rows, multi-select:**
+
+| lane | transfer | load | first query | est. cold @4G | median | p95 |
+|---|---|---|---|---|---|---|
+| JS objects | 12.92 MB | 1,335 ms | 172 ms | 13.6 s | 137 ms | 444 ms |
+| crossfilter2 | 12.93 MB | 3,569 ms | 392 ms | 16.0 s | 66 ms | 127 ms |
+| .facetful → wasm | **8.63 MB** | **112 ms** | 39 ms | 8.19 s | **15 ms** | **20 ms** |
+| hyparquet (objects) → JS | 7.85 MB | 810 ms | 14 ms | 8.14 s | 14 ms | 19 ms |
+| hyparquet (chunks) → JS | 7.85 MB | 530 ms | 14 ms | 7.86 s | 14 ms | 19 ms |
+
+**Chromium, 1M rows, multi-select:** facetful 106 ms load / **14.4 ms** median / 19.8 p95 (8.19 s cold); hyparquet objects 17.1 ms / chunks 19.5 ms medians (7.8-7.9 s cold); JS objects 165.7 ms; **crossfilter 191 ms — behind even the objects baseline**; DuckDB 415 ms median, 21.4 s cold.
+
+### Synthesis
+
+1. **crossfilter is eliminated as a rival under real facet semantics** — 66 ms (FF) / 191 ms (Chrome) medians with 127-365 ms tails; in Chrome it is *slower than hand-written objects*. Its single-select index magic does not survive multi-select.
+2. **facetful is the only lane fast in both browsers**: 14.4-15 ms medians, ~20 ms p95, near-identical across engines and scales — the wasm predictability story, measured. The JS-kernel lanes match it in Firefox (14 ms) but drift in Chrome (17-19.5 ms, p95 to 27 ms).
+3. **End-to-end cold has converged**: 8.19 s vs 7.78-7.86 s @4G — a ~5% gap (parquet's remaining transfer edge is ~0.78 MB, almost entirely the Float64 column; the parked Decimal/per-segment-deflate levers would erase it). **Repeat visits are not close**: facetful re-opens in ~110 ms; the parquet path re-pays 430-810 ms of transcode every session (or persists to OPFS as .facetful — becoming facetful).
+4. **DuckDB at 1M multi-select: 415 ms per interaction, 21.4 s cold** — 29× behind on interactions.
+
+With multi-select, first-query-included cold, the fair-rival chunks adapter, and both browsers at both scales, the review's benchmark-qualification list is cleared except: **memory measurement** and **the real map dataset (with nulls)**.
+</sv-prose>
