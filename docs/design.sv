@@ -338,7 +338,19 @@ Cross-browser synthesis: the wasm engine and the JS-typed-kernel lane are parity
 3. **DuckDB at 1M:** 221 ms per facet refresh, 10 s load, 29 s cold @4G — behind even the objects baseline. Reference point settled at both scales.
 4. **Transfer still favors parquet** (7.85 vs 9.36 MB gz) until the measured encoding work (u8 codes, narrow ints, Decimal) lands — expected to roughly close the gap.
 
-### Gate closed: outcome 1 with an evidence-sharpened Option C
+### Gate: proceed — engine proven, publishing-format claim still open
 
-Proceed with the full design. `.facetful` **clearly wins cold-start and stays parity-or-better on interactions** — its load advantage is structural and scale-growing. The parquet/hyparquet path graduates to a first-class *source* (`db.loadParquet`) whose trade is known precisely: smaller transfer today, decode-at-load cost that grows linearly, no larger-than-memory or range story. Deferred to their milestones (M5/M7) rather than blocking the gate: OPFS larger-than-memory and HTTP-range measurements — the paths only `.facetful` can serve. Real-dataset re-run still owed when the map CSV is available.
-</sv-prose>
+*(Verdict corrected after the second review audit — the original "outcome 1, gate closed" overstated it.)*
+
+What is proven: **the engine, the representation, and the fused faceting algorithm** (3 ms vs 28 ms objects / 6 ms crossfilter at 200K; still interactive at 1M; 19.7 KB gz engine), and **structural open-time advantage** (flat vs linear in N). What is *not* yet proven: `.facetful` as the preferred **cold-network publishing format** — by this page's own est.-cold metric, parquet+hyparquet currently wins end-to-end (1.68 vs 1.93 s @200K, 8.2 vs 8.9 s @1M): the transfer surplus cancels the open advantage on 4G. The compact encodings (u8 codes, narrow ints, dict-once, Decimal) are projected to close the transfer gap; if they do, the faster open wins end-to-end — measure, don't assume.
+
+**Benchmark qualifications from the audit** (recorded so the numbers aren't over-read): facetful's ~11-22 ms first-query cost was hidden by warm-up (conclusion survives); the hyparquet lane is a *simple* adapter — a column-chunk version cut its Node ingest ~16%, so the 3.5-5× open gap is vs a naive adapter, not the best plausible one; memory is unmeasured (prototype holds file + segment copies + query vectors); the dataset is synthetic, non-null, dictionary-friendly, single-value-per-facet; DuckDB is a fair product reference, not a neutral compute comparison; and hyparquet does have range/chunked capabilities in principle — facetful's range/OPFS claim is "simpler and faster", which must be shown, not asserted.
+
+**Next gate (entry criteria for building the SQL layer, folded into M2):**
+1. Implement compact encodings; re-run **one end-to-end metric: network + open + first correct facets** (first query included, no warm-up shield).
+2. Benchmark an optimized hyparquet **column-chunk** adapter as the fair rival.
+3. Measure peak + steady memory per lane.
+4. Real map dataset, with nulls and **true multi-value facet selections** (engine gains per-dim code *sets* — the current i32-per-dim API is single-select).
+5. HTTP ranges + OPFS exercised before calling those differentiators proven.
+
+Even in the worst case — parquet remains the best initial source — the product shape stands: Parquet as first-class input, `.facetful` as the fast browser execution/cache representation.</sv-prose>
