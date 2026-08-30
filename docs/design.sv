@@ -420,3 +420,24 @@ With multi-select, first-query-included cold, the fair-rival chunks adapter, and
 
 Remaining M2 gate item: **the real map dataset** — everything else from the review's checklist is done.
 </sv-prose>
+
+<sv-prose id="d17">
+## Product posture (adopted 2026-08-31, per third review): Parquet public, .facetful internal
+
+| layer | choice |
+|---|---|
+| Public input contract | **Parquet** (and CSV via the CLI) — publishers change nothing |
+| Browser execution | facetful's dictionary-coded representation (the thing every benchmark validated) |
+| Persistent cache | **versioned, discardable `.facetful` in OPFS** — transcode Parquet once, reopen at ~110 ms forever after |
+| Advanced/experimental API | `loadFacetful()` — direct publishing stays available, unpromised |
+
+Rationale from the measurements: first-visit cold still slightly favors Parquet (7.86 vs 8.19 s @4G); warm interactions are near-parity (facetful more predictable cross-browser); facetful's decisive edge is *preparation* (112 vs 530 ms) — and an OPFS cache captures that edge without asking anyone to publish a second format. "Parquet repays transcode every session" only holds if you deliberately don't cache. Public-format compatibility is a promise with real long-term cost; not made yet.
+
+**Promotion criteria** — `.facetful` becomes a supported *publishing* format only if it proves at least one advantage Parquet+cache cannot reproduce:
+1. materially lower peak memory;
+2. substantially faster range-based queries on large remote datasets (the M7 experiment — zero-decode ranges vs hyparquet page decode);
+3. clearly better time-to-first-facets across target devices/networks;
+4. genuine publisher demand for precomputed, directly executable assets.
+
+The format implementation and CLI stay — they are the transcoder, the cache writer, and the candidate for static-hosting/offline deployments. One-line story: **"Open Parquet instantly in a tiny, purpose-built faceting engine."** (The PMTiles analogy shifts accordingly: Parquet is the tiles; facetful is the renderer.)
+</sv-prose>
