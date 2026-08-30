@@ -301,5 +301,17 @@ Still open before the gate closes: the DuckDB-WASM reference lane, the hyparquet
 2. **HTTP range queries** (query without downloading) and **OPFS larger-than-memory** — neither exercised; both are .facetful-only capabilities in this design.
 3. **Transfer:** parquet's encodings beat unoptimized .facetful (1.62 vs 1.90 MB); the measured encoding improvements (u8 codes, narrow ints) close most of that gap without breaking zero-decode.
 
+### Chromium run (same device, finer timer)
+
+| lane | load | interaction median | p95 | vs JS objects |
+|---|---|---|---|---|
+| JS objects | 441 ms | 27.20 ms | 47.0 ms | 1.0× |
+| crossfilter2 | 711 ms | 4.50 ms | 7.9 ms | 6.0× |
+| .facetful → wasm | 148 ms | **2.30 ms** | 3.0 ms | 11.8× |
+| parquet → hyparquet → JS kernels | 109 ms | 2.80 ms | 4.0 ms | 9.7× |
+| DuckDB-WASM | 9,153 ms | 55.70 ms | 67.4 ms | 0.5× |
+
+Cross-browser synthesis: the wasm engine and the JS-typed-kernel lane are parity-class (within ±20% both ways — wasm ahead 1.2× in Chromium, quantization-tied in Firefox); hyparquet's load edges ahead at this scale; DuckDB is consistently ~20× behind on interactions and 60-90× on load. The engine-language evidence stands as measured in lang-bench: wasm's decisive edges (GROUP BY, SIMD, tails) live outside this kernel.
+
 **Gate verdict: proceed** — with the review's Option C sharpened by evidence: parquet-in via hyparquet is a first-class *source* at small scale, not just a compatibility adapter; `.facetful` must earn its keep at scale and on the range/OPFS paths, which the next experiments measure before the SQL layer is built. DuckDB is no longer the competitor to watch; careful JS over a good representation is. (DuckDB fairness note: batching its 8 queries could improve it, but per-query round trips are how it is actually used from JS.)
 </sv-prose>
