@@ -278,3 +278,28 @@ Reading against the decision gate:
 
 Still open before the gate closes: the DuckDB-WASM reference lane, the hyparquet→JS-kernels lane, throttled cold-load measurement, and a re-run on the real map dataset when available.
 </sv-prose>
+
+<sv-prose id="d11">
+## M1 spike — full five-lane results (2026-08-31, Firefox, 200K rows)
+
+| lane | transfer (gz) | load | est. cold @4G | interaction median | p95 | vs JS objects |
+|---|---|---|---|---|---|---|
+| JS objects (current-style, correct facets) | 2.58 MB | 267 ms | 2.67 s | 28 ms | 53 ms | 1.0× |
+| crossfilter2 | 2.59 MB | 626 ms | 3.04 s | 6 ms | 12 ms | 4.7× |
+| .facetful → wasm engine | 1.90 MB | 161 ms | 1.93 s | 3 ms | 4 ms | 9.3× |
+| parquet → hyparquet → JS typed kernels | 1.62 MB | 172 ms | 1.68 s | 2 ms | 3 ms | 14.0× |
+| DuckDB-WASM (reference, async SQL) | 10.46 MB | 7,134 ms | 16.88 s | 53 ms | 67 ms | 0.5× |
+
+### Honest gate reading
+
+**Proven decisively: the niche vs DuckDB.** 17× faster interactions — DuckDB's 8 async SQL round trips per facet refresh cost more than the scans themselves, leaving it *slower than hand-written JS objects* on this workload — and ~9× faster cold start (1.9 s vs 16.9 s @4G). The "embeddable instant-start analytics below DuckDB" quadrant is real and this architecture owns it.
+
+**Proven: the representation, not (yet) the wasm.** The two fast lanes share one design — dictionary codes in flat arrays + the correct one-pass facet algorithm — and at 200K rows they sit at timer-granularity parity (2 vs 3 ms on a 1 ms Firefox clock). Consistent with the language micro-bench (facet kernel 1.36×): at flagship scale the representation and algorithm deliver the win; JS-vs-wasm is a wash *for this kernel*. Wasm's measured edges (GROUP BY 3.5×, SIMD scans, GC-free tails) weren't exercised by this workload.
+
+**Not yet tested — exactly where .facetful's reasons-to-exist live:**
+1. **Scale.** The hyparquet lane's load materializes every row as a JS object before dict-encoding; at 1-5M rows that means seconds of parse and a heap spike while zero-decode load stays flat. The 200K parity is unlikely to survive 1M+ — measure, don't assume.
+2. **HTTP range queries** (query without downloading) and **OPFS larger-than-memory** — neither exercised; both are .facetful-only capabilities in this design.
+3. **Transfer:** parquet's encodings beat unoptimized .facetful (1.62 vs 1.90 MB); the measured encoding improvements (u8 codes, narrow ints) close most of that gap without breaking zero-decode.
+
+**Gate verdict: proceed** — with the review's Option C sharpened by evidence: parquet-in via hyparquet is a first-class *source* at small scale, not just a compatibility adapter; `.facetful` must earn its keep at scale and on the range/OPFS paths, which the next experiments measure before the SQL layer is built. DuckDB is no longer the competitor to watch; careful JS over a good representation is. (DuckDB fairness note: batching its 8 queries could improve it, but per-query round trips are how it is actually used from JS.)
+</sv-prose>
