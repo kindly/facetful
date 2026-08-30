@@ -23,6 +23,7 @@ Design rule: **the on-disk bytes of a column segment are exactly the in-memory r
 
 ```
 [header: magic "FCT1", version, schema, sorted_by, row-group size]
+[dictionary block: lens table + each dict column's offsets/bytes, written once]
 [row-group 0: group header (row count, segment lengths) + column segments…]
 [row-group 1: …]
 …
@@ -46,7 +47,7 @@ Cost: a few dozen bytes per group duplicated between group headers and the foote
 | `Int8/16/32/64` / `Float64` | raw little-endian values, `n × width` bytes — CLI picks the narrowest int width that fits the column |
 | `Bool` | bit-packed, `⌈n/8⌉` bytes |
 | `Utf8` | `(n+1) × u32` offsets, then UTF-8 bytes blob |
-| `Utf8`, dictionary-encoded | `n × u8/u16` codes + dictionary segment (offsets + bytes) — **operable without decoding**: filters/group-by run on the codes, strings materialize only at output. CLI applies automatically above a cardinality threshold; ~10-20x less memory for facet-type columns |
+| `Utf8`, dictionary-encoded | `n × u8/u16` codes per group (u8 when cardinality ≤ 256 — flag `CODES_U8`); the dictionary itself (offsets + bytes) lives **once** in the file-level dictionary block after the header. **Operable without decoding**: filters/group-by run on the codes, strings materialize only at output. CLI applies automatically above a cardinality threshold; ~10-20x less memory for facet-type columns |
 | `Date` / `Timestamp` | `Int64` (days / milliseconds since epoch) — stored identically, distinguished by schema type |
 | nulls | validity bitmap segment (`⌈n/8⌉` bytes), **omitted entirely when null_count = 0** |
 
