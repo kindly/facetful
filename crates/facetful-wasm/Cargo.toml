@@ -1,0 +1,12 @@
+[package]
+name = "facetful-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "facetful wasm bindings and worker protocol"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+facetful-engine = { path = "../facetful-engine" }

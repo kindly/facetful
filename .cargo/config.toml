@@ -1,0 +1,4 @@
+# SIMD128 is the default for wasm builds (decision 2026-08-30: its browser floor —
+# Chrome 91+/FF 89+/Safari 16.4+ — matches OPFS's, and the lang-bench measured 3-10x on scans).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/facetful-format",
+    "crates/facetful-engine",
+    "crates/facetful-wasm",
+    "crates/facetful-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# The wasm size budget lives or dies in this profile.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Native tooling (CLI, tests, benches) wants speed, not size.
+[profile.native]
+inherits = "release"
+opt-level = 3
+panic = "unwind"

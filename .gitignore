@@ -1,0 +1,6 @@
+target/
+target-simd/
+node_modules/
+dist/
+*.wasm.gz
+.sideview/

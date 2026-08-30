@@ -1,0 +1,9 @@
+[package]
+name = "facetful-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = ".facetful columnar format: read/write, footer codec, stats"
+
+[dependencies]
+# none, by design — this crate is compiled into the wasm engine

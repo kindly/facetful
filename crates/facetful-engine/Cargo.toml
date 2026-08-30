@@ -1,0 +1,9 @@
+[package]
+name = "facetful-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "facetful vectorized executor (parser + planner later); pure, no I/O"
+
+[dependencies]
+facetful-format = { path = "../facetful-format" }

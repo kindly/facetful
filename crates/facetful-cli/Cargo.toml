@@ -1,0 +1,13 @@
+[package]
+name = "facetful-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "facetful native CLI: convert, inspect, query"
+
+[[bin]]
+name = "facetful"
+path = "src/main.rs"
+
+[dependencies]
+facetful-format = { path = "../facetful-format" }
