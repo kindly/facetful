@@ -3,7 +3,7 @@
 <title>facetful spike bench</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 66rem; margin: 2rem auto; padding: 0 1rem; }
   table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
   th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -13,66 +13,215 @@
 </style>
 <h1>facetful — M1 spike benchmark</h1>
 <p>200K-row synthetic facet workload: per interaction, <strong>correct filters-except-own
-facet counts over 6 dimensions + totals + top-50 sort</strong>. All lanes run in a
-worker and are verified to produce identical counts before timing.</p>
+facet counts over 6 dimensions + totals + top-50 sort</strong>. Lanes are verified to
+produce identical counts before timing. DuckDB runs via its own worker machinery
+(async query round trips — its real interface); everything else runs in one module worker.</p>
 <p>
   <button id="run">Run benchmark</button>
+  <label class="muted"><input type="checkbox" id="withDuck" checked> include DuckDB-WASM reference</label>
   <span id="status" class="muted"></span>
 </p>
 <table id="results" hidden>
   <thead>
-    <tr><th>lane</th><th class="num">assets (raw)</th><th class="num">load</th>
+    <tr><th>lane</th><th class="num">transfer (gz)</th><th class="num">load</th>
+        <th class="num">est. cold @ 4G*</th>
         <th class="num">interaction median</th><th class="num">p95</th><th class="num">vs JS objects</th></tr>
   </thead>
   <tbody></tbody>
 </table>
-<p class="muted">Asset sizes are raw/uncompressed (local server sends no Content-Encoding). On a gzipping host: CSV 2.69 MB, .facetful 1.98 MB — a 1.36× transfer difference.</p>
+<p class="muted">*estimated: gzipped asset bytes at 9 Mbps + measured load/init time — an
+approximation of a first visit on a mid 4G connection; local serving hides real network cost.
+Transfer column = what a gzipping static host would send (measured offline, sizes.json).</p>
 <p id="meta" class="muted"></p>
 <p><button id="copy" hidden>Copy results JSON</button></p>
 <script type="module">
+  import { makeScript, sameResult, DIM_NAMES, MEASURE } from "./lanes.js";
+
   const worker = new Worker("./worker.js", { type: "module" });
   const el = (id) => document.getElementById(id);
-  let payload = null;
+  const status = (m) => (el("status").textContent = m);
+  let payload = { results: [] };
+  let sizes = {};
+  const MBPS_4G = 9e6 / 8; // bytes/sec
 
-  el("run").onclick = () => {
+  const laneTransfer = (name) => {
+    if (name.startsWith(".facetful")) return sizes.facetfulGz + sizes.engineWasmGz;
+    if (name.startsWith("JS objects")) return sizes.csvGz;
+    if (name.startsWith("crossfilter")) return sizes.csvGz + sizes.crossfilterGz;
+    if (name.startsWith("parquet")) return (sizes.parquetGz || 0) + sizes.hyparquetGz;
+    if (name.startsWith("DuckDB")) return sizes.csvGz + sizes.duckdbGz;
+    return 0;
+  };
+
+  function render() {
+    const tb = el("results").querySelector("tbody");
+    tb.innerHTML = "";
+    const base = payload.results.find((r) => r.name.startsWith("JS objects"));
+    for (const r of payload.results) {
+      const transfer = laneTransfer(r.name);
+      const cold = transfer / MBPS_4G * 1000 + r.loadMs;
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        `<td>${r.name}</td>` +
+        `<td class="num">${(transfer / 1048576).toFixed(2)} MB</td>` +
+        `<td class="num">${r.loadMs.toFixed(0)} ms</td>` +
+        `<td class="num">${(cold / 1000).toFixed(2)} s</td>` +
+        `<td class="num"><strong>${r.median.toFixed(2)} ms</strong></td>` +
+        `<td class="num">${r.p95.toFixed(2)} ms</td>` +
+        `<td class="num">${base ? (base.median / r.median).toFixed(1) + "×" : "—"}</td>`;
+      tb.appendChild(tr);
+    }
+    el("results").hidden = false;
+    el("copy").hidden = false;
+  }
+
+  // ---------- DuckDB reference lane (main thread; duckdb spawns its own worker) ----------
+  async function runDuckdb(dicts, verify) {
+    const t0 = performance.now();
+    const duckdb = await import("./node_modules/@duckdb/duckdb-wasm/dist/duckdb-browser.mjs");
+    const base = "./node_modules/@duckdb/duckdb-wasm/dist/";
+    const bundle = await duckdb.selectBundle({
+      mvp: { mainModule: base + "duckdb-mvp.wasm", mainWorker: base + "duckdb-browser-mvp.worker.js" },
+      eh: { mainModule: base + "duckdb-eh.wasm", mainWorker: base + "duckdb-browser-eh.worker.js" },
+    });
+    const w = new Worker(bundle.mainWorker);
+    const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), w);
+    await db.instantiate(bundle.mainModule);
+    const csv = await (await fetch("/spikes/facet-spike/data-200000.csv")).arrayBuffer();
+    await db.registerFileBuffer("data.csv", new Uint8Array(csv));
+    const conn = await db.connect();
+    await conn.query(`CREATE TABLE t AS SELECT * FROM read_csv_auto('data.csv')`);
+    const loadMs = performance.now() - t0;
+
+    const cond = (values, exceptDim) =>
+      DIM_NAMES.map((d, j) =>
+        j !== exceptDim && values[j] !== null ? `${d} = '${values[j]}'` : null,
+      ).filter(Boolean).join(" AND ");
+
+    const interact = async (values) => {
+      const counts = [];
+      for (let k = 0; k < DIM_NAMES.length; k++) {
+        const wcl = cond(values, k);
+        const res = await conn.query(
+          `SELECT ${DIM_NAMES[k]} AS k, count(*)::INT AS c FROM t ${wcl ? "WHERE " + wcl : ""} GROUP BY 1`,
+        );
+        const m = new Map();
+        for (const row of res) m.set(row.k, row.c);
+        counts.push(m);
+      }
+      const wcl = cond(values, -1);
+      const tot = await conn.query(
+        `SELECT count(*)::INT AS n, coalesce(sum(${MEASURE}), 0) AS s FROM t ${wcl ? "WHERE " + wcl : ""}`,
+      );
+      const trow = tot.get(0);
+      await conn.query(
+        `SELECT * FROM t ${wcl ? "WHERE " + wcl : ""} ORDER BY ${MEASURE} DESC LIMIT 50`,
+      );
+      return { pass: trow.n, sum: Number(trow.s), countMaps: counts };
+    };
+
+    const script = makeScript(dicts, 140);
+    // correctness spot-check vs facetful counts
+    const chk = await interact(script[60]);
+    const facChk = verify(script[60]);
+    if (chk.pass !== facChk.pass) throw new Error(`duckdb pass ${chk.pass} vs facetful ${facChk.pass}`);
+    for (let k = 0; k < DIM_NAMES.length; k++) {
+      for (let c = 0; c < dicts[k].length; c++) {
+        const expect = facChk.counts[k][c] || 0;
+        const got = chk.countMaps[k].get(dicts[k][c]) || 0;
+        if (expect !== got) throw new Error(`duckdb counts[${DIM_NAMES[k]}][${dicts[k][c]}] ${got} vs ${expect}`);
+      }
+    }
+    const times = [];
+    for (let i = 0; i < script.length; i++) {
+      const s0 = performance.now();
+      await interact(script[i]);
+      if (i >= 20) times.push(performance.now() - s0);
+    }
+    await conn.close();
+    await db.terminate();
+    w.terminate();
+    times.sort((a, b) => a - b);
+    return {
+      name: "DuckDB-WASM (reference, async SQL)",
+      loadMs,
+      median: times[Math.floor(times.length / 2)],
+      p95: times[Math.floor(times.length * 0.95)],
+    };
+  }
+
+  // ---------- orchestration ----------
+
+  el("run").onclick = async () => {
     el("run").disabled = true;
     el("results").hidden = true;
-    el("status").textContent = "starting…";
+    payload = { results: [] };
+    sizes = await (await fetch("./sizes.json")).json().catch(() => ({}));
+    status("starting worker lanes…");
     worker.postMessage({ cmd: "run" });
   };
 
-  worker.onmessage = (e) => {
+  worker.onmessage = async (e) => {
     const d = e.data;
-    if (d.type === "status") el("status").textContent = d.m;
+    if (d.type === "status") status(d.m);
     if (d.type === "error") {
-      el("status").textContent = "ERROR: " + d.m;
+      status("ERROR: " + d.m);
       el("run").disabled = false;
     }
-    if (d.type === "done") {
-      payload = d;
-      const tb = el("results").querySelector("tbody");
-      tb.innerHTML = "";
-      const base = d.results[0].median;
-      for (const r of d.results) {
-        const tr = document.createElement("tr");
-        const mb = (r.assetBytes / 1048576).toFixed(2) + " MB";
-        tr.innerHTML =
-          `<td>${r.name}</td><td class="num">${mb}</td>` +
-          `<td class="num">${r.loadMs.toFixed(0)} ms</td>` +
-          `<td class="num"><strong>${r.median.toFixed(2)} ms</strong></td>` +
-          `<td class="num">${r.p95.toFixed(2)} ms</td>` +
-          `<td class="num">${(base / r.median).toFixed(1)}×</td>`;
-        tb.appendChild(tr);
-      }
-      el("results").hidden = false;
-      el("copy").hidden = false;
+    if (d.type === "lanes-done") {
+      payload.results.push(...d.results);
+      payload.meta = d.meta;
+      render();
       el("meta").textContent =
-        `${d.meta.rows.toLocaleString()} rows · engine wasm ${(d.meta.wasmBytes / 1024).toFixed(1)} KB · ` +
-        `.facetful ${(d.meta.facetfulBytes / 1048576).toFixed(2)} MB · CSV ${(d.meta.csvBytes / 1048576).toFixed(2)} MB · ${d.meta.ua}`;
-      el("status").textContent = "done";
-      el("run").disabled = false;
+        `${d.meta.rows.toLocaleString()} rows · engine wasm ${(d.meta.wasmBytes / 1024).toFixed(1)} KB raw · ${d.meta.ua}`;
+
+      // hyparquet lane (needs the pre-generated parquet file)
+      const pq = await fetch("/spikes/facet-spike/data-200000.parquet");
+      if (pq.ok) {
+        const buf = await pq.arrayBuffer();
+        worker.postMessage({ cmd: "hyparquet", parquet: buf }, [buf]);
+      } else {
+        status("parquet file missing — skipping hyparquet lane");
+        await maybeDuck(d);
+      }
+      payload._laneDone = d;
+    }
+    if (d.type === "hyparquet-done") {
+      payload.results.push(d.result);
+      render();
+      await maybeDuck(payload._laneDone);
     }
   };
+
+  async function maybeDuck(laneData) {
+    if (!el("withDuck").checked) {
+      status("done");
+      el("run").disabled = false;
+      return;
+    }
+    try {
+      status("DuckDB reference lane: loading (large download)…");
+      // cheap local recompute for verification: use the js-objects lane in-page
+      const { laneJsObjects } = await import("./lanes.js");
+      const csvText = await (await fetch("/spikes/facet-spike/data-200000.csv")).text();
+      const jso = laneJsObjects(csvText);
+      const duck = await runDuckdb(laneData.dicts, (sel) => {
+        const r = jso.interact(sel);
+        // reorder counts into facetful dict order
+        const counts = laneData.dicts.map((dict, k) => {
+          const m = new Map(jso.dicts[k].map((v, c) => [v, r.counts[k][c]]));
+          return dict.map((v) => m.get(v) || 0);
+        });
+        return { pass: r.pass, counts };
+      });
+      payload.results.push(duck);
+      render();
+      status("done");
+    } catch (err) {
+      status("DuckDB lane failed: " + err);
+    }
+    el("run").disabled = false;
+  }
 
   el("copy").onclick = () => navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
 </script>

@@ -1,0 +1,9 @@
+{
+  "csvGz": 2708356,
+  "facetfulGz": 1972688,
+  "engineWasmGz": 19764,
+  "crossfilterGz": 5739,
+  "hyparquetGz": 52438,
+  "parquetGz": 1643227,
+  "duckdbGz": 8260651
+}

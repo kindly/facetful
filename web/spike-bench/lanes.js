@@ -261,3 +261,80 @@ export function sameResult(a, aDicts, b, bDicts) {
   }
   return null;
 }
+
+// ---------- lane: hyparquet -> JS typed-array kernels ----------
+// The "standard format + best-case JS compute" pairing: parquet decoded by
+// hyparquet (as its README shows, to objects), dict-encoded into typed arrays
+// at load (the honest ingest cost of that path), then the same correct-facets
+// algorithm over Uint16Array codes.
+
+export async function laneHyparquet(parquetBuffer, hp) {
+  const t0 = performance.now();
+  const rows = await hp.parquetReadObjects({ file: parquetBuffer });
+  const n = rows.length;
+  const dicts = [];
+  const codesArr = [];
+  for (const d of DIM_NAMES) {
+    const idx = new Map();
+    const dict = [];
+    const codes = new Uint16Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = rows[i][d];
+      let c = idx.get(v);
+      if (c === undefined) {
+        c = dict.length;
+        idx.set(v, c);
+        dict.push(v);
+      }
+      codes[i] = c;
+    }
+    dicts.push(dict);
+    codesArr.push(codes);
+  }
+  const measure = new Float64Array(n);
+  for (let i = 0; i < n; i++) measure[i] = Number(rows[i][MEASURE]);
+  const loadMs = performance.now() - t0;
+
+  const nd = DIM_NAMES.length;
+  const counts = dicts.map((d) => new Uint32Array(d.length));
+  const mask = new Uint8Array(n);
+  const codeMaps = dicts.map((d) => new Map(d.map((v, c) => [v, c])));
+
+  return {
+    name: "parquet → hyparquet → JS typed-array kernels",
+    loadMs,
+    dicts,
+    meta: { rows: n },
+    interact(values) {
+      const sel = values.map((v, k) => (v === null ? -1 : codeMaps[k].get(v)));
+      for (let k = 0; k < nd; k++) counts[k].fill(0);
+      let pass = 0;
+      let sum = 0;
+      for (let row = 0; row < n; row++) {
+        let fails = 0;
+        let failDim = -1;
+        for (let k = 0; k < nd; k++) {
+          if (sel[k] >= 0 && codesArr[k][row] !== sel[k]) {
+            fails++;
+            if (fails === 2) break;
+            failDim = k;
+          }
+        }
+        if (fails === 0) {
+          mask[row] = 1;
+          pass++;
+          sum += measure[row];
+          for (let k = 0; k < nd; k++) counts[k][codesArr[k][row]]++;
+        } else {
+          mask[row] = 0;
+          if (fails === 1) counts[failDim][codesArr[failDim][row]]++;
+        }
+      }
+      const idx = [];
+      for (let row = 0; row < n; row++) if (mask[row]) idx.push(row);
+      idx.sort((a, b) => measure[b] - measure[a]);
+      const top = idx.slice(0, TOPK);
+      return { pass, sum, counts: counts.map((c) => Array.from(c)), top };
+    },
+  };
+}

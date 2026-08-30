@@ -36,3 +36,19 @@ for (const lane of [jso, cfl, fac]) {
   const r = runScript(lane, script);
   console.log(`${r.name.padEnd(42)} load ${lane.loadMs.toFixed(0).padStart(5)}ms  median ${r.median.toFixed(2).padStart(7)}ms  p95 ${r.p95.toFixed(2).padStart(7)}ms`);
 }
+
+// ---- hyparquet lane ----
+import * as hyparquet from "hyparquet";
+import { laneHyparquet } from "./lanes.js";
+const pqBytes = readFileSync(new URL("spikes/facet-spike/data-200000.parquet", root));
+const pq = await laneHyparquet(pqBytes.buffer.slice(pqBytes.byteOffset, pqBytes.byteOffset + pqBytes.byteLength), hyparquet);
+{
+  const i = 60;
+  const err = sameResult(fac.interact(script[i]), fac.dicts, pq.interact(script[i]), pq.dicts);
+  if (err) throw new Error(`facetful vs hyparquet @${i}: ${err}`);
+  console.log("hyparquet lane agrees with facetful");
+}
+{
+  const r = runScript(pq, script);
+  console.log(`${r.name.padEnd(42)} load ${pq.loadMs.toFixed(0).padStart(5)}ms  median ${r.median.toFixed(2).padStart(7)}ms  p95 ${r.p95.toFixed(2).padStart(7)}ms`);
+}
