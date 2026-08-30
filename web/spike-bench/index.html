@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>facetful spike bench</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  button { font: inherit; padding: .35rem .9rem; }
+  .muted { opacity: .65; font-size: .85em; }
+  #status { margin-left: .75rem; }
+</style>
+<h1>facetful — M1 spike benchmark</h1>
+<p>200K-row synthetic facet workload: per interaction, <strong>correct filters-except-own
+facet counts over 6 dimensions + totals + top-50 sort</strong>. All lanes run in a
+worker and are verified to produce identical counts before timing.</p>
+<p>
+  <button id="run">Run benchmark</button>
+  <span id="status" class="muted"></span>
+</p>
+<table id="results" hidden>
+  <thead>
+    <tr><th>lane</th><th class="num">assets</th><th class="num">load</th>
+        <th class="num">interaction median</th><th class="num">p95</th><th class="num">vs JS objects</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+<p id="meta" class="muted"></p>
+<p><button id="copy" hidden>Copy results JSON</button></p>
+<script type="module">
+  const worker = new Worker("./worker.js", { type: "module" });
+  const el = (id) => document.getElementById(id);
+  let payload = null;
+
+  el("run").onclick = () => {
+    el("run").disabled = true;
+    el("results").hidden = true;
+    el("status").textContent = "starting…";
+    worker.postMessage({ cmd: "run" });
+  };
+
+  worker.onmessage = (e) => {
+    const d = e.data;
+    if (d.type === "status") el("status").textContent = d.m;
+    if (d.type === "error") {
+      el("status").textContent = "ERROR: " + d.m;
+      el("run").disabled = false;
+    }
+    if (d.type === "done") {
+      payload = d;
+      const tb = el("results").querySelector("tbody");
+      tb.innerHTML = "";
+      const base = d.results[0].median;
+      for (const r of d.results) {
+        const tr = document.createElement("tr");
+        const mb = (r.assetBytes / 1048576).toFixed(2) + " MB";
+        tr.innerHTML =
+          `<td>${r.name}</td><td class="num">${mb}</td>` +
+          `<td class="num">${r.loadMs.toFixed(0)} ms</td>` +
+          `<td class="num"><strong>${r.median.toFixed(2)} ms</strong></td>` +
+          `<td class="num">${r.p95.toFixed(2)} ms</td>` +
+          `<td class="num">${(base / r.median).toFixed(1)}×</td>`;
+        tb.appendChild(tr);
+      }
+      el("results").hidden = false;
+      el("copy").hidden = false;
+      el("meta").textContent =
+        `${d.meta.rows.toLocaleString()} rows · engine wasm ${(d.meta.wasmBytes / 1024).toFixed(1)} KB · ` +
+        `.facetful ${(d.meta.facetfulBytes / 1048576).toFixed(2)} MB · CSV ${(d.meta.csvBytes / 1048576).toFixed(2)} MB · ${d.meta.ua}`;
+      el("status").textContent = "done";
+      el("run").disabled = false;
+    }
+  };
+
+  el("copy").onclick = () => navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+</script>
