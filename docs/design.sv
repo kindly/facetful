@@ -441,3 +441,18 @@ Rationale from the measurements: first-visit cold still slightly favors Parquet 
 
 The format implementation and CLI stay — they are the transcoder, the cache writer, and the candidate for static-hosting/offline deployments. One-line story: **"Open Parquet instantly in a tiny, purpose-built faceting engine."** (The PMTiles analogy shifts accordingly: Parquet is the tiles; facetful is the renderer.)
 </sv-prose>
+
+<sv-prose id="d18">
+## Internal-representation consequences (2026-08-31)
+
+Demoting `.facetful` to internal changes what the format is *for* — the virtues survive, the constraints don't:
+
+- **Kept (execution properties, not transfer ones):** zero-decode segment layout (the ~110 ms reopen *is* the cache's value), row groups + min/max stats (larger-than-memory scanning, filter skipping), u8 codes / narrow ints / dict-once (memory footprint and scan speed — they improved interactions, not just downloads).
+- **Dropped obligations:** forward-compatibility discipline. The OPFS cache is keyed by `(engine version, source content hash)`; any layout change silently invalidates and re-transcodes. Reserved-bit ceremony and unknown-flag rejection stay in code but stop being promises. Self-framing group headers (streaming-GET consumption of published files) are no longer sacred — kept for now, cheap.
+- **Newly permitted — a cache can contain answers, not just data** (transcode-time precomputations a public format could never carry):
+  1. unfiltered facet counts → first facet paint without a scan;
+  2. a sort permutation for the default table column → first table render without sorting;
+  3. dictionary rank arrays → `ORDER BY <dim>` without comparing strings.
+- **Engine fix surfaced by this review:** `codes()` currently widens u8 codes into a `Vec<u16>` per query — a per-query decode hiding in a zero-decode engine. The executor should scan u8 segments directly.
+- **Considered and declined:** Arrow IPC as the internal representation — same zero-copy philosophy plus ecosystem interop, but ours is effectively Arrow's layout plus stats/groups, already built at 6% of the size budget. Revisit only if first-class Arrow export becomes a goal.
+</sv-prose>
