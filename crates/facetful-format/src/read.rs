@@ -124,6 +124,38 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
     let mut fbuf = vec![0u8; footer_len as usize];
     src.read_at(file_len - 8 - footer_len, &mut fbuf)?;
 
+    // Dictionary block (immediately after the header): lens table then payloads.
+    let (schema, sorted_by, version, row_group_target, hlen) =
+        (schema, sorted_by, version, row_group_target, _hlen);
+    let ndict = schema.columns.iter().filter(|c| c.is_dict()).count();
+    let mut dicts: Vec<Option<DictLoc>> = vec![None; schema.columns.len()];
+    if ndict > 0 {
+        let table_len = crate::align_up(ndict * 8);
+        let mut tbuf = vec![0u8; table_len];
+        src.read_at(hlen as u64, &mut tbuf)?;
+        let mut lens = Vec::with_capacity(ndict);
+        for i in 0..ndict {
+            let o = u32::from_le_bytes(tbuf[i * 8..i * 8 + 4].try_into().unwrap());
+            let b = u32::from_le_bytes(tbuf[i * 8 + 4..i * 8 + 8].try_into().unwrap());
+            lens.push((o, b));
+        }
+        let mut off = hlen as u64 + table_len as u64;
+        let mut di = 0;
+        for (ci, c) in schema.columns.iter().enumerate() {
+            if c.is_dict() {
+                let (ol, bl) = lens[di];
+                dicts[ci] = Some(DictLoc {
+                    offsets_off: off,
+                    offsets_len: ol,
+                    bytes_off: off + ol as u64,
+                    bytes_len: bl,
+                });
+                off += ol as u64 + bl as u64;
+                di += 1;
+            }
+        }
+    }
+
     let mut c = Cursor::new(&fbuf);
     let total_rows = c.u64()?;
     let ngroups = c.u32()? as usize;
@@ -158,6 +190,7 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
         row_group_target,
         schema,
         sorted_by,
+        dicts,
         total_rows,
         groups,
     })
@@ -195,15 +228,53 @@ pub fn read_segment(
     Ok(buf)
 }
 
+/// Decode one dictionary's values (dict columns only).
+pub fn read_dictionary(
+    src: &impl ReadAt,
+    cat: &Catalog,
+    col: usize,
+) -> Result<Vec<String>, FormatError> {
+    let loc = cat.dicts[col].ok_or(FormatError::Corrupt("not a dictionary column"))?;
+    let mut obuf = vec![0u8; loc.offsets_len as usize];
+    src.read_at(loc.offsets_off, &mut obuf)?;
+    let mut bbuf = vec![0u8; loc.bytes_len as usize];
+    src.read_at(loc.bytes_off, &mut bbuf)?;
+    let offs: Vec<u32> = obuf
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // (count+1) real entries; the segment is padded with zeros. The last real
+    // offset equals the (unpadded) byte length; padding breaks monotonicity.
+    let mut count = 0;
+    for w in offs.windows(2) {
+        if w[1] < w[0] {
+            break;
+        }
+        count += 1;
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let (a, b) = (offs[i] as usize, offs[i + 1] as usize);
+        if b > bbuf.len() {
+            break;
+        }
+        out.push(
+            core::str::from_utf8(&bbuf[a..b])
+                .map_err(|_| FormatError::Corrupt("dictionary value not utf-8"))?
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write::{ColumnChunk, SegmentData, Writer};
+    use crate::write::{ColumnChunk, DictData, SegmentData, Writer};
 
     fn utf8_offsets(strings: &[&str]) -> (Vec<u32>, Vec<u8>) {
-        let mut offsets = Vec::with_capacity(strings.len() + 1);
+        let mut offsets = vec![0u32];
         let mut bytes = Vec::new();
-        offsets.push(0);
         for s in strings {
             bytes.extend_from_slice(s.as_bytes());
             offsets.push(bytes.len() as u32);
@@ -215,31 +286,43 @@ mod tests {
     fn roundtrip_two_groups() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int64, flags: 0 },
+                ColumnDef { name: "id".into(), ty: ColumnType::Int32, flags: 0 },
                 ColumnDef { name: "amount".into(), ty: ColumnType::Float64, flags: 0 },
-                ColumnDef { name: "status".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY },
+                ColumnDef {
+                    name: "status".into(),
+                    ty: ColumnType::Utf8,
+                    flags: flags::DICTIONARY | flags::CODES_U8,
+                },
+                ColumnDef { name: "owner".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY },
                 ColumnDef { name: "note".into(), ty: ColumnType::Utf8, flags: 0 },
             ],
         };
+        let (soff, sbytes) = utf8_offsets(&["ok", "closed", "pending"]);
+        let (ooff, obytes) = utf8_offsets(&["alpha", "beta"]);
+        let dicts = vec![
+            None,
+            None,
+            Some(DictData { offsets: soff, bytes: sbytes }),
+            Some(DictData { offsets: ooff, bytes: obytes }),
+            None,
+        ];
         let sorted = vec![SortKey { column: 0, descending: false }];
-        let mut w = Writer::new(schema, sorted, 4);
+        let mut w = Writer::new(schema, sorted, 4, &dicts);
 
-        let (dict_off, dict_bytes) = utf8_offsets(&["ok", "closed", "pending"]);
-        for gi in 0..2u32 {
-            let ids: Vec<u8> = (0..4i64).flat_map(|i| (gi as i64 * 4 + i).to_le_bytes()).collect();
-            let amounts: Vec<u8> = (0..4).flat_map(|i| ((gi * 4 + i) as f64 * 1.5).to_le_bytes()).collect();
-            let codes: Vec<u16> = vec![0, 2, 1, 0];
+        for gi in 0..2i32 {
+            let ids: Vec<u8> = (0..4i32).flat_map(|i| (gi * 4 + i).to_le_bytes()).collect();
+            let amounts: Vec<u8> =
+                (0..4).flat_map(|i| ((gi * 4 + i) as f64 * 1.5).to_le_bytes()).collect();
+            let scodes: [u8; 4] = [0, 2, 1, 0];
+            let ocodes: [u16; 4] = [1, 0, 0, 1];
             let (noff, nbytes) = utf8_offsets(&["a", "", "long note here", "x"]);
             w.write_group(
                 4,
                 &[
                     ColumnChunk { data: SegmentData::Fixed(&ids), validity: None, null_count: 0 },
                     ColumnChunk { data: SegmentData::Fixed(&amounts), validity: None, null_count: 0 },
-                    ColumnChunk {
-                        data: SegmentData::Dict { codes: &codes, dict_offsets: &dict_off, dict_bytes: &dict_bytes },
-                        validity: None,
-                        null_count: 0,
-                    },
+                    ColumnChunk { data: SegmentData::Codes8(&scodes), validity: None, null_count: 0 },
+                    ColumnChunk { data: SegmentData::Codes16(&ocodes), validity: None, null_count: 0 },
                     ColumnChunk {
                         data: SegmentData::Utf8 { offsets: &noff, bytes: &nbytes },
                         validity: None,
@@ -254,11 +337,16 @@ mod tests {
         let cat = open(&src).unwrap();
         assert_eq!(cat.total_rows, 8);
         assert_eq!(cat.groups.len(), 2);
-        assert_eq!(cat.schema.columns.len(), 4);
-        assert_eq!(cat.sorted_by.len(), 1);
         assert!(cat.schema.columns[2].is_dict());
+        assert_eq!(cat.schema.columns[2].code_width(), 1);
+        assert_eq!(cat.schema.columns[3].code_width(), 2);
 
-        // stats
+        // dictionaries decode from the dict block
+        assert_eq!(read_dictionary(&src, &cat, 2).unwrap(), vec!["ok", "closed", "pending"]);
+        assert_eq!(read_dictionary(&src, &cat, 3).unwrap(), vec!["alpha", "beta"]);
+        assert!(read_dictionary(&src, &cat, 0).is_err());
+
+        // narrow int stats + decode
         match cat.groups[1].cols[0].stats {
             Stats::Int { min, max } => {
                 assert_eq!(min, 4);
@@ -266,29 +354,29 @@ mod tests {
             }
             _ => panic!("expected int stats"),
         }
-
-        // id column of group 1 decodes back
         let seg = read_segment(&src, &cat, 1, 0, 0).unwrap();
-        let ids: Vec<i64> = seg[..32].chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+        let ids: Vec<i32> =
+            seg[..16].chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
         assert_eq!(ids, vec![4, 5, 6, 7]);
 
-        // dict codes of group 0
+        // u8 codes of group 0
         let codes_seg = read_segment(&src, &cat, 0, 2, 0).unwrap();
-        let codes: Vec<u16> = codes_seg[..8].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        assert_eq!(codes, vec![0, 2, 1, 0]);
+        assert_eq!(&codes_seg[..4], &[0, 2, 1, 0]);
+        // u16 codes of group 0
+        let ocode_seg = read_segment(&src, &cat, 0, 3, 0).unwrap();
+        let oc: Vec<u16> =
+            ocode_seg[..8].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(oc, vec![1, 0, 0, 1]);
 
-        // dict bytes of group 0
-        let db = read_segment(&src, &cat, 0, 2, 2).unwrap();
-        assert!(db.starts_with(b"okclosedpending"));
-
-        // plain utf8: offsets + bytes of group 0
-        let no = read_segment(&src, &cat, 0, 3, 0).unwrap();
-        let offs: Vec<u32> = no[..20].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        // plain utf8 offsets survive
+        let no = read_segment(&src, &cat, 0, 4, 0).unwrap();
+        let offs: Vec<u32> =
+            no[..20].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         assert_eq!(offs, vec![0, 1, 1, 15, 16]);
 
-        // header alone parses (streaming reader path)
+        // header alone parses (streaming path)
         let (schema2, _, _, _, hlen) = parse_header(&file[..file.len().min(1024)]).unwrap();
-        assert_eq!(schema2.columns[3].name, "note");
+        assert_eq!(schema2.columns[4].name, "note");
         assert!(hlen as usize % ALIGN == 0);
     }
 

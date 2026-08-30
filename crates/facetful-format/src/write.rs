@@ -1,10 +1,16 @@
-//! One-pass streaming writer: header first, then self-framing row groups as they
-//! arrive, footer last. The caller chunks rows into groups (the CLI does this).
+//! One-pass streaming writer: header, then the file-level dictionary block
+//! (dictionaries are known before writing begins — the CLI computes them during
+//! inference), then self-framing row groups as they arrive, footer last.
 
 use crate::*;
 
-/// Column data for ONE row group, in schema order. Values are already in their
-/// final physical representation — the writer only frames, pads, and takes stats.
+/// One dictionary's payload: (n+1) offsets + UTF-8 blob, shared by every group.
+pub struct DictData {
+    pub offsets: Vec<u32>,
+    pub bytes: Vec<u8>,
+}
+
+/// Column data for ONE row group, in schema order.
 pub enum SegmentData<'a> {
     /// Fixed-width values as raw LE bytes (len = rows * width). Covers
     /// Int8/16/32/64, Float64, Date, Timestamp.
@@ -13,19 +19,15 @@ pub enum SegmentData<'a> {
     Bool(&'a [u8]),
     /// Plain strings: (n+1) u32 offsets + UTF-8 blob.
     Utf8 { offsets: &'a [u32], bytes: &'a [u8] },
-    /// Dictionary-encoded strings: u16 codes per row + dict (offsets + blob).
-    Dict {
-        codes: &'a [u16],
-        dict_offsets: &'a [u32],
-        dict_bytes: &'a [u8],
-    },
+    /// Dictionary codes, u8 (column flag CODES_U8 must be set).
+    Codes8(&'a [u8]),
+    /// Dictionary codes, u16.
+    Codes16(&'a [u16]),
 }
 
 pub struct ColumnChunk<'a> {
     pub data: SegmentData<'a>,
-    /// Validity bitmap (1 = present), ceil(rows/8) bytes; None = no nulls.
-    /// NOTE: v1 stores validity inline ahead of data in the FIRST segment slot
-    /// only when present — for the spike we keep nulls out of scope and require None.
+    /// Validity bitmap (1 = present); None = no nulls. Nulls are out of spike scope.
     pub validity: Option<&'a [u8]>,
     pub null_count: u32,
 }
@@ -40,7 +42,18 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub fn new(schema: Schema, sorted_by: Vec<SortKey>, row_group_target: u32) -> Self {
+    /// `dicts` must align with the schema: `Some(DictData)` exactly for columns
+    /// flagged DICTIONARY.
+    pub fn new(
+        schema: Schema,
+        sorted_by: Vec<SortKey>,
+        row_group_target: u32,
+        dicts: &[Option<DictData>],
+    ) -> Self {
+        assert_eq!(dicts.len(), schema.columns.len());
+        for (c, d) in schema.columns.iter().zip(dicts) {
+            assert_eq!(c.is_dict(), d.is_some(), "dict presence must match DICTIONARY flag");
+        }
         let mut w = Self {
             schema,
             sorted_by,
@@ -50,6 +63,7 @@ impl Writer {
             total_rows: 0,
         };
         w.write_header();
+        w.write_dict_block(dicts);
         w
     }
 
@@ -71,7 +85,7 @@ impl Writer {
     fn write_header(&mut self) {
         self.buf.extend_from_slice(&MAGIC);
         let len_pos = self.buf.len();
-        self.put_u32(0); // header_len placeholder (bytes from magic through padding)
+        self.put_u32(0); // header_len placeholder
         self.put_u16(VERSION);
         self.put_u16(0); // file flags, reserved
         let target = self.row_group_target;
@@ -95,6 +109,29 @@ impl Writer {
         self.buf[len_pos..len_pos + 4].copy_from_slice(&hlen.to_le_bytes());
     }
 
+    /// Dictionary block: a lens table (offsets_len, bytes_len per dict column,
+    /// in schema order), then the padded payloads. Self-framing for streaming
+    /// readers; random-access readers recompute the same offsets from the lens.
+    fn write_dict_block(&mut self, dicts: &[Option<DictData>]) {
+        let present: Vec<&DictData> = dicts.iter().flatten().collect();
+        if present.is_empty() {
+            return;
+        }
+        for d in &present {
+            self.put_u32(align_up(d.offsets.len() * 4) as u32);
+            self.put_u32(align_up(d.bytes.len()) as u32);
+        }
+        self.pad();
+        for d in &present {
+            for o in &d.offsets {
+                self.put_u32(*o);
+            }
+            self.pad();
+            self.buf.extend_from_slice(&d.bytes);
+            self.pad();
+        }
+    }
+
     /// Append one row group. `cols` must match the schema order and all describe
     /// `row_count` rows.
     pub fn write_group(&mut self, row_count: u32, cols: &[ColumnChunk<'_>]) {
@@ -103,10 +140,9 @@ impl Writer {
 
         let group_offset = self.buf.len() as u64;
 
-        // Gather per-column segment payloads (unpadded) and stats first.
         let mut metas: Vec<ColMeta> = Vec::with_capacity(cols.len());
         let mut payloads: Vec<[Option<&[u8]>; MAX_SEGS]> = Vec::with_capacity(cols.len());
-        let mut owned_offsets: Vec<Vec<u8>> = Vec::new(); // u32/u16 slices re-encoded as bytes
+        let mut owned: Vec<Vec<u8>> = Vec::new();
 
         for (ci, chunk) in cols.iter().enumerate() {
             let def = &self.schema.columns[ci];
@@ -127,49 +163,41 @@ impl Writer {
                 }
                 (SegmentData::Utf8 { offsets, bytes }, ColumnType::Utf8, false) => {
                     assert_eq!(offsets.len(), row_count as usize + 1);
-                    let ob = u32s_as_bytes(offsets);
-                    owned_offsets.push(ob);
-                    segs[0] = None; // fixed up below from owned_offsets
+                    owned.push(u32s_as_bytes(offsets));
                     segs[1] = Some(bytes);
                     stats = Stats::None;
                 }
-                (SegmentData::Dict { codes, dict_offsets, dict_bytes }, ColumnType::Utf8, true) => {
+                (SegmentData::Codes8(codes), ColumnType::Utf8, true) => {
+                    assert_eq!(def.code_width(), 1, "col {ci}: CODES_U8 flag mismatch");
                     assert_eq!(codes.len(), row_count as usize);
-                    owned_offsets.push(u16s_as_bytes(codes));
-                    owned_offsets.push(u32s_as_bytes(dict_offsets));
-                    segs[2] = Some(dict_bytes);
+                    segs[0] = Some(codes);
+                    stats = Stats::None;
+                }
+                (SegmentData::Codes16(codes), ColumnType::Utf8, true) => {
+                    assert_eq!(def.code_width(), 2, "col {ci}: expected u16 codes");
+                    assert_eq!(codes.len(), row_count as usize);
+                    owned.push(u16s_as_bytes(codes));
                     stats = Stats::None;
                 }
                 _ => panic!("column {ci}: data does not match schema type/flags"),
             }
             payloads.push(segs);
-            metas.push(ColMeta {
-                null_count: chunk.null_count,
-                seg_lens: [0; MAX_SEGS],
-                stats,
-            });
+            metas.push(ColMeta { null_count: chunk.null_count, seg_lens: [0; MAX_SEGS], stats });
         }
 
-        // Resolve owned (re-encoded) segments into the payload table.
-        // owned_offsets is filled in schema order: utf8 -> 1 entry (slot 0),
-        // dict -> 2 entries (slots 0 and 1).
+        // Resolve owned re-encoded segments (utf8 offsets -> slot 0, u16 codes -> slot 0).
         let mut oi = 0;
         for (ci, chunk) in cols.iter().enumerate() {
             match &chunk.data {
-                SegmentData::Utf8 { .. } => {
-                    payloads[ci][0] = Some(&owned_offsets[oi]);
+                SegmentData::Utf8 { .. } | SegmentData::Codes16(_) => {
+                    payloads[ci][0] = Some(&owned[oi]);
                     oi += 1;
-                }
-                SegmentData::Dict { .. } => {
-                    payloads[ci][0] = Some(&owned_offsets[oi]);
-                    payloads[ci][1] = Some(&owned_offsets[oi + 1]);
-                    oi += 2;
                 }
                 _ => {}
             }
         }
 
-        // Group header: row_count, then per column: null_count + MAX_SEGS padded lengths.
+        // Group header.
         self.put_u32(row_count);
         for (ci, meta) in metas.iter_mut().enumerate() {
             self.put_u32(meta.null_count);
@@ -181,7 +209,6 @@ impl Writer {
         }
         self.pad();
 
-        // Segments, each padded to ALIGN.
         for segs in &payloads {
             for seg in segs.iter().flatten() {
                 self.buf.extend_from_slice(seg);
@@ -190,11 +217,7 @@ impl Writer {
         }
 
         self.total_rows += row_count as u64;
-        self.groups.push(GroupMeta {
-            offset: group_offset,
-            row_count,
-            cols: metas,
-        });
+        self.groups.push(GroupMeta { offset: group_offset, row_count, cols: metas });
     }
 
     /// Write the footer and return the finished file bytes.

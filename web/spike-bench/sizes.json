@@ -2,16 +2,16 @@
   "datasets": {
     "200000": {
       "csvGz": 2708356,
-      "facetfulGz": 1972688,
+      "facetfulGz": 1815989,
       "parquetGz": 1643227
     },
     "1000000": {
       "csvGz": 13550597,
-      "facetfulGz": 9795667,
+      "facetfulGz": 9024013,
       "parquetGz": 8175678
     }
   },
-  "engineWasmGz": 19764,
+  "engineWasmGz": 20515,
   "crossfilterGz": 5739,
   "hyparquetGz": 52438,
   "duckdbGz": 8260651

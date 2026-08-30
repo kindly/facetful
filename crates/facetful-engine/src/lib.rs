@@ -18,6 +18,8 @@ pub struct Table<S: ReadAt> {
     /// cache[group][column][segment] — loaded on first touch, never invalidated
     /// (SELECT-only: there is nothing to invalidate).
     cache: Vec<Vec<[Option<Vec<u8>>; format::MAX_SEGS]>>,
+    /// Decoded dictionaries, cached per column.
+    dict_cache: Vec<Option<Vec<String>>>,
 }
 
 /// A facet-refresh request: `dims` are dictionary-encoded Utf8 columns,
@@ -47,7 +49,8 @@ impl<S: ReadAt> Table<S> {
             .iter()
             .map(|_| cat.schema.columns.iter().map(|_| [None, None, None]).collect())
             .collect();
-        Ok(Self { src, cat, cache })
+        let dict_cache = cat.schema.columns.iter().map(|_| None).collect();
+        Ok(Self { src, cat, cache, dict_cache })
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -69,11 +72,15 @@ impl<S: ReadAt> Table<S> {
     fn codes(&mut self, group: usize, col: usize) -> Result<Vec<u16>, FormatError> {
         debug_assert!(self.cat.schema.columns[col].is_dict());
         let rows = self.cat.groups[group].row_count as usize;
+        let width = self.cat.schema.columns[col].code_width();
         let seg = self.segment(group, col, 0)?;
-        Ok(seg[..rows * 2]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect())
+        Ok(match width {
+            1 => seg[..rows].iter().map(|&b| b as u16).collect(),
+            _ => seg[..rows * 2]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        })
     }
 
     fn f64s(&mut self, group: usize, col: usize) -> Result<Vec<f64>, FormatError> {
@@ -86,34 +93,13 @@ impl<S: ReadAt> Table<S> {
             .collect())
     }
 
-    /// Dictionary values of `col` (taken from group 0 — the CLI writes identical
-    /// dictionaries in every group; see design doc, dict-once is a format v1.1 item).
+    /// Dictionary values of `col`, from the file-level dictionary block (cached).
     pub fn dictionary(&mut self, col: usize) -> Result<Vec<String>, FormatError> {
-        let offs_seg = self.segment(0, col, 1)?.to_vec();
-        let bytes_seg = self.segment(0, col, 2)?;
-        let n_offsets = offs_seg.len() / 4;
-        let offs: Vec<u32> = offs_seg[..n_offsets * 4]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        // offsets are (count+1) entries, but the segment is padded — find the real
-        // count: last meaningful offset bounds bytes len; entries after are pad zeros.
-        let mut count = 0;
-        for w in offs.windows(2) {
-            if w[1] < w[0] {
-                break;
-            }
-            count += 1;
+        if self.dict_cache[col].is_none() {
+            let d = read::read_dictionary(&self.src, &self.cat, col)?;
+            self.dict_cache[col] = Some(d);
         }
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let (a, b) = (offs[i] as usize, offs[i + 1] as usize);
-            if b > bytes_seg.len() {
-                break;
-            }
-            out.push(String::from_utf8_lossy(&bytes_seg[a..b]).into_owned());
-        }
-        Ok(out)
+        Ok(self.dict_cache[col].clone().unwrap())
     }
 
     /// One facet-interface refresh with correct filters-except-own semantics,
@@ -231,14 +217,19 @@ impl<S: ReadAt> Table<S> {
                 }
                 Ok(GatherResult::Text(out))
             }
-            (ColumnType::Int64 | ColumnType::Timestamp, false) => {
+            (ty, false) if ty.fixed_width().is_some() && ty != ColumnType::Float64 => {
+                let w = ty.fixed_width().unwrap();
                 let mut out = Vec::with_capacity(indices.len());
                 for &i in indices {
                     let (g, r) = locate(i);
-                    let rows = self.cat.groups[g].row_count as usize;
                     let seg = self.segment(g, col, 0)?;
-                    let bytes = &seg[..rows * 8];
-                    out.push(i64::from_le_bytes(bytes[r * 8..r * 8 + 8].try_into().unwrap()));
+                    let b = &seg[r * w..r * w + w];
+                    out.push(match w {
+                        1 => b[0] as i8 as i64,
+                        2 => i16::from_le_bytes([b[0], b[1]]) as i64,
+                        4 => i32::from_le_bytes(b.try_into().unwrap()) as i64,
+                        _ => i64::from_le_bytes(b.try_into().unwrap()),
+                    });
                 }
                 Ok(GatherResult::Int(out))
             }

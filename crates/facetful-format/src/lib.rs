@@ -70,11 +70,14 @@ impl ColumnType {
 
 /// Column flag bits (u16). Reserved bits must be zero in v1 readers.
 pub mod flags {
-    /// Utf8 column is dictionary-encoded: codes segment + dict offsets + dict bytes.
+    /// Utf8 column is dictionary-encoded: a codes segment per group; the
+    /// dictionary itself lives once in the file-level dictionary block.
     pub const DICTIONARY: u16 = 1 << 0;
     /// Reserved: per-segment compression (not implemented in v1).
     pub const COMPRESSED: u16 = 1 << 1;
-    pub const KNOWN: u16 = DICTIONARY;
+    /// Dictionary codes are u8 (cardinality <= 256); otherwise u16.
+    pub const CODES_U8: u16 = 1 << 2;
+    pub const KNOWN: u16 = DICTIONARY | CODES_U8;
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +90,10 @@ pub struct ColumnDef {
 impl ColumnDef {
     pub fn is_dict(&self) -> bool {
         self.flags & flags::DICTIONARY != 0
+    }
+    /// Byte width of this column's dictionary codes (1 or 2).
+    pub fn code_width(&self) -> usize {
+        if self.flags & flags::CODES_U8 != 0 { 1 } else { 2 }
     }
 }
 
@@ -134,6 +141,8 @@ pub struct Catalog {
     pub row_group_target: u32,
     pub schema: Schema,
     pub sorted_by: Vec<SortKey>,
+    /// Per column: dictionary payload location (dict columns only).
+    pub dicts: Vec<Option<DictLoc>>,
     pub total_rows: u64,
     pub groups: Vec<GroupMeta>,
 }
@@ -145,10 +154,19 @@ pub fn align_up(n: usize) -> usize {
 /// Number of segments a column occupies in every row group.
 pub fn seg_count(col: &ColumnDef) -> usize {
     match (col.ty, col.is_dict()) {
-        (ColumnType::Utf8, true) => 3,  // codes, dict offsets, dict bytes
+        (ColumnType::Utf8, true) => 1,  // codes only; the dictionary lives in the dict block
         (ColumnType::Utf8, false) => 2, // offsets, bytes
         _ => 1,
     }
+}
+
+/// Location of one dictionary's payloads in the file-level dictionary block.
+#[derive(Debug, Clone, Copy)]
+pub struct DictLoc {
+    pub offsets_off: u64,
+    pub offsets_len: u32,
+    pub bytes_off: u64,
+    pub bytes_len: u32,
 }
 
 #[derive(Debug)]

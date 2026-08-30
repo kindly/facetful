@@ -8,7 +8,7 @@
 //! quotes, escaped quotes, CRLF).
 
 use facetful_format as fmt;
-use fmt::write::{ColumnChunk, SegmentData, Writer};
+use fmt::write::{ColumnChunk, DictData, SegmentData, Writer};
 use fmt::{ColumnDef, ColumnType, Schema, Stats};
 use std::collections::HashMap;
 use std::process::exit;
@@ -71,10 +71,23 @@ fn parse_csv(data: &str) -> (Vec<String>, Vec<Vec<String>>) {
 // ---------------- inference ----------------
 
 enum Typed {
-    Int(Vec<i64>),
+    /// Integers plus the narrowest type that fits.
+    Int(Vec<i64>, ColumnType),
     Float(Vec<f64>),
     Dict { codes: Vec<u16>, dict: Vec<String> },
     Text(Vec<String>),
+}
+
+fn narrowest_int(min: i64, max: i64) -> ColumnType {
+    if min >= i8::MIN as i64 && max <= i8::MAX as i64 {
+        ColumnType::Int8
+    } else if min >= i16::MIN as i64 && max <= i16::MAX as i64 {
+        ColumnType::Int16
+    } else if min >= i32::MIN as i64 && max <= i32::MAX as i64 {
+        ColumnType::Int32
+    } else {
+        ColumnType::Int64
+    }
 }
 
 fn infer_column(values: Vec<String>) -> Typed {
@@ -92,7 +105,10 @@ fn infer_column(values: Vec<String>) -> Typed {
         }
     }
     if all_int {
-        return Typed::Int(values.iter().map(|v| v.parse().unwrap()).collect());
+        let ints: Vec<i64> = values.iter().map(|v| v.parse().unwrap()).collect();
+        let min = ints.iter().copied().min().unwrap_or(0);
+        let max = ints.iter().copied().max().unwrap_or(0);
+        return Typed::Int(ints, narrowest_int(min, max));
     }
     if all_float {
         return Typed::Float(values.iter().map(|v| v.parse().unwrap()).collect());
@@ -183,9 +199,13 @@ fn convert(args: &[String]) {
             .zip(&typed)
             .map(|(name, t)| {
                 let (ty, flags) = match t {
-                    Typed::Int(_) => (ColumnType::Int64, 0),
+                    Typed::Int(_, ty) => (*ty, 0),
                     Typed::Float(_) => (ColumnType::Float64, 0),
-                    Typed::Dict { .. } => (ColumnType::Utf8, fmt::flags::DICTIONARY),
+                    Typed::Dict { dict, .. } => (
+                        ColumnType::Utf8,
+                        fmt::flags::DICTIONARY
+                            | if dict.len() <= 256 { fmt::flags::CODES_U8 } else { 0 },
+                    ),
                     Typed::Text(_) => (ColumnType::Utf8, 0),
                 };
                 ColumnDef { name: name.clone(), ty, flags }
@@ -194,15 +214,29 @@ fn convert(args: &[String]) {
     };
     for (c, t) in schema.columns.iter().zip(&typed) {
         let kind = match t {
-            Typed::Int(_) => "int64".into(),
+            Typed::Int(_, ty) => format!("{ty:?}").to_lowercase(),
             Typed::Float(_) => "float64".into(),
-            Typed::Dict { dict, .. } => format!("utf8/dict[{}]", dict.len()),
+            Typed::Dict { dict, .. } => format!(
+                "utf8/dict[{}] (u{} codes)",
+                dict.len(),
+                c.code_width() * 8
+            ),
             Typed::Text(_) => "utf8".into(),
         };
         eprintln!("  {}: {kind}", c.name);
     }
 
-    let mut w = Writer::new(schema, vec![], group_size as u32);
+    let dicts: Vec<Option<DictData>> = typed
+        .iter()
+        .map(|t| match t {
+            Typed::Dict { dict, .. } => {
+                let (offsets, bytes) = utf8_offsets(dict);
+                Some(DictData { offsets, bytes })
+            }
+            _ => None,
+        })
+        .collect();
+    let mut w = Writer::new(schema.clone(), vec![], group_size as u32, &dicts);
     let mut start = 0;
     while start < nrows {
         let rows_here = group_size.min(nrows - start);
@@ -210,12 +244,21 @@ fn convert(args: &[String]) {
         // Build owned per-group buffers first, then borrow for the writer call.
         let owned: Vec<OwnedChunk> = typed
             .iter()
-            .map(|t| match t {
-                Typed::Int(v) => OwnedChunk::Fixed(v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect()),
+            .zip(&schema.columns)
+            .map(|(t, def)| match t {
+                Typed::Int(v, ty) => OwnedChunk::Fixed(match ty {
+                    ColumnType::Int8 => v[start..end].iter().map(|&x| x as i8 as u8).collect(),
+                    ColumnType::Int16 => v[start..end].iter().flat_map(|&x| (x as i16).to_le_bytes()).collect(),
+                    ColumnType::Int32 => v[start..end].iter().flat_map(|&x| (x as i32).to_le_bytes()).collect(),
+                    _ => v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect(),
+                }),
                 Typed::Float(v) => OwnedChunk::Fixed(v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect()),
-                Typed::Dict { codes, dict } => {
-                    let (doff, dbytes) = utf8_offsets(dict);
-                    OwnedChunk::Dict { codes: codes[start..end].to_vec(), doff, dbytes }
+                Typed::Dict { codes, .. } => {
+                    if def.code_width() == 1 {
+                        OwnedChunk::Codes8(codes[start..end].iter().map(|&c| c as u8).collect())
+                    } else {
+                        OwnedChunk::Codes16(codes[start..end].to_vec())
+                    }
                 }
                 Typed::Text(v) => {
                     let (off, bytes) = utf8_offsets(&v[start..end]);
@@ -228,9 +271,8 @@ fn convert(args: &[String]) {
             .map(|o| ColumnChunk {
                 data: match o {
                     OwnedChunk::Fixed(b) => SegmentData::Fixed(b),
-                    OwnedChunk::Dict { codes, doff, dbytes } => {
-                        SegmentData::Dict { codes, dict_offsets: doff, dict_bytes: dbytes }
-                    }
+                    OwnedChunk::Codes8(c) => SegmentData::Codes8(c),
+                    OwnedChunk::Codes16(c) => SegmentData::Codes16(c),
                     OwnedChunk::Utf8 { off, bytes } => SegmentData::Utf8 { offsets: off, bytes },
                 },
                 validity: None,
@@ -247,7 +289,8 @@ fn convert(args: &[String]) {
 
 enum OwnedChunk {
     Fixed(Vec<u8>),
-    Dict { codes: Vec<u16>, doff: Vec<u32>, dbytes: Vec<u8> },
+    Codes8(Vec<u8>),
+    Codes16(Vec<u16>),
     Utf8 { off: Vec<u32>, bytes: Vec<u8> },
 }
 

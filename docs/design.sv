@@ -76,7 +76,7 @@ Cost: a few dozen bytes per group duplicated between group headers and the foote
 
 `.facetful` is **not** a Parquet replacement and does not need to beat Parquet at compression; it is an execution-optimised publishing format. The deciding metric is **bytes + time to first correct result**, then repeat-query latency and peak memory — measured in the M1 spike, not asserted. Honest flip side: Parquet is already produced and understood, its encodings can transfer fewer bytes over ranges, and a custom format is an adoption ask on publishers — hence:
 
-**Parquet strategy (product shape, contingent on the spike)**: `.facetful` preferred, plus a **lazily-imported hyparquet adapter** — `db.loadParquet(name, url, {mode: "direct"})` decodes one row group at a time into the same executor (push-shaped: JS awaits and decodes a group, bulk-copies typed arrays into wasm memory, executes, proceeds), or `{mode: "materialize", persist}` transcodes once to `.facetful` for repeat sessions. `.facetful` then becomes an optimisation publishers adopt after seeing a measured benefit, not a prerequisite for trying the engine. Committed only if the spike shows the direct path is usable — strings/nulls/dictionaries are its known weak point, and two execution paths is real surface for a one-person project.
+**Parquet strategy (product shape, contingent on the spike)**: `.facetful` preferred, plus a **lazily-imported hyparquet adapter** — `db.loadParquet(name, url, {mode: "direct"})` decodes one row group at a time into the same executor (push-shaped: JS awaits and decodes a group, bulk-copies typed arrays into wasm memory, executes, proceeds), or `{mode: "materialize", persist}` transcodes once to `.facetful` for repeat sessions. `.facetful` then becomes an optimisation publishers adopt after seeing a measured benefit, not a prerequisite for trying the engine. The M1 spike effectively measured the materialize path (the hyparquet lane's load *is* parquet→facetful-memory conversion): at 1M rows the transcode costs ~0.4-0.8 s (linear in N, transiently double memory) vs facetful's flat ~0.18 s open — so **"publish parquet, transcode once, persist `.facetful` in OPFS"** is the strongest pre-encodings configuration: first visit pays parquet's smaller wire + one transcode, every later visit gets the flat zero-decode open offline. If the compact encodings reach transfer parity, direct `.facetful` wins outright. Committed only if the spike shows the direct path is usable — strings/nulls/dictionaries are its known weak point, and two execution paths is real surface for a one-person project.
 </sv-prose>
 
 <sv-prose id="d3">
@@ -354,3 +354,18 @@ What is proven: **the engine, the representation, and the fused faceting algorit
 5. HTTP ranges + OPFS exercised before calling those differentiators proven.
 
 Even in the worst case — parquet remains the best initial source — the product shape stands: Parquet as first-class input, `.facetful` as the fast browser execution/cache representation.</sv-prose>
+
+<sv-prose id="d13">
+## M2 progress: compact encodings landed (2026-08-31)
+
+Format + CLI + engine now implement **u8 dictionary codes** (cardinality ≤ 256), **narrow integer widths** (Int8/16/32 inference), and **dictionary-once** (a file-level dictionary block after the header replaces per-group dictionary copies; dict columns carry only codes per group). All workspace tests + the five-lane correctness smoke pass; engine wasm still 6% of budget.
+
+| | raw | gz | parquet gz | end-to-end cold @4G (est.) |
+|---|---|---|---|---|
+| 200K rows | 5.72 → **3.83 MB** (-33%) | 1.97 → **1.82 MB** | 1.64 MB | facetful ~1.73 s vs parquet+transcode ~1.65 s |
+| 1M rows | 28.5 → **19.0 MB** (-33%) | 9.80 → **9.07 MB** | 8.18 MB | facetful ~8.2 s vs parquet+transcode ~7.9-8.2 s |
+
+Side effects measured (Node): open time dropped 174→100 ms (less data to touch) and interactions 2.44→2.30 ms (denser codes). **The end-to-end cold gap is now a statistical tie** — parquet's remaining ~10% transfer edge is almost entirely the Float64 measure column (raw f64 bits gzip poorly). The two levers that would flip it, both deliberately parked: `Decimal(scale)` storage for fixed-decimal measures, and per-segment deflate (measured earlier at near-parity with whole-file gzip). Meanwhile facetful keeps the flat open (and with OPFS persistence, repeat visits skip the network entirely), the better p95, and the range/OPFS paths to come.
+
+Remaining M2 gate items: multi-value facet selections (per-dim code sets), optimized hyparquet column-chunk rival, single first-query-included cold metric in the bench, memory measurement, real dataset.
+</sv-prose>

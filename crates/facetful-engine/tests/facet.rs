@@ -2,7 +2,7 @@
 //! in-code, verified against a naive row-by-row recomputation.
 
 use facetful_engine::{FacetQuery, GatherResult, Table};
-use facetful_format::write::{ColumnChunk, SegmentData, Writer};
+use facetful_format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_format::{flags, ColumnDef, ColumnType, Schema};
 
 fn utf8_offsets(strings: &[&str]) -> (Vec<u32>, Vec<u8>) {
@@ -17,10 +17,15 @@ fn utf8_offsets(strings: &[&str]) -> (Vec<u32>, Vec<u8>) {
 
 /// 3 groups x 5 rows, 2 dict dims + measure.
 fn build_file() -> (Vec<u8>, Vec<Vec<u16>>, Vec<f64>) {
+    // status uses u8 codes to exercise both widths
     let schema = Schema {
         columns: vec![
             ColumnDef { name: "region".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY },
-            ColumnDef { name: "status".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY },
+            ColumnDef {
+                name: "status".into(),
+                ty: ColumnType::Utf8,
+                flags: flags::DICTIONARY | flags::CODES_U8,
+            },
             ColumnDef { name: "amount".into(), ty: ColumnType::Float64, flags: 0 },
         ],
     };
@@ -28,31 +33,29 @@ fn build_file() -> (Vec<u8>, Vec<Vec<u16>>, Vec<f64>) {
     let (soff, sbytes) = utf8_offsets(&["open", "closed"]);
 
     let region_codes: Vec<u16> = vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
-    let status_codes: Vec<u16> = vec![0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1];
+    let status_codes: Vec<u8> = vec![0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1];
     let amounts: Vec<f64> = (0..15).map(|i| (i as f64) * 1.25 + 0.5).collect();
 
-    let mut w = Writer::new(schema, vec![], 5);
+    let dicts = vec![
+        Some(DictData { offsets: roff, bytes: rbytes }),
+        Some(DictData { offsets: soff, bytes: sbytes }),
+        None,
+    ];
+    let mut w = Writer::new(schema, vec![], 5, &dicts);
     for g in 0..3 {
         let s = g * 5;
         let amount_bytes: Vec<u8> = amounts[s..s + 5].iter().flat_map(|x| x.to_le_bytes()).collect();
         w.write_group(
             5,
             &[
-                ColumnChunk {
-                    data: SegmentData::Dict { codes: &region_codes[s..s + 5], dict_offsets: &roff, dict_bytes: &rbytes },
-                    validity: None,
-                    null_count: 0,
-                },
-                ColumnChunk {
-                    data: SegmentData::Dict { codes: &status_codes[s..s + 5], dict_offsets: &soff, dict_bytes: &sbytes },
-                    validity: None,
-                    null_count: 0,
-                },
+                ColumnChunk { data: SegmentData::Codes16(&region_codes[s..s + 5]), validity: None, null_count: 0 },
+                ColumnChunk { data: SegmentData::Codes8(&status_codes[s..s + 5]), validity: None, null_count: 0 },
                 ColumnChunk { data: SegmentData::Fixed(&amount_bytes), validity: None, null_count: 0 },
             ],
         );
     }
-    (w.finish(), vec![region_codes, status_codes], amounts)
+    let status_u16: Vec<u16> = status_codes.iter().map(|&c| c as u16).collect();
+    (w.finish(), vec![region_codes, status_u16], amounts)
 }
 
 fn naive_facets(
