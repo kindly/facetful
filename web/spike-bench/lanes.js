@@ -21,20 +21,25 @@ export function mulberry32(seed) {
   };
 }
 
-/** Value-based interaction script (same shape across all lanes). */
+/** Value-based interaction script: per dim an ARRAY of selected values
+ * (empty = no filter). Steps toggle one value, like a user clicking facet
+ * checkboxes; occasional clear-dim. Same shape across all lanes. */
 export function makeScript(dicts, steps, seed = 7) {
   const rng = mulberry32(seed);
-  const selected = DIM_NAMES.map(() => null);
+  const selected = DIM_NAMES.map(() => []);
   const script = [];
   for (let i = 0; i < steps; i++) {
     const k = Math.floor(rng() * DIM_NAMES.length);
-    if (selected[k] !== null && rng() < 0.35) {
-      selected[k] = null;
+    if (selected[k].length > 0 && rng() < 0.25) {
+      selected[k] = [];
     } else {
       const card = dicts[k].length;
-      selected[k] = dicts[k][Math.min(card - 1, Math.floor(rng() * rng() * card))];
+      const v = dicts[k][Math.min(card - 1, Math.floor(rng() * rng() * card))];
+      const at = selected[k].indexOf(v);
+      if (at >= 0) selected[k].splice(at, 1);
+      else if (selected[k].length < 4) selected[k].push(v);
     }
-    script.push([...selected]);
+    script.push(selected.map((s) => [...s]));
   }
   return script;
 }
@@ -83,7 +88,8 @@ export async function laneFacetful(wasmBytes, fileBytes) {
   const nd = DIM_NAMES.length;
   const dimsPtr = w.alloc(nd * 4);
   new Uint32Array(mem(), dimsPtr, nd).set(dimCols);
-  const selPtr = w.alloc(nd * 4);
+  const selLensPtr = w.alloc(nd * 4);
+  const selValsPtr = w.alloc(nd * 4 * 2 * 8); // up to 4 selections per dim, slack
   const topkPtr = w.alloc(TOPK * 4);
   const loadMs = performance.now() - t0;
 
@@ -93,11 +99,15 @@ export async function laneFacetful(wasmBytes, fileBytes) {
     dicts,
     meta: { rows: w.table_total_rows(table), fileBytes: fileBytes.byteLength },
     interact(values) {
-      const sel = new Int32Array(mem(), selPtr, nd);
+      const lens = new Uint32Array(mem(), selLensPtr, nd);
+      const vals = new Uint16Array(mem(), selValsPtr, nd * 8);
+      let off = 0;
       for (let k = 0; k < nd; k++) {
-        sel[k] = values[k] === null ? -1 : codeMaps[k].get(values[k]);
+        const set = values[k] || [];
+        lens[k] = set.length;
+        for (const v of set) vals[off++] = codeMaps[k].get(v);
       }
-      const res = w.facet_refresh(table, dimsPtr, nd, selPtr, measureCol);
+      const res = w.facet_refresh(table, dimsPtr, nd, selLensPtr, selValsPtr, measureCol);
       // copy out what a UI would keep: all facet counts
       const counts = [];
       for (let k = 0; k < nd; k++) {
@@ -151,12 +161,13 @@ export function laneJsObjects(csvText) {
     meta: { rows: rows.length },
     interact(values) {
       const nd = DIM_NAMES.length;
+      const sets = values.map((v) => (v && v.length ? new Set(v) : null));
       // per-dim counts under all filters except own — one pass per dim
       const counts = DIM_NAMES.map((d, k) => {
         const m = new Map();
         outer: for (const r of rows) {
           for (let j = 0; j < nd; j++) {
-            if (j !== k && values[j] !== null && r[DIM_NAMES[j]] !== values[j]) continue outer;
+            if (j !== k && sets[j] !== null && !sets[j].has(r[DIM_NAMES[j]])) continue outer;
           }
           const v = r[d];
           m.set(v, (m.get(v) || 0) + 1);
@@ -169,7 +180,7 @@ export function laneJsObjects(csvText) {
       const filtered = [];
       outer: for (const r of rows) {
         for (let j = 0; j < nd; j++) {
-          if (values[j] !== null && r[DIM_NAMES[j]] !== values[j]) continue outer;
+          if (sets[j] !== null && !sets[j].has(r[DIM_NAMES[j]])) continue outer;
         }
         pass++;
         sum += r[MEASURE];
@@ -208,8 +219,13 @@ export async function laneCrossfilter(csvText, crossfilterFactory) {
     meta: { rows: rows.length },
     interact(values) {
       for (let k = 0; k < dims.length; k++) {
-        if (values[k] === null) dims[k].filterAll();
-        else dims[k].filterExact(values[k]);
+        const v = values[k];
+        if (!v || v.length === 0) dims[k].filterAll();
+        else if (v.length === 1) dims[k].filterExact(v[0]);
+        else {
+          const set = new Set(v);
+          dims[k].filterFunction((x) => set.has(x));
+        }
       }
       // group.all() reflects every filter except the group's own dimension
       const counts = groups.map((g, k) => {
@@ -228,16 +244,19 @@ export async function laneCrossfilter(csvText, crossfilterFactory) {
 export function runScript(lane, script, warmup = 20) {
   const times = [];
   let last = null;
+  let firstMs = null;
   for (let i = 0; i < script.length; i++) {
     const t0 = performance.now();
     last = lane.interact(script[i]);
     const el = performance.now() - t0;
+    if (i === 0) firstMs = el; // cold first query — JIT, caches, segment loads
     if (i >= warmup) times.push(el);
   }
   times.sort((a, b) => a - b);
   return {
     name: lane.name,
     loadMs: lane.loadMs,
+    firstMs,
     median: times[Math.floor(times.length / 2)],
     p95: times[Math.floor(times.length * 0.95)],
     measured: times.length,
@@ -263,11 +282,60 @@ export function sameResult(a, aDicts, b, bDicts) {
   return null;
 }
 
-// ---------- lane: hyparquet -> JS typed-array kernels ----------
-// The "standard format + best-case JS compute" pairing: parquet decoded by
-// hyparquet (as its README shows, to objects), dict-encoded into typed arrays
-// at load (the honest ingest cost of that path), then the same correct-facets
-// algorithm over Uint16Array codes.
+// ---------- lanes: parquet via hyparquet -> JS typed-array kernels ----------
+// Two ingest strategies over the same executor: the README-typical
+// parquetReadObjects (rows as objects, then dict-encode), and the optimized
+// column-chunk path (no row objects — the fair rival the review asked for).
+
+function typedFacetLane(name, loadMs, n, dicts, codesArr, measure) {
+  const nd = DIM_NAMES.length;
+  const counts = dicts.map((d) => new Uint32Array(d.length));
+  const mask = new Uint8Array(n);
+  const codeMaps = dicts.map((d) => new Map(d.map((v, c) => [v, c])));
+  return {
+    name,
+    loadMs,
+    dicts,
+    meta: { rows: n },
+    interact(values) {
+      // membership tables, like the wasm engine
+      const members = values.map((v, k) => {
+        if (!v || v.length === 0) return null;
+        const m = new Uint8Array(dicts[k].length);
+        for (const val of v) m[codeMaps[k].get(val)] = 1;
+        return m;
+      });
+      for (let k = 0; k < nd; k++) counts[k].fill(0);
+      let pass = 0;
+      let sum = 0;
+      for (let row = 0; row < n; row++) {
+        let fails = 0;
+        let failDim = -1;
+        for (let k = 0; k < nd; k++) {
+          if (members[k] !== null && members[k][codesArr[k][row]] === 0) {
+            fails++;
+            if (fails === 2) break;
+            failDim = k;
+          }
+        }
+        if (fails === 0) {
+          mask[row] = 1;
+          pass++;
+          sum += measure[row];
+          for (let k = 0; k < nd; k++) counts[k][codesArr[k][row]]++;
+        } else {
+          mask[row] = 0;
+          if (fails === 1) counts[failDim][codesArr[failDim][row]]++;
+        }
+      }
+      const idx = [];
+      for (let row = 0; row < n; row++) if (mask[row]) idx.push(row);
+      idx.sort((a, b) => measure[b] - measure[a]);
+      const top = idx.slice(0, TOPK);
+      return { pass, sum, counts: counts.map((c) => Array.from(c)), top };
+    },
+  };
+}
 
 export async function laneHyparquet(parquetBuffer, hp) {
   const t0 = performance.now();
@@ -295,47 +363,51 @@ export async function laneHyparquet(parquetBuffer, hp) {
   const measure = new Float64Array(n);
   for (let i = 0; i < n; i++) measure[i] = Number(rows[i][MEASURE]);
   const loadMs = performance.now() - t0;
+  return typedFacetLane(
+    "parquet → hyparquet (objects) → JS kernels", loadMs, n, dicts, codesArr, measure,
+  );
+}
 
-  const nd = DIM_NAMES.length;
-  const counts = dicts.map((d) => new Uint32Array(d.length));
-  const mask = new Uint8Array(n);
-  const codeMaps = dicts.map((d) => new Map(d.map((v, c) => [v, c])));
-
-  return {
-    name: "parquet → hyparquet → JS typed-array kernels",
-    loadMs,
-    dicts,
-    meta: { rows: n },
-    interact(values) {
-      const sel = values.map((v, k) => (v === null ? -1 : codeMaps[k].get(v)));
-      for (let k = 0; k < nd; k++) counts[k].fill(0);
-      let pass = 0;
-      let sum = 0;
-      for (let row = 0; row < n; row++) {
-        let fails = 0;
-        let failDim = -1;
-        for (let k = 0; k < nd; k++) {
-          if (sel[k] >= 0 && codesArr[k][row] !== sel[k]) {
-            fails++;
-            if (fails === 2) break;
-            failDim = k;
-          }
-        }
-        if (fails === 0) {
-          mask[row] = 1;
-          pass++;
-          sum += measure[row];
-          for (let k = 0; k < nd; k++) counts[k][codesArr[k][row]]++;
-        } else {
-          mask[row] = 0;
-          if (fails === 1) counts[failDim][codesArr[failDim][row]]++;
-        }
+/** Optimized ingest: column chunks straight into typed arrays, no row objects. */
+export async function laneHyparquetChunks(parquetBuffer, hp) {
+  const t0 = performance.now();
+  const meta = await hp.parquetMetadataAsync(parquetBuffer);
+  const n = Number(meta.num_rows);
+  const dimIdx = new Map(DIM_NAMES.map((d, k) => [d, k]));
+  const idxMaps = DIM_NAMES.map(() => new Map());
+  const dicts = DIM_NAMES.map(() => []);
+  const codesArr = DIM_NAMES.map(() => new Uint16Array(n));
+  const measure = new Float64Array(n);
+  await hp.parquetRead({
+    file: parquetBuffer,
+    metadata: meta,
+    columns: [...DIM_NAMES, MEASURE],
+    onChunk(chunk) {
+      const { columnName, columnData, rowStart } = chunk;
+      if (columnName === MEASURE) {
+        for (let i = 0; i < columnData.length; i++) measure[rowStart + i] = Number(columnData[i]);
+        return;
       }
-      const idx = [];
-      for (let row = 0; row < n; row++) if (mask[row]) idx.push(row);
-      idx.sort((a, b) => measure[b] - measure[a]);
-      const top = idx.slice(0, TOPK);
-      return { pass, sum, counts: counts.map((c) => Array.from(c)), top };
+      const k = dimIdx.get(columnName);
+      if (k === undefined) return;
+      const idx = idxMaps[k];
+      const dict = dicts[k];
+      const codes = codesArr[k];
+      for (let i = 0; i < columnData.length; i++) {
+        const v = columnData[i];
+        let c = idx.get(v);
+        if (c === undefined) {
+          c = dict.length;
+          idx.set(v, c);
+          dict.push(v);
+        }
+        codes[rowStart + i] = c;
+      }
     },
-  };
+    onComplete() {},
+  });
+  const loadMs = performance.now() - t0;
+  return typedFacetLane(
+    "parquet → hyparquet (column chunks) → JS kernels", loadMs, n, dicts, codesArr, measure,
+  );
 }

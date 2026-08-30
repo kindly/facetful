@@ -61,23 +61,25 @@ fn build_file() -> (Vec<u8>, Vec<Vec<u16>>, Vec<f64>) {
 fn naive_facets(
     dims: &[Vec<u16>],
     cards: &[usize],
-    selected: &[i32],
+    selected: &[Vec<u16>],
     amounts: &[f64],
 ) -> (Vec<Vec<u32>>, u64, f64, Vec<u8>) {
     let n = amounts.len();
     let d = dims.len();
+    let pass_dim = |j: usize, row: usize| -> bool {
+        selected[j].is_empty() || selected[j].contains(&dims[j][row])
+    };
     let mut counts: Vec<Vec<u32>> = cards.iter().map(|&c| vec![0; c]).collect();
     let mut mask = vec![0u8; n];
     let (mut pass, mut sum) = (0u64, 0f64);
     for row in 0..n {
         for k in 0..d {
             // counted under all filters except k's own
-            let ok = (0..d).all(|j| j == k || selected[j] < 0 || dims[j][row] as i32 == selected[j]);
-            if ok {
+            if (0..d).all(|j| j == k || pass_dim(j, row)) {
                 counts[k][dims[k][row] as usize] += 1;
             }
         }
-        if (0..d).all(|j| selected[j] < 0 || dims[j][row] as i32 == selected[j]) {
+        if (0..d).all(|j| pass_dim(j, row)) {
             mask[row] = 1;
             pass += 1;
             sum += amounts[row];
@@ -94,7 +96,16 @@ fn facet_refresh_matches_naive() {
     assert_eq!(t.dictionary(0).unwrap(), vec!["eu", "us", "asia"]);
     assert_eq!(t.dictionary(1).unwrap(), vec!["open", "closed"]);
 
-    for selected in [vec![-1, -1], vec![0, -1], vec![-1, 1], vec![2, 0], vec![1, 1]] {
+    let cases: Vec<Vec<Vec<u16>>> = vec![
+        vec![vec![], vec![]],
+        vec![vec![0], vec![]],
+        vec![vec![], vec![1]],
+        vec![vec![2], vec![0]],
+        vec![vec![0, 2], vec![]],      // multi-select on region
+        vec![vec![0, 1], vec![1]],     // multi-select + single
+        vec![vec![0, 1, 2], vec![0, 1]], // everything selected = no-op filters
+    ];
+    for selected in cases {
         let q = FacetQuery { dims: vec![0, 1], selected: selected.clone(), measure: 2 };
         let r = t.facet_refresh(&q).unwrap();
         let (counts, pass, sum, mask) = naive_facets(&dims, &[3, 2], &selected, &amounts);
@@ -111,7 +122,7 @@ fn topk_and_gather() {
     let src: &[u8] = &file;
     let mut t = Table::open(src).unwrap();
 
-    let q = FacetQuery { dims: vec![0, 1], selected: vec![-1, 0], measure: 2 };
+    let q = FacetQuery { dims: vec![0, 1], selected: vec![vec![], vec![0]], measure: 2 };
     let r = t.facet_refresh(&q).unwrap();
     let top = t.sort_topk(2, &r.mask, 3).unwrap();
     // "open" rows: 0,1,4,6,8,9,12,13 — top 3 amounts descending = rows 13,12,9

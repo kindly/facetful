@@ -52,3 +52,14 @@ const pq = await laneHyparquet(pqBytes.buffer.slice(pqBytes.byteOffset, pqBytes.
   const r = runScript(pq, script);
   console.log(`${r.name.padEnd(42)} load ${pq.loadMs.toFixed(0).padStart(5)}ms  median ${r.median.toFixed(2).padStart(7)}ms  p95 ${r.p95.toFixed(2).padStart(7)}ms`);
 }
+
+// ---- optimized column-chunk hyparquet lane ----
+import { laneHyparquetChunks } from "./lanes.js";
+const pqc = await laneHyparquetChunks(pqBytes.buffer.slice(pqBytes.byteOffset, pqBytes.byteOffset + pqBytes.byteLength), hyparquet);
+{
+  const err = sameResult(fac.interact(script[60]), fac.dicts, pqc.interact(script[60]), pqc.dicts);
+  if (err) throw new Error(`facetful vs hyparquet-chunks @60: ${err}`);
+  console.log("hyparquet column-chunk lane agrees with facetful");
+  const r = runScript(pqc, script);
+  console.log(`${r.name.padEnd(42)} load ${pqc.loadMs.toFixed(0).padStart(5)}ms  median ${r.median.toFixed(2).padStart(7)}ms  p95 ${r.p95.toFixed(2).padStart(7)}ms`);
+}

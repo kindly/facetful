@@ -370,3 +370,18 @@ Side effects measured (Node): open time dropped 174→100 ms (less data to touch
 
 Remaining M2 gate items: multi-value facet selections (per-dim code sets), optimized hyparquet column-chunk rival, single first-query-included cold metric in the bench, memory measurement, real dataset.
 </sv-prose>
+
+<sv-prose id="d14">
+## M2 progress: multi-select facets + fair-rival lanes (2026-08-31)
+
+**Multi-value facet selections** are now the workload everywhere: the engine takes per-dim *code sets* (membership tables, one byte per code — the fails-counting algorithm unchanged), the wasm ABI passes per-dim lens + concatenated codes, and the benchmark script toggles values in per-dim sets (up to 4 per dim, occasional clears) like a user working facet checkboxes. Correctness re-verified across all lanes against naive recomputation and each other, including everything-selected edge cases.
+
+**First multi-select numbers (Node, 200K)** — the workload change redraws the field:
+- **crossfilter2 collapses: 5.5 → 37 ms** — multi-select forces its `filterFunction` path (a per-row JS predicate), forfeiting the sorted-index advantage that made it the 200K specialist. The "strongest specialist" from the single-select rounds is not one under real facet semantics.
+- facetful: 3.3 ms (from 2.3 — membership indirection costs a little); hyparquet→JS kernels: 4.4-4.5 ms — **the wasm engine now leads best-case JS by ~1.4× on the real workload**, consistent with the language-bench prediction that JS parity was kernel-specific.
+- The **optimized column-chunk hyparquet adapter** (the review's fair rival — no row objects) is implemented and verified: ingest 176 → 127 ms at 200K (~28% faster than the objects path); interaction identical, as expected (same executor).
+
+**Benchmark honesty upgrades**: lanes are now benchmarked *before* correctness verification so each lane's **first query is honestly cold** and reported as its own column; est. cold @4G = transfer + load + first query (the review's single end-to-end metric); DuckDB uses `IN` lists for multi-select.
+
+Remaining M2 gate items: memory measurement, real map dataset (with nulls).
+</sv-prose>

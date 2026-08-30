@@ -11,16 +11,25 @@ fn main() {
     let dims: Vec<usize> = ["country", "status", "fuel", "region", "owner", "year"]
         .iter().map(|n| t.column_index(n).unwrap()).collect();
     let measure = t.column_index("capacity").unwrap();
-    let cards: Vec<i32> = dims.iter().map(|&d| t.dictionary(d).unwrap().len() as i32).collect();
+    let cards: Vec<usize> = dims.iter().map(|&d| t.dictionary(d).unwrap().len()).collect();
 
     // scripted interactions (deterministic LCG)
     let mut state = 12345u64;
     let mut rng = move || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (state >> 33) as u32 };
-    let mut selected = vec![-1i32; dims.len()];
+    let mut selected: Vec<Vec<u16>> = vec![vec![]; dims.len()];
     let mut times = Vec::new();
     for it in 0..120 {
         let k = (rng() as usize) % dims.len();
-        selected[k] = if selected[k] >= 0 && rng() % 100 < 35 { -1 } else { (rng() as i32) % cards[k] };
+        if !selected[k].is_empty() && rng() % 100 < 35 {
+            selected[k].clear();
+        } else {
+            let code = (rng() % cards[k] as u32) as u16;
+            if let Some(pos) = selected[k].iter().position(|&c| c == code) {
+                selected[k].remove(pos);
+            } else {
+                selected[k].push(code);
+            }
+        }
         let q = FacetQuery { dims: dims.clone(), selected: selected.clone(), measure };
         let t0 = Instant::now();
         let r = t.facet_refresh(&q).unwrap();

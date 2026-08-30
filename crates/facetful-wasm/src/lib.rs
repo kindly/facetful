@@ -81,21 +81,34 @@ pub extern "C" fn table_dict_len(t: usize, col: u32) -> u32 {
     t.dictionary(col as usize).map(|d| d.len() as u32).unwrap_or(0)
 }
 
-/// One facet-interface refresh. Returns a result handle, or 0 on error.
+/// One facet-interface refresh (multi-select: per dim a set of codes).
+/// `sel_lens_ptr`: ndims u32 counts; `sel_values_ptr`: the concatenated u16
+/// codes (sum of lens entries). A dim with len 0 is unfiltered.
+/// Returns a result handle, or 0 on error.
 #[no_mangle]
 pub extern "C" fn facet_refresh(
     t: usize,
     dims_ptr: *const u32,
     ndims: usize,
-    selected_ptr: *const i32,
+    sel_lens_ptr: *const u32,
+    sel_values_ptr: *const u16,
     measure: u32,
 ) -> usize {
     let t = unsafe { &mut *(t as *mut T) };
     let dims = unsafe { core::slice::from_raw_parts(dims_ptr, ndims) };
-    let selected = unsafe { core::slice::from_raw_parts(selected_ptr, ndims) };
+    let lens = unsafe { core::slice::from_raw_parts(sel_lens_ptr, ndims) };
+    let total: usize = lens.iter().map(|&l| l as usize).sum();
+    let values = unsafe { core::slice::from_raw_parts(sel_values_ptr, total) };
+    let mut selected = Vec::with_capacity(ndims);
+    let mut off = 0usize;
+    for &l in lens {
+        let l = l as usize;
+        selected.push(values[off..off + l].to_vec());
+        off += l;
+    }
     let q = FacetQuery {
         dims: dims.iter().map(|&d| d as usize).collect(),
-        selected: selected.to_vec(),
+        selected,
         measure: measure as usize,
     };
     match t.facet_refresh(&q) {

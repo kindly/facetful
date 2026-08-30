@@ -34,13 +34,14 @@ produce identical counts before timing. DuckDB runs via its own worker machinery
 <table id="results" hidden>
   <thead>
     <tr><th>lane</th><th class="num">transfer (gz)</th><th class="num">load</th>
+        <th class="num">first query</th>
         <th class="num">est. cold @ 4G*</th>
         <th class="num">interaction median</th><th class="num">p95</th><th class="num">vs JS objects</th></tr>
   </thead>
   <tbody></tbody>
 </table>
-<p class="muted">*estimated: gzipped asset bytes at 9 Mbps + measured load/init time — an
-approximation of a first visit on a mid 4G connection; local serving hides real network cost.
+<p class="muted">*estimated: gzipped asset bytes at 9 Mbps + measured load/init + the cold FIRST query — an
+approximation of a first visit on a mid 4G connection through to first correct facets; local serving hides real network cost.
 Transfer column = what a gzipping static host would send (measured offline, sizes.json).</p>
 <p id="meta" class="muted"></p>
 <p><button id="copy" hidden>Copy results JSON</button></p>
@@ -71,12 +72,13 @@ Transfer column = what a gzipping static host would send (measured offline, size
     const base = payload.results.find((r) => r.name.startsWith("JS objects"));
     for (const r of payload.results) {
       const transfer = laneTransfer(r.name);
-      const cold = transfer / MBPS_4G * 1000 + r.loadMs;
+      const cold = transfer / MBPS_4G * 1000 + r.loadMs + (r.firstMs || 0);
       const tr = document.createElement("tr");
       tr.innerHTML =
         `<td>${r.name}</td>` +
         `<td class="num">${(transfer / 1048576).toFixed(2)} MB</td>` +
         `<td class="num">${r.loadMs.toFixed(0)} ms</td>` +
+        `<td class="num">${r.firstMs != null ? r.firstMs.toFixed(1) + " ms" : "—"}</td>` +
         `<td class="num">${(cold / 1000).toFixed(2)} s</td>` +
         `<td class="num"><strong>${r.median.toFixed(2)} ms</strong></td>` +
         `<td class="num">${r.p95.toFixed(2)} ms</td>` +
@@ -106,9 +108,11 @@ Transfer column = what a gzipping static host would send (measured offline, size
     const loadMs = performance.now() - t0;
 
     const cond = (values, exceptDim) =>
-      DIM_NAMES.map((d, j) =>
-        j !== exceptDim && values[j] !== null ? `${d} = '${values[j]}'` : null,
-      ).filter(Boolean).join(" AND ");
+      DIM_NAMES.map((d, j) => {
+        if (j === exceptDim || !values[j] || values[j].length === 0) return null;
+        const list = values[j].map((v) => `'${v}'`).join(", ");
+        return `${d} IN (${list})`;
+      }).filter(Boolean).join(" AND ");
 
     const interact = async (values) => {
       const counts = [];
@@ -145,10 +149,13 @@ Transfer column = what a gzipping static host would send (measured offline, size
       }
     }
     const times = [];
+    let firstMs = null;
     for (let i = 0; i < script.length; i++) {
       const s0 = performance.now();
       await interact(script[i]);
-      if (i >= 20) times.push(performance.now() - s0);
+      const el = performance.now() - s0;
+      if (i === 0) firstMs = el;
+      if (i >= 20) times.push(el);
     }
     await conn.close();
     await db.terminate();
@@ -157,6 +164,7 @@ Transfer column = what a gzipping static host would send (measured offline, size
     return {
       name: "DuckDB-WASM (reference, async SQL)",
       loadMs,
+      firstMs,
       median: times[Math.floor(times.length / 2)],
       p95: times[Math.floor(times.length * 0.95)],
     };
@@ -200,7 +208,7 @@ Transfer column = what a gzipping static host would send (measured offline, size
       payload._laneDone = d;
     }
     if (d.type === "hyparquet-done") {
-      payload.results.push(d.result);
+      payload.results.push(...d.results);
       render();
       await maybeDuck(payload._laneDone);
     }

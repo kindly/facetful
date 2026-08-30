@@ -23,11 +23,12 @@ pub struct Table<S: ReadAt> {
 }
 
 /// A facet-refresh request: `dims` are dictionary-encoded Utf8 columns,
-/// `selected[i]` is a dict code or -1 for "no filter", `measure` is a Float64
-/// column summed for totals.
+/// `selected[i]` is the set of selected dict codes for dim i (empty = no
+/// filter — real facet UIs are multi-select), `measure` is a Float64 column
+/// summed for totals.
 pub struct FacetQuery {
     pub dims: Vec<usize>,
-    pub selected: Vec<i32>,
+    pub selected: Vec<Vec<u16>>,
     pub measure: usize,
 }
 
@@ -115,6 +116,25 @@ impl<S: ReadAt> Table<S> {
             .map(|&c| self.dictionary(c).map(|d| d.len()))
             .collect::<Result<_, _>>()?;
         let mut counts: Vec<Vec<u32>> = cards.iter().map(|&c| vec![0u32; c]).collect();
+        // Per-dim membership tables: None = unfiltered, else 1 byte per code.
+        let members: Vec<Option<Vec<u8>>> = q
+            .selected
+            .iter()
+            .zip(&cards)
+            .map(|(sel, &card)| {
+                if sel.is_empty() {
+                    None
+                } else {
+                    let mut m = vec![0u8; card];
+                    for &c in sel {
+                        if (c as usize) < card {
+                            m[c as usize] = 1;
+                        }
+                    }
+                    Some(m)
+                }
+            })
+            .collect();
         let mut mask = vec![0u8; total_rows];
         let mut pass_count = 0u64;
         let mut sum = 0f64;
@@ -134,13 +154,14 @@ impl<S: ReadAt> Table<S> {
                 let mut fails = 0u32;
                 let mut fail_dim = usize::MAX;
                 for k in 0..d {
-                    let s = q.selected[k];
-                    if s >= 0 && dim_codes[k][row] as i32 != s {
-                        fails += 1;
-                        if fails == 2 {
-                            break;
+                    if let Some(m) = &members[k] {
+                        if m[dim_codes[k][row] as usize] == 0 {
+                            fails += 1;
+                            if fails == 2 {
+                                break;
+                            }
+                            fail_dim = k;
                         }
-                        fail_dim = k;
                     }
                 }
                 if fails == 0 {
