@@ -315,3 +315,30 @@ Cross-browser synthesis: the wasm engine and the JS-typed-kernel lane are parity
 
 **Gate verdict: proceed** — with the review's Option C sharpened by evidence: parquet-in via hyparquet is a first-class *source* at small scale, not just a compatibility adapter; `.facetful` must earn its keep at scale and on the range/OPFS paths, which the next experiments measure before the SQL layer is built. DuckDB is no longer the competitor to watch; careful JS over a good representation is. (DuckDB fairness note: batching its 8 queries could improve it, but per-query round trips are how it is actually used from JS.)
 </sv-prose>
+
+<sv-prose id="d12">
+## M1 spike — 1M-row scale run (2026-08-31) and gate closure
+
+**Firefox, 1M rows:**
+
+| lane | transfer (gz) | load | est. cold @4G | median | p95 | vs JS objects |
+|---|---|---|---|---|---|---|
+| JS objects | 12.92 MB | 1,264 ms | 13.3 s | 160 ms | 257 ms | 1.0× |
+| crossfilter2 | 12.93 MB | 3,568 ms | 15.6 s | 31 ms | 77 ms | 5.2× |
+| .facetful → wasm | 9.36 MB | **185 ms** | 8.9 s | 14 ms | 18 ms | 11.4× |
+| parquet → hyparquet → JS kernels | 7.85 MB | 863 ms | 8.2 s | 11 ms | 16 ms | 14.5× |
+| DuckDB-WASM | 20.80 MB | 10,055 ms | 29.4 s | 221 ms | 286 ms | 0.7× |
+
+**Chrome, 1M rows** (no DuckDB): facetful load **164 ms**, median **11.2 ms**, p95 15.0; hyparquet load 567 ms, median 14.6 ms, p95 20.1; crossfilter 23.9 ms; JS objects 142.9 ms.
+
+### What scale proved
+
+1. **Zero-decode load is real and grows with data.** facetful's load is *flat* (161→185 ms Firefox, 148→164 ms Chrome going 200K→1M) while every decode-at-load lane scales linearly: hyparquet 5× (→863/567 ms), JS objects →1.3-1.8 s, crossfilter →2.1-3.6 s. At 1M rows facetful opens **3.5-5× faster than the parquet path** and the gap widens with N. This was the format's core claim; it is now measured.
+2. **Interactions: parity-class, browser-split, wasm never behind by much.** Chrome: wasm 1.3× ahead (11.2 vs 14.6 ms). Firefox: JS kernels slightly ahead (11 vs 14 ms). Both stay comfortably interactive at 1M; crossfilter (24-31 ms, p95 46-77) and JS objects (~150 ms) drop out of the fluid range. Wasm's GROUP BY/SIMD headroom remains unspent.
+3. **DuckDB at 1M:** 221 ms per facet refresh, 10 s load, 29 s cold @4G — behind even the objects baseline. Reference point settled at both scales.
+4. **Transfer still favors parquet** (7.85 vs 9.36 MB gz) until the measured encoding work (u8 codes, narrow ints, Decimal) lands — expected to roughly close the gap.
+
+### Gate closed: outcome 1 with an evidence-sharpened Option C
+
+Proceed with the full design. `.facetful` **clearly wins cold-start and stays parity-or-better on interactions** — its load advantage is structural and scale-growing. The parquet/hyparquet path graduates to a first-class *source* (`db.loadParquet`) whose trade is known precisely: smaller transfer today, decode-at-load cost that grows linearly, no larger-than-memory or range story. Deferred to their milestones (M5/M7) rather than blocking the gate: OPFS larger-than-memory and HTTP-range measurements — the paths only `.facetful` can serve. Real-dataset re-run still owed when the map CSV is available.
+</sv-prose>
