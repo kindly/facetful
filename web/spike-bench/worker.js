@@ -98,6 +98,6 @@ self.onmessage = async (e) => {
       });
     }
   } catch (err) {
-    postMessage({ type: "error", m: String(err.stack || err) });
+    postMessage({ type: "error", m: (err && err.message ? err.message : String(err)) + "\n" + (err && err.stack || "") });
   }
 };

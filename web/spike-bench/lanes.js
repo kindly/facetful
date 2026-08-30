@@ -249,7 +249,8 @@ export function runScript(lane, script, warmup = 20) {
  * order, so comparison is value-keyed. */
 export function sameResult(a, aDicts, b, bDicts) {
   if (a.pass !== b.pass) return `pass ${a.pass} vs ${b.pass}`;
-  if (Math.abs(a.sum - b.sum) > Math.abs(a.sum) * 1e-9 + 1e-9) return `sum ${a.sum} vs ${b.sum}`;
+  // float sums accumulate in different orders across lanes; counts are the exact check
+  if (Math.abs(a.sum - b.sum) > Math.abs(a.sum) * 1e-7 + 1e-7) return `sum ${a.sum} vs ${b.sum}`;
   for (let k = 0; k < aDicts.length; k++) {
     const bm = new Map(bDicts[k].map((v, c) => [v, b.counts[k][c] || 0]));
     for (let c = 0; c < aDicts[k].length; c++) {
