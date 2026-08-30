@@ -248,3 +248,32 @@ Each milestone ends with the size report and the demo page still working — in 
 
 Round 2 approved 2026-08-30, all as suggested: **result shape** = column-major transferable buffers (strings as dictionary codes or offsets+bytes) with a `rows()` convenience layer; **dates** = format + CLI recognize Date/Timestamp in v1, engine treats them as comparable Int64, date functions later; **design approved** — M0 (scaffold + size-budget CI) and the M1 validation spike are underway. The spike runs on synthetic facet-shaped data until a real/anonymised copy of the ~200K-row map CSV is provided, then re-runs on the real thing.
 </sv-prose>
+
+<sv-markup id="d9">
+<div class="alert alert-info w-100">
+  <strong>M1 spike benchmark — run it from any tailnet device:</strong>
+  <a href="http://100.102.221.40:8765/web/spike-bench/index.html" target="_blank">http://100.102.221.40:8765/web/spike-bench/index.html</a>
+  <div class="small text-muted mt-1">200K rows · three lanes (current-style JS objects, crossfilter2, .facetful→wasm), correctness-verified against each other before timing, all in a worker. Press "Run benchmark". Node/V8 preview: facetful 2.45ms vs crossfilter 5.5ms vs JS objects 35.7ms median per interaction. Serving from the repo via <code>python3 -m http.server 8765</code> on the lenovo box.</div>
+</div>
+<iframe src="http://100.102.221.40:8765/web/spike-bench/index.html" style="width:100%;height:34rem;border:1px solid #8884;border-radius:6px" title="facetful spike bench"></iframe>
+</sv-markup>
+
+<sv-prose id="d10">
+## M1 spike — first results (2026-08-30, browser via tailnet, 200K rows)
+
+All lanes verified to produce **identical facet counts and totals** before timing; every lane runs in a worker; interaction = correct filters-except-own counts over 6 dims + totals + top-50.
+
+| lane | assets (raw — local server doesn't gzip) | load | interaction median | p95 | vs current-style JS |
+|---|---|---|---|---|---|
+| JS objects (current-style, correct facets) | 12.63 MB | 203 ms | 29.00 ms | 46.00 ms | 1.0× |
+| crossfilter2 | 12.63 MB | 520 ms | 6.00 ms | 11.00 ms | 4.8× |
+| **.facetful → wasm engine** | **5.51 MB** | **155 ms** | **3.00 ms** | **4.00 ms** | **9.7×** |
+
+Reading against the decision gate:
+- **Interaction: 9.7× over the realistic baseline, 2× over crossfilter** (the strongest specialist) — and the p95 gap is wider still (4 ms vs 46 ms): correct faceting at 200K rows is comfortably 60fps-budget territory only in the facetful lane.
+- **Load: fastest of the three** (155 ms including wasm instantiation, table open, and dictionary extraction) while crossfilter pays 520 ms building its indexes.
+- **Assets: 1.36× smaller transfer** on a real (gzipping) host — 1.98 MB vs 2.69 MB gz. (The bench table shows raw bytes because the local server doesn't compress; the earlier "2.3× smaller" framing was corrected — gzip closes most of the raw gap on text. The raw difference still matters *post-download*: the CSV lanes hold 12.6 MB of text and parse it into ~200K heap objects, while the 5.5 MB .facetful is already the queryable representation.) Known raw fat to reclaim later: per-group dictionary duplication (dict-once) and Int64-where-Int32-fits (narrow-width inference not yet in the CLI). The entire engine adds 19.7 KB gz.
+- Engine binary: **50.7 KB raw / 19.7 KB gz = 6% of the 300 KB budget** with the whole format reader + facet executor inside.
+
+Still open before the gate closes: the DuckDB-WASM reference lane, the hyparquet→JS-kernels lane, throttled cold-load measurement, and a re-run on the real map dataset when available.
+</sv-prose>

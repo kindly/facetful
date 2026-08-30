@@ -21,11 +21,12 @@ worker and are verified to produce identical counts before timing.</p>
 </p>
 <table id="results" hidden>
   <thead>
-    <tr><th>lane</th><th class="num">assets</th><th class="num">load</th>
+    <tr><th>lane</th><th class="num">assets (raw)</th><th class="num">load</th>
         <th class="num">interaction median</th><th class="num">p95</th><th class="num">vs JS objects</th></tr>
   </thead>
   <tbody></tbody>
 </table>
+<p class="muted">Asset sizes are raw/uncompressed (local server sends no Content-Encoding). On a gzipping host: CSV 2.69 MB, .facetful 1.98 MB — a 1.36× transfer difference.</p>
 <p id="meta" class="muted"></p>
 <p><button id="copy" hidden>Copy results JSON</button></p>
 <script type="module">
