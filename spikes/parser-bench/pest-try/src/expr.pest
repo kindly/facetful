@@ -1,0 +1,13 @@
+WHITESPACE = _{ " " | "\t" | "\n" }
+num        = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+string     = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
+ident      = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+call       = { ident ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+atom       = { num | string | call | ident | "(" ~ expr ~ ")" }
+unary      = { ("-" | ^"not")* ~ atom }
+mul        = { unary ~ (("*" | "/") ~ unary)* }
+add        = { mul ~ (("+" | "-") ~ mul)* }
+cmp        = { add ~ (("<=" | ">=" | "!=" | "=" | "<" | ">") ~ add)* }
+conj       = { cmp ~ (^"and" ~ cmp)* }
+expr       = { conj ~ (^"or" ~ conj)* }
+top        = { SOI ~ expr ~ EOI }
