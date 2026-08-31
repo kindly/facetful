@@ -1,0 +1,511 @@
+//! The binder: resolves a parsed Query against a table schema, checks names,
+//! arity and types, classifies aggregate vs scalar context, and validates
+//! GROUP BY shape. This is where the diagnostics users actually feel live —
+//! every error carries the offending span and, where possible, a suggestion.
+
+use super::ast::{BinOp, Expr, Query, SelectItem, SortDir, UnOp};
+use super::span::{suggest, Diagnostic, Span};
+use crate::format::{ColumnType, Schema};
+
+/// Value types as the engine computes them (storage widths erased).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ty {
+    Int,
+    Float,
+    Text,
+    Bool,
+    /// the type of a bare NULL literal — coerces to anything
+    Null,
+}
+
+impl Ty {
+    fn of_column(c: ColumnType) -> Ty {
+        match c {
+            ColumnType::Bool => Ty::Bool,
+            ColumnType::Int8
+            | ColumnType::Int16
+            | ColumnType::Int32
+            | ColumnType::Int64
+            | ColumnType::Date
+            | ColumnType::Timestamp => Ty::Int,
+            ColumnType::Float64 => Ty::Float,
+            ColumnType::Utf8 => Ty::Text,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Ty::Int => "int",
+            Ty::Float => "float",
+            Ty::Text => "text",
+            Ty::Bool => "bool",
+            Ty::Null => "null",
+        }
+    }
+    fn numeric(self) -> bool {
+        matches!(self, Ty::Int | Ty::Float | Ty::Null)
+    }
+    fn coerces_to(self, other: Ty) -> bool {
+        self == other || self == Ty::Null || (self == Ty::Int && other == Ty::Float)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bound {
+    Number(f64),
+    Str(String),
+    Null,
+    Column { index: usize, ty: Ty },
+    Call { func: &'static FuncDef, args: Vec<Bound>, ty: Ty },
+    Unary { op: UnOp, expr: Box<Bound>, ty: Ty },
+    Binary { op: BinOp, lhs: Box<Bound>, rhs: Box<Bound>, ty: Ty },
+}
+
+impl Bound {
+    pub fn ty(&self) -> Ty {
+        match self {
+            Bound::Number(n) => {
+                if n.fract() == 0.0 {
+                    Ty::Int
+                } else {
+                    Ty::Float
+                }
+            }
+            Bound::Str(_) => Ty::Text,
+            Bound::Null => Ty::Null,
+            Bound::Column { ty, .. }
+            | Bound::Call { ty, .. }
+            | Bound::Unary { ty, .. }
+            | Bound::Binary { ty, .. } => *ty,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSelect {
+    pub expr: Bound,
+    pub name: String,
+    /// true when the expression contains an aggregate call
+    pub aggregated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundQuery {
+    pub select: Vec<BoundSelect>,
+    pub filter: Option<Bound>,
+    pub group_by: Vec<Bound>,
+    pub order_by: Vec<(Bound, SortDir)>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+    /// whether the query aggregates at all (explicit GROUP BY or bare aggregates)
+    pub is_aggregate: bool,
+}
+
+// ---------------- function registry ----------------
+
+#[derive(Debug, PartialEq)]
+pub struct FuncDef {
+    pub name: &'static str,
+    pub kind: FuncKind,
+    /// (min_args, max_args) — max None = variadic
+    pub arity: (usize, Option<usize>),
+    pub sig: Sig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuncKind {
+    Scalar,
+    Aggregate,
+}
+
+/// Just enough signature machinery for the v1 registry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Sig {
+    /// args any-type, fixed return
+    Any(Ty),
+    /// all args numeric, returns Float
+    NumericToFloat,
+    /// all args numeric, returns the widest arg type
+    NumericSame,
+    /// first arg text (rest per arity), returns Text
+    TextToText,
+    /// first arg text, returns Int
+    TextToInt,
+    /// comparison-style: args must share a comparable type, returns Bool
+    ComparableToBool,
+    /// all args same type as first, returns that type
+    SameAsFirst,
+}
+
+pub static FUNCS: &[FuncDef] = &[
+    // aggregates
+    FuncDef { name: "count", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::Any(Ty::Int) },
+    FuncDef { name: "count_distinct", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::Any(Ty::Int) },
+    FuncDef { name: "sum", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::NumericSame },
+    FuncDef { name: "avg", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::NumericToFloat },
+    FuncDef { name: "min", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::SameAsFirst },
+    FuncDef { name: "max", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::SameAsFirst },
+    // scalars
+    FuncDef { name: "abs", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericSame },
+    FuncDef { name: "round", kind: FuncKind::Scalar, arity: (1, Some(2)), sig: Sig::NumericSame },
+    FuncDef { name: "floor", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericSame },
+    FuncDef { name: "ceil", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericSame },
+    FuncDef { name: "lower", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::TextToText },
+    FuncDef { name: "upper", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::TextToText },
+    FuncDef { name: "length", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::TextToInt },
+    FuncDef { name: "substr", kind: FuncKind::Scalar, arity: (2, Some(3)), sig: Sig::TextToText },
+    FuncDef { name: "concat", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::TextToText },
+    FuncDef { name: "coalesce", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::SameAsFirst },
+    // desugar targets
+    FuncDef { name: "between", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::ComparableToBool },
+    FuncDef { name: "in", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::ComparableToBool },
+    FuncDef { name: "like", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::ComparableToBool },
+    FuncDef { name: "isnull", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Bool) },
+    FuncDef { name: "if", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::SameAsFirst },
+    FuncDef { name: "case", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::SameAsFirst },
+    FuncDef { name: "int", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Int) },
+    FuncDef { name: "float", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Float) },
+    FuncDef { name: "text", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Text) },
+];
+
+fn lookup_func(name: &str) -> Option<&'static FuncDef> {
+    FUNCS.iter().find(|f| f.name == name)
+}
+
+// ---------------- binder ----------------
+
+pub struct Binder<'a> {
+    schema: &'a Schema,
+}
+
+impl<'a> Binder<'a> {
+    pub fn new(schema: &'a Schema) -> Self {
+        Self { schema }
+    }
+
+    pub fn bind_query(&self, q: &Query) -> Result<BoundQuery, Diagnostic> {
+        let filter = match &q.filter {
+            Some(e) => {
+                // bind permissively so the WHERE-specific message below wins
+                let b = self.bind(e, true)?;
+                if contains_aggregate(&b) {
+                    return Err(Diagnostic::new(
+                        "aggregate functions are not allowed in WHERE",
+                        e.span(),
+                    )
+                    .with_hint("filter on aggregates by wrapping the query later (HAVING is not supported yet)"));
+                }
+                if !matches!(b.ty(), Ty::Bool | Ty::Null) {
+                    return Err(Diagnostic::new(
+                        format!("WHERE needs a boolean condition, this is {}", b.ty().name()),
+                        e.span(),
+                    ));
+                }
+                Some(b)
+            }
+            None => None,
+        };
+
+        let group_by: Vec<Bound> =
+            q.group_by.iter().map(|e| self.bind(e, false)).collect::<Result<_, _>>()?;
+
+        let mut select = Vec::new();
+        for (i, item) in q.select.iter().enumerate() {
+            let b = self.bind(&item.expr, true)?;
+            let aggregated = contains_aggregate(&b);
+            let name = item.alias.clone().unwrap_or_else(|| default_name(&item.expr, i));
+            select.push(BoundSelect { expr: b, name, aggregated });
+        }
+
+        let is_aggregate = !q.group_by.is_empty() || select.iter().any(|s| s.aggregated);
+        if is_aggregate {
+            for (item, bound) in q.select.iter().zip(&select) {
+                // bound comparison — Bound carries no spans, so `country` in the
+                // select list equals `country` in GROUP BY
+                if !bound.aggregated && !group_by.iter().any(|g| g == &bound.expr) {
+                    return Err(Diagnostic::new(
+                        format!(
+                            "'{}' must appear in GROUP BY or be inside an aggregate function",
+                            &bound.name
+                        ),
+                        item.expr.span(),
+                    ));
+                }
+            }
+        }
+
+        let mut order_by = Vec::new();
+        for o in &q.order_by {
+            // ORDER BY may reference select aliases or positions (1-based), like SQL
+            let b = match &o.expr {
+                Expr::Column(name, _) if select.iter().any(|s| &s.name == name) => {
+                    select.iter().find(|s| &s.name == name).unwrap().expr.clone()
+                }
+                Expr::Number(n, span) if n.fract() == 0.0 => {
+                    let idx = *n as usize;
+                    if idx == 0 || idx > select.len() {
+                        return Err(Diagnostic::new(
+                            format!("ORDER BY position {idx} is out of range (1..={})", select.len()),
+                            *span,
+                        ));
+                    }
+                    select[idx - 1].expr.clone()
+                }
+                e => self.bind(e, true)?,
+            };
+            order_by.push((b, o.dir));
+        }
+
+        Ok(BoundQuery {
+            select,
+            filter,
+            group_by,
+            order_by,
+            limit: q.limit,
+            offset: q.offset,
+            is_aggregate,
+        })
+    }
+
+    fn bind(&self, e: &Expr, allow_aggregate: bool) -> Result<Bound, Diagnostic> {
+        match e {
+            Expr::Number(n, _) => Ok(Bound::Number(*n)),
+            Expr::Str(s, _) => Ok(Bound::Str(s.clone())),
+            Expr::Null(_) => Ok(Bound::Null),
+            Expr::Star(span) => Err(Diagnostic::new(
+                "'*' can only be used as count(*) or as the whole select list",
+                *span,
+            )),
+            Expr::Column(name, span) => self.bind_column(name, *span),
+            Expr::Unary { op, expr, span } => {
+                let b = self.bind(expr, allow_aggregate)?;
+                let ty = match op {
+                    UnOp::Neg => {
+                        if !b.ty().numeric() {
+                            return Err(Diagnostic::new(
+                                format!("'-' needs a number, this is {}", b.ty().name()),
+                                *span,
+                            ));
+                        }
+                        b.ty()
+                    }
+                    UnOp::Not => {
+                        if !matches!(b.ty(), Ty::Bool | Ty::Null) {
+                            return Err(Diagnostic::new(
+                                format!("'not' needs a boolean, this is {}", b.ty().name()),
+                                *span,
+                            ));
+                        }
+                        Ty::Bool
+                    }
+                };
+                Ok(Bound::Unary { op: *op, expr: Box::new(b), ty })
+            }
+            Expr::Binary { op, lhs, rhs, span } => {
+                let l = self.bind(lhs, allow_aggregate)?;
+                let r = self.bind(rhs, allow_aggregate)?;
+                let ty = self.binary_type(*op, &l, &r, *span)?;
+                Ok(Bound::Binary { op: *op, lhs: Box::new(l), rhs: Box::new(r), ty })
+            }
+            Expr::Call { name, args, span } => self.bind_call(name, args, *span, allow_aggregate),
+        }
+    }
+
+    fn bind_column(&self, name: &str, span: Span) -> Result<Bound, Diagnostic> {
+        match self.schema.columns.iter().position(|c| c.name == name) {
+            Some(index) => {
+                Ok(Bound::Column { index, ty: Ty::of_column(self.schema.columns[index].ty) })
+            }
+            None => {
+                let mut d = Diagnostic::new(format!("unknown column '{name}'"), span);
+                if let Some(s) = suggest(name, self.schema.columns.iter().map(|c| c.name.as_str()))
+                {
+                    d = d.with_hint(format!("did you mean '{s}'?"));
+                }
+                Err(d)
+            }
+        }
+    }
+
+    fn bind_call(
+        &self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        allow_aggregate: bool,
+    ) -> Result<Bound, Diagnostic> {
+        let Some(func) = lookup_func(name) else {
+            let mut d = Diagnostic::new(format!("unknown function '{name}'"), span);
+            if let Some(s) = suggest(name, FUNCS.iter().map(|f| f.name)) {
+                d = d.with_hint(format!("did you mean '{s}()'?"));
+            }
+            return Err(d);
+        };
+
+        if func.kind == FuncKind::Aggregate && !allow_aggregate {
+            return Err(Diagnostic::new(
+                format!("aggregate function '{name}()' is not allowed here"),
+                span,
+            ));
+        }
+
+        // count(*) special case: the only place Star binds
+        let mut bound_args = Vec::with_capacity(args.len());
+        for a in args {
+            if let (Expr::Star(_), "count") = (a, name) {
+                bound_args.push(Bound::Number(1.0)); // count(*) == count(1)
+                continue;
+            }
+            let b = self.bind(a, false)?; // no aggregates inside call args
+            if func.kind == FuncKind::Aggregate && contains_aggregate(&b) {
+                return Err(Diagnostic::new(
+                    format!("aggregate functions cannot be nested inside '{name}()'"),
+                    a.span(),
+                ));
+            }
+            bound_args.push(b);
+        }
+
+        let (min, max) = func.arity;
+        if bound_args.len() < min || max.map_or(false, |m| bound_args.len() > m) {
+            let want = match max {
+                Some(m) if m == min => format!("{min}"),
+                Some(m) => format!("{min} to {m}"),
+                None => format!("at least {min}"),
+            };
+            return Err(Diagnostic::new(
+                format!("{name}() takes {want} argument(s), got {}", bound_args.len()),
+                span,
+            ));
+        }
+
+        let ty = self.check_sig(func, &bound_args, args, span)?;
+        Ok(Bound::Call { func, args: bound_args, ty })
+    }
+
+    fn check_sig(
+        &self,
+        func: &FuncDef,
+        bound: &[Bound],
+        exprs: &[Expr],
+        span: Span,
+    ) -> Result<Ty, Diagnostic> {
+        let arg_span = |i: usize| exprs.get(i).map(|e| e.span()).unwrap_or(span);
+        match func.sig {
+            Sig::Any(ret) => Ok(ret),
+            Sig::NumericToFloat | Sig::NumericSame => {
+                let mut widest = Ty::Int;
+                for (i, b) in bound.iter().enumerate() {
+                    if !b.ty().numeric() {
+                        return Err(Diagnostic::new(
+                            format!("{}() needs a number, argument {} is {}", func.name, i + 1, b.ty().name()),
+                            arg_span(i),
+                        ));
+                    }
+                    if b.ty() == Ty::Float {
+                        widest = Ty::Float;
+                    }
+                }
+                Ok(if func.sig == Sig::NumericToFloat { Ty::Float } else { widest })
+            }
+            Sig::TextToText | Sig::TextToInt => {
+                if !bound[0].ty().coerces_to(Ty::Text) {
+                    return Err(Diagnostic::new(
+                        format!("{}() needs text, this is {}", func.name, bound[0].ty().name()),
+                        arg_span(0),
+                    ));
+                }
+                Ok(if func.sig == Sig::TextToText { Ty::Text } else { Ty::Int })
+            }
+            Sig::ComparableToBool => {
+                let base = bound[0].ty();
+                for (i, b) in bound.iter().enumerate().skip(1) {
+                    if !(b.ty().coerces_to(base) || base.coerces_to(b.ty())) {
+                        return Err(Diagnostic::new(
+                            format!(
+                                "{}() compares {} values, argument {} is {}",
+                                func.name, base.name(), i + 1, b.ty().name()
+                            ),
+                            arg_span(i),
+                        ));
+                    }
+                }
+                Ok(Ty::Bool)
+            }
+            Sig::SameAsFirst => {
+                // if/case: value type comes from the first value position
+                let ret = match func.name {
+                    "if" => bound[1].ty(),
+                    "case" => bound[1].ty(),
+                    _ => bound[0].ty(),
+                };
+                Ok(ret)
+            }
+        }
+    }
+
+    fn binary_type(&self, op: BinOp, l: &Bound, r: &Bound, span: Span) -> Result<Ty, Diagnostic> {
+        use BinOp::*;
+        match op {
+            Add | Sub | Mul | Div | Mod => {
+                if !l.ty().numeric() || !r.ty().numeric() {
+                    return Err(Diagnostic::new(
+                        format!(
+                            "arithmetic needs numbers, got {} and {}",
+                            l.ty().name(), r.ty().name()
+                        ),
+                        span,
+                    )
+                    .with_hint("to join text use '||' or concat()"));
+                }
+                Ok(if l.ty() == Ty::Float || r.ty() == Ty::Float || op == Div {
+                    Ty::Float
+                } else {
+                    Ty::Int
+                })
+            }
+            Eq | Ne | Lt | Le | Gt | Ge => {
+                if !(l.ty().coerces_to(r.ty()) || r.ty().coerces_to(l.ty())) {
+                    return Err(Diagnostic::new(
+                        format!("cannot compare {} with {}", l.ty().name(), r.ty().name()),
+                        span,
+                    ));
+                }
+                Ok(Ty::Bool)
+            }
+            And | Or => {
+                for side in [l, r] {
+                    if !matches!(side.ty(), Ty::Bool | Ty::Null) {
+                        return Err(Diagnostic::new(
+                            format!(
+                                "'{}' needs boolean operands, got {}",
+                                if op == And { "and" } else { "or" },
+                                side.ty().name()
+                            ),
+                            span,
+                        ));
+                    }
+                }
+                Ok(Ty::Bool)
+            }
+        }
+    }
+}
+
+pub fn contains_aggregate(b: &Bound) -> bool {
+    match b {
+        Bound::Call { func, args, .. } => {
+            func.kind == FuncKind::Aggregate || args.iter().any(contains_aggregate)
+        }
+        Bound::Unary { expr, .. } => contains_aggregate(expr),
+        Bound::Binary { lhs, rhs, .. } => contains_aggregate(lhs) || contains_aggregate(rhs),
+        _ => false,
+    }
+}
+
+fn default_name(e: &Expr, i: usize) -> String {
+    match e {
+        Expr::Column(name, _) => name.clone(),
+        Expr::Call { name, .. } => name.clone(),
+        _ => format!("column{}", i + 1),
+    }
+}

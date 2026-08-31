@@ -2,6 +2,7 @@
 //! Design decisions and error-message philosophy: docs/sql-parser.sv.
 
 pub mod ast;
+pub mod binder;
 pub mod lexer;
 pub mod parser;
 pub mod span;
