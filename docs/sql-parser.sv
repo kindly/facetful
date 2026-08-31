@@ -85,3 +85,19 @@ Build order: spans + diagnostics renderer → lexer → AST → parser (skeleton
 
 
 </sv-page>
+
+<sv-prose id="p4">
+## Build log 1: lexer + parser + diagnostics are in (commit-level notes for review)
+
+**What exists** (`crates/facetful-engine/src/sql/`, 12 tests green): spans + caret-snippet diagnostic renderer + edit-distance `suggest()` (span.rs), a hand lexer (lexer.rs), the small AST (ast.rs), and the descent+Pratt parser with the full idiom-sugar set (parser.rs).
+
+**Decisions worth your eyes:**
+1. **Keyword-named function spellings survive reservation.** `between`, `in`, `like`, `case` are keywords, so `between(x,1,5)` initially failed to parse — the tests caught it. Fix: in prefix position, a sugar keyword followed by `(` is a function call. Both spellings now provably produce identical ASTs (`idioms_desugar_to_function_calls` test asserts tree-equality).
+2. **BETWEEN's `AND` ambiguity** is one line: the middle operand parses at binding power above AND, so `x between 1 and 5 and y = 2` groups correctly (tested).
+3. **Bare aliases** are in (`select sum(x) total from t`) — LLMs emit them constantly. Cost: a name after an expression is always an alias, which makes some missing-comma errors read as alias errors; acceptable, and the FROM-expected error hints about commas.
+4. **`"quoted"` identifiers** escape the keyword list (`select "between" from t` works) — the safety valve for reserving keywords upfront.
+5. **Error messages are tested as a feature** — exact-content assertions, e.g. `expected ')' to close the arguments of sum(`, the unterminated-string hint about `''` escaping, `between is written: x between low and high`, and a line/column pointer test.
+6. `--` line comments, `''` string escaping, `<>` as not-equals, case-insensitive keywords — the small LLM/SQL-culture compatibilities.
+
+**Next**: the binder (name resolution against the catalog with did-you-mean, arity/type checks — where the best diagnostics live), then the SELECT pipeline mapping bound queries onto the existing executor, then the `facetful query` REPL.
+</sv-prose>
