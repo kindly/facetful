@@ -8,6 +8,8 @@
 
 pub use facetful_format as format;
 
+pub mod sql;
+
 use format::read::{self, ReadAt};
 use format::{Catalog, ColumnType, FormatError};
 

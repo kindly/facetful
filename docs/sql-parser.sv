@@ -75,30 +75,13 @@ Context: the whole engine is currently 21 KB gz. pest would roughly double the b
 Either way, the **binder diagnostics** (did-you-mean columns/functions, arity/type errors with spans) get built identically — they're most of the perceived "good errors" and no library provides them.
 </sv-prose>
 
-<sv-ask id="pq1" round="1">
-**Parser approach?**
-- * Hand-rolled lexer + Pratt + diagnostics module — best errors, smallest, the learning part; pest as named fallback
-- pest — grammar file as spec, 25 KB gz, good errors out of the box, less to write
-- rust-peg — pure codegen, no grammar file, 34 KB gz
-- sqlite3-parser — battle-tested full SQLite grammar (contradicts functions-over-syntax; 51 KB gz)
-</sv-ask>
+<sv-prose id="p3">
+## Decisions (round 1, approved 2026-08-31)
 
-<sv-ask id="pq2" round="1">
-**Syntax surface?** (revised after the LLM-emission discussion on this page: LLMs emit standard SQL idioms unprompted, and SQL-as-agent-interface is a project aim)
-- * LLM idiom set as sugar — accept IN, IS [NOT] NULL, BETWEEN, [NOT] LIKE, CASE WHEN, CAST, COUNT(DISTINCT) and desugar to the same function-call AST (function spellings stay valid); reserve the keyword set upfront; ~1,200-1,500 LoC parser
-- Functions-only v1, add sugar in v2 — smallest start, but early LLM consumers hit failures until v2
-- Fuller SQL beyond the idiom set (subqueries in expressions, etc.) — the genuinely costly tail
-</sv-ask>
+**Hand-rolled lexer + Pratt parser + diagnostics module** (pest the named fallback) · **LLM idiom set as sugar** — IN, IS [NOT] NULL, BETWEEN, [NOT] LIKE, CASE WHEN, CAST, COUNT(DISTINCT), `||` all desugar to the function-call AST; function spellings stay valid; keyword set reserved upfront · **Claude builds it end to end, with detailed design input to David as it goes** — key decisions narrated on this page for review, not just committed.
 
-<sv-ask id="pq3" round="1">
-**Who writes the parser?** (M3 split)
-- Claude builds it end to end
-- * Claude scaffolds (AST, token/span types, diagnostics renderer, planner plumbing) — David writes the grammar/parse functions
-- David writes it solo; Claude reviews
-</sv-ask>
+Build order: spans + diagnostics renderer → lexer → AST → parser (skeleton + Pratt + sugar) → binder (did-you-mean, arity/type checks) → SELECT pipeline over the existing executor → `facetful query` REPL → error-message and desugar-equivalence test suites.
+</sv-prose>
 
-<sv-ask id="pq4" round="1" role="close">
-**SQL-parser direction sign-off.** On approval, M3 starts in the agreed split, building against the existing executor (facet queries become one consumer of the general SELECT pipeline).
-</sv-ask>
 
 </sv-page>
