@@ -84,10 +84,10 @@ Either way, the **binder diagnostics** (did-you-mean columns/functions, arity/ty
 </sv-ask>
 
 <sv-ask id="pq2" round="1">
-**Confirm functions-over-syntax?** (the table in the first section: between/in/like/if/isnull/concat as functions; no BETWEEN, CASE, CAST, IS NULL, ||, or DISTINCT-inside-calls syntax)
-- * Yes — minimal syntax, functions for everything beyond the query skeleton
-- Mostly — but keep `IN (…)` and `IS NULL` as syntax (they're muscle-memory SQL)
-- Prefer fuller SQL syntax even at parser-complexity cost
+**Syntax surface?** (revised after the LLM-emission discussion on this page: LLMs emit standard SQL idioms unprompted, and SQL-as-agent-interface is a project aim)
+- * LLM idiom set as sugar — accept IN, IS [NOT] NULL, BETWEEN, [NOT] LIKE, CASE WHEN, CAST, COUNT(DISTINCT) and desugar to the same function-call AST (function spellings stay valid); reserve the keyword set upfront; ~1,200-1,500 LoC parser
+- Functions-only v1, add sugar in v2 — smallest start, but early LLM consumers hit failures until v2
+- Fuller SQL beyond the idiom set (subqueries in expressions, etc.) — the genuinely costly tail
 </sv-ask>
 
 <sv-ask id="pq3" round="1">
