@@ -101,3 +101,17 @@ Build order: spans + diagnostics renderer → lexer → AST → parser (skeleton
 
 **Next**: the binder (name resolution against the catalog with did-you-mean, arity/type checks — where the best diagnostics live), then the SELECT pipeline mapping bound queries onto the existing executor, then the `facetful query` REPL.
 </sv-prose>
+
+<sv-prose id="p5">
+## Build log 2: the binder (commit f90817f)
+
+Name resolution, arity and type checking, and the aggregate rules — with the diagnostics tested as features:
+
+- **Did-you-mean** works both ways: `unknown column 'contry' — did you mean 'country'?` and `unknown function 'cont' — did you mean 'count()'?` (edit-distance over schema/registry).
+- **Type system**: Int/Float/Text/Bool + Null-coerces-to-anything, Int→Float widening; arithmetic on text gets a hint pointing at `||`/concat; `WHERE` requires a boolean and says what it got instead.
+- **Aggregate rules**, each with a tailored message: no aggregates in WHERE (hints that HAVING isn't supported yet); nested aggregates rejected (`sum(sum(x))`) while `round(sum(x))` stays legal; non-aggregated select items must appear in GROUP BY — validated on *bound* expressions so spans don't defeat the comparison (a bug the tests caught).
+- **SQL culture**: `count(*)` binds as count(1); ORDER BY accepts select aliases and 1-based positions.
+- The function registry (aggregates, scalars, desugar targets) is one static table — a UDF registration API later extends it rather than replacing it.
+
+**Next**: the execution pipeline — compiling a BoundQuery onto the existing vectorized executor (scan → filter → group/aggregate → sort → limit), then the `facetful query` REPL.
+</sv-prose>
