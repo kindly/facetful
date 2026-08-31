@@ -355,7 +355,11 @@ impl<'a> Binder<'a> {
                 bound_args.push(Bound::Number(1.0)); // count(*) == count(1)
                 continue;
             }
-            let b = self.bind(a, false)?; // no aggregates inside call args
+            // scalar calls pass the context through (round(sum(x)) is legal in a
+            // select list); aggregate calls bind permissively so the tailored
+            // nested-aggregate error below fires instead of a generic one
+            let arg_allow = if func.kind == FuncKind::Aggregate { true } else { allow_aggregate };
+            let b = self.bind(a, arg_allow)?;
             if func.kind == FuncKind::Aggregate && contains_aggregate(&b) {
                 return Err(Diagnostic::new(
                     format!("aggregate functions cannot be nested inside '{name}()'"),
