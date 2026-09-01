@@ -18,10 +18,124 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("convert") => convert(&args[1..]),
         Some("inspect") => inspect(&args[1..]),
+        Some("query") => query(&args[1..]),
         _ => {
             eprintln!("usage: facetful convert in.csv out.facetful [--row-group-size N]");
             eprintln!("       facetful inspect file.facetful");
+            eprintln!("       facetful query file.facetful [\"select …\"]   (no SQL = REPL)");
             exit(2);
+        }
+    }
+}
+
+// ---------------- query / REPL ----------------
+
+fn query(args: &[String]) {
+    use facetful_engine::sql::exec::Val;
+    use facetful_engine::sql::run_query;
+    use facetful_engine::Table;
+    use std::io::{BufRead, Write};
+
+    let Some(path) = args.first() else {
+        eprintln!("usage: facetful query file.facetful [\"select …\"]");
+        exit(2);
+    };
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("cannot read {path}: {e}");
+        exit(1);
+    });
+    let mut table = Table::open(bytes).unwrap_or_else(|e| {
+        eprintln!("{path}: {e}");
+        exit(1);
+    });
+
+    let render = |v: &Val| -> String {
+        match v {
+            Val::Null => "".into(),
+            Val::Bool(b) => b.to_string(),
+            Val::Int(i) => i.to_string(),
+            Val::Float(f) => {
+                if f.fract() == 0.0 { format!("{f:.1}") } else { format!("{f}") }
+            }
+            Val::Text(s) => s.to_string(),
+        }
+    };
+
+    let one_shot = args.get(1).cloned();
+    if one_shot.is_none() {
+        let cat = table.catalog();
+        eprintln!(
+            "facetful query — {} rows, {} columns. SQL at the prompt; empty line or ctrl-d quits.",
+            cat.total_rows,
+            cat.schema.columns.len()
+        );
+        let names: Vec<&str> = cat.schema.columns.iter().map(|c| c.name.as_str()).collect();
+        eprintln!("columns: {} (table name: t)", names.join(", "));
+    }
+
+    let mut run_one = |sql: &str| {
+        let t0 = std::time::Instant::now();
+        match run_query(&mut table, sql) {
+            Err(d) => eprint!("{}", d.render(sql)),
+            Ok(r) => {
+                let mut widths: Vec<usize> = r.columns.iter().map(|c| c.len()).collect();
+                let cells: Vec<Vec<String>> = r
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                let s = render(v);
+                                widths[i] = widths[i].max(s.len());
+                                s
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let line = |cols: &[String]| {
+                    cols.iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("{c:<w$}", w = widths[i]))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                };
+                println!("{}", line(&r.columns));
+                println!("{}", widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("  "));
+                for row in &cells {
+                    println!("{}", line(row));
+                }
+                println!(
+                    "({} row{}, {:.1} ms)",
+                    cells.len(),
+                    if cells.len() == 1 { "" } else { "s" },
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+    };
+
+    if let Some(sql) = one_shot {
+        run_one(&sql);
+        return;
+    }
+
+    // REPL
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("facetful> ");
+        std::io::stderr().flush().ok();
+        let mut linebuf = String::new();
+        match stdin.lock().read_line(&mut linebuf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let sql = linebuf.trim();
+                if sql.is_empty() {
+                    break;
+                }
+                run_one(sql);
+            }
+            Err(_) => break,
         }
     }
 }
@@ -306,7 +420,7 @@ fn convert(args: &[String]) {
                     }
                 };
                 let null_count = validity
-                    .map(|(bits, nulls)| *nulls)
+                    .map(|(_bits, nulls)| *nulls)
                     .unwrap_or(0);
                 ColumnChunk {
                     data,

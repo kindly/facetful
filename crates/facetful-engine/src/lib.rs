@@ -60,6 +60,44 @@ impl<S: ReadAt> Table<S> {
         &self.cat
     }
 
+    /// Integer column of any storage width, widened to i64 (Date/Timestamp too).
+    pub(crate) fn i64s(&mut self, group: usize, col: usize) -> Result<Vec<i64>, FormatError> {
+        let ty = self.cat.schema.columns[col].ty;
+        let w = ty.fixed_width().ok_or(FormatError::Corrupt("not a fixed-width column"))?;
+        let rows = self.cat.groups[group].row_count as usize;
+        let seg = self.segment(group, col, 0)?;
+        Ok(match w {
+            1 => seg[..rows].iter().map(|&b| b as i8 as i64).collect(),
+            2 => seg[..rows * 2].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as i64).collect(),
+            4 => seg[..rows * 4].chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64).collect(),
+            _ => seg[..rows * 8].chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect(),
+        })
+    }
+
+    /// Plain (non-dict) Utf8 column materialized as strings.
+    pub(crate) fn texts(&mut self, group: usize, col: usize) -> Result<Vec<String>, FormatError> {
+        let rows = self.cat.groups[group].row_count as usize;
+        let offs_seg = self.segment(group, col, 0)?.to_vec();
+        let bytes_seg = self.segment(group, col, 1)?;
+        let offs: Vec<u32> = offs_seg[..(rows + 1) * 4]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let mut out = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let (a, b) = (offs[i] as usize, offs[i + 1] as usize);
+            out.push(String::from_utf8_lossy(&bytes_seg[a..b]).into_owned());
+        }
+        Ok(out)
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.cat.groups.len()
+    }
+    pub fn group_rows(&self, g: usize) -> usize {
+        self.cat.groups[g].row_count as usize
+    }
+
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.cat.schema.columns.iter().position(|c| c.name == name)
     }
@@ -72,7 +110,7 @@ impl<S: ReadAt> Table<S> {
         Ok(self.cache[group][col][seg].as_deref().unwrap())
     }
 
-    fn codes(&mut self, group: usize, col: usize) -> Result<Vec<u16>, FormatError> {
+    pub(crate) fn codes(&mut self, group: usize, col: usize) -> Result<Vec<u16>, FormatError> {
         debug_assert!(self.cat.schema.columns[col].is_dict());
         let rows = self.cat.groups[group].row_count as usize;
         let width = self.cat.schema.columns[col].code_width();
@@ -87,14 +125,14 @@ impl<S: ReadAt> Table<S> {
     }
 
     /// Validity bitmap for (group, col): None when the chunk has no nulls.
-    fn validity(&mut self, group: usize, col: usize) -> Result<Option<Vec<u8>>, FormatError> {
+    pub(crate) fn validity(&mut self, group: usize, col: usize) -> Result<Option<Vec<u8>>, FormatError> {
         if self.cat.groups[group].cols[col].null_count == 0 {
             return Ok(None);
         }
         Ok(Some(self.segment(group, col, 2)?.to_vec()))
     }
 
-    fn f64s(&mut self, group: usize, col: usize) -> Result<Vec<f64>, FormatError> {
+    pub(crate) fn f64s(&mut self, group: usize, col: usize) -> Result<Vec<f64>, FormatError> {
         debug_assert_eq!(self.cat.schema.columns[col].ty, ColumnType::Float64);
         let rows = self.cat.groups[group].row_count as usize;
         let seg = self.segment(group, col, 0)?;

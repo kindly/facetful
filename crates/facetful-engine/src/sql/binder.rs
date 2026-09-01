@@ -3,7 +3,7 @@
 //! GROUP BY shape. This is where the diagnostics users actually feel live —
 //! every error carries the offending span and, where possible, a suggestion.
 
-use super::ast::{BinOp, Expr, Query, SelectItem, SortDir, UnOp};
+use super::ast::{BinOp, Expr, Query, SortDir, UnOp};
 use super::span::{suggest, Diagnostic, Span};
 use crate::format::{ColumnType, Schema};
 

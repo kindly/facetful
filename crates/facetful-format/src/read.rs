@@ -11,6 +11,15 @@ pub trait ReadAt {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError>;
 }
 
+impl ReadAt for Vec<u8> {
+    fn len(&self) -> u64 {
+        Vec::len(self) as u64
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        self.as_slice().read_at(offset, buf)
+    }
+}
+
 impl ReadAt for &[u8] {
     fn len(&self) -> u64 {
         <[u8]>::len(self) as u64

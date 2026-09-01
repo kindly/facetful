@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 facetful-format = { path = "../facetful-format" }
+facetful-engine = { path = "../facetful-engine" }
