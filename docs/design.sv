@@ -424,6 +424,8 @@ Remaining M2 gate item: **the real map dataset** — everything else from the re
 <sv-prose id="d17">
 ## Product posture (adopted 2026-08-31, per third review): Parquet public, .facetful internal
 
+*Superseded/refined 2026-09-01 by the [compiled-image conclusion](/p/facetful-compiled-image): Parquet = source, .facetful = rebuildable engine-ABI-keyed execution image; AOT native compiler + optional lazy browser compiler; sidecar publishing for controlled deployments; rebuild-not-migrate. Review disciplines recorded on that page.*
+
 | layer | choice |
 |---|---|
 | Public input contract | **Parquet** (and CSV via the CLI) — publishers change nothing |
