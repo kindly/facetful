@@ -115,3 +115,37 @@ Name resolution, arity and type checking, and the aggregate rules — with the d
 
 **Next**: the execution pipeline — compiling a BoundQuery onto the existing vectorized executor (scan → filter → group/aggregate → sort → limit), then the `facetful query` REPL.
 </sv-prose>
+
+<sv-prose id="p6">
+## Build log 3: executor + REPL — M3 core complete
+
+`facetful query spikes/facet-spike/data-200000.facetful` now answers real SQL:
+
+```
+facetful> select country, count(*) as n, round(sum(capacity), 1) as total
+          from t where status in ('status_0','status_1')
+          group by country order by total desc limit 5
+country    n     total
+---------  ----  --------
+country_0  4297  153153.5
+…
+(5 rows, 52.1 ms)
+```
+
+And the diagnostics survive the whole pipeline:
+
+```
+facetful> select contry, sum(capacit) from t group by country
+error: unknown column 'contry'
+  --> line 1, column 8
+   | select contry, sum(capacit) from t group by country
+   |        ^^^^^^
+hint: did you mean 'country'?
+```
+
+**Semantics choices** (SQLite-compatible where there was a choice): three-valued logic (only TRUE passes WHERE; `x > NULL` filters out); sum/avg/min/max/count(x) skip nulls, `count(*)` doesn't; empty aggregate → `count 0, sum NULL`; GROUP BY groups NULLs together and `1` groups with `1.0`; ORDER BY puts NULL smallest; division by zero → NULL; LIKE is `%`/`_` with ASCII case-insensitivity.
+
+**Shape**: the executor is a correct-first row-wise interpreter over per-group cached columns (dictionary values Rc'd once, so no string copies per row). Expressions over aggregates (`sum(x)/count(x)`) work via override resolution in group context. 8 end-to-end tests; 32 green across the workspace.
+
+**Known backlog, deliberately deferred**: row-group min/max pruning isn't wired into SQL scans yet; expression evaluation is row-wise (52 ms for a filtered GROUP BY at 200K vs ~1 ms for the specialized facet kernels — the gap is the vectorization work); dict-code fast paths for string equality. Correctness first, then the M6 benchmarks decide where optimization effort goes.
+</sv-prose>
