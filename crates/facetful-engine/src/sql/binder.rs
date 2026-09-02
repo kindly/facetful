@@ -51,7 +51,7 @@ impl Ty {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bound {
-    Number(f64),
+    Number(f64, /*is_float*/ bool),
     Str(String),
     Null,
     Column { index: usize, ty: Ty },
@@ -63,12 +63,8 @@ pub enum Bound {
 impl Bound {
     pub fn ty(&self) -> Ty {
         match self {
-            Bound::Number(n) => {
-                if n.fract() == 0.0 {
-                    Ty::Int
-                } else {
-                    Ty::Float
-                }
+            Bound::Number(_, is_float) => {
+                if *is_float { Ty::Float } else { Ty::Int }
             }
             Bound::Str(_) => Ty::Text,
             Bound::Null => Ty::Null,
@@ -240,7 +236,7 @@ impl<'a> Binder<'a> {
                 Expr::Column(name, _) if select.iter().any(|s| &s.name == name) => {
                     select.iter().find(|s| &s.name == name).unwrap().expr.clone()
                 }
-                Expr::Number(n, span) if n.fract() == 0.0 => {
+                Expr::Number(n, false, span) if n.fract() == 0.0 => {
                     let idx = *n as usize;
                     if idx == 0 || idx > select.len() {
                         return Err(Diagnostic::new(
@@ -268,7 +264,7 @@ impl<'a> Binder<'a> {
 
     fn bind(&self, e: &Expr, allow_aggregate: bool) -> Result<Bound, Diagnostic> {
         match e {
-            Expr::Number(n, _) => Ok(Bound::Number(*n)),
+            Expr::Number(n, f, _) => Ok(Bound::Number(*n, *f)),
             Expr::Str(s, _) => Ok(Bound::Str(s.clone())),
             Expr::Null(_) => Ok(Bound::Null),
             Expr::Star(span) => Err(Diagnostic::new(
@@ -352,7 +348,7 @@ impl<'a> Binder<'a> {
         let mut bound_args = Vec::with_capacity(args.len());
         for a in args {
             if let (Expr::Star(_), "count") = (a, name) {
-                bound_args.push(Bound::Number(1.0)); // count(*) == count(1)
+                bound_args.push(Bound::Number(1.0, false)); // count(*) == count(1)
                 continue;
             }
             // scalar calls pass the context through (round(sum(x)) is legal in a

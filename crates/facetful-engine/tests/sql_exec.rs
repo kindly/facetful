@@ -149,3 +149,30 @@ fn expression_over_aggregates() {
     let rows = q("select sum(capacity) / count(capacity) as manual_avg from t where region = 'eu'");
     assert_eq!(rows, vec![vec!["5.6"]]); // 28/5
 }
+
+#[test]
+fn integer_division_truncates_like_sqlite() {
+    let rows = q("select 7 / 2, 7.0 / 2, 7 / 0 from t limit 1");
+    assert_eq!(rows, vec![vec!["3", "3.5", "NULL"]]);
+}
+
+#[test]
+fn minmax_pruning_skips_groups_and_keeps_results() {
+    // year lives in [2000, 2004] in BOTH groups (no pruning there), but a
+    // year > 9000 filter prunes everything
+    let mut t = table();
+    let r = facetful_engine::sql::run_query(&mut t, "select count(*) from t where year > 9000").unwrap();
+    assert_eq!(r.scanned_groups, 0);
+    assert_eq!(r.total_groups, 2);
+    match &r.rows[0][0] {
+        Val::Int(0) => {}
+        v => panic!("expected 0, got {v:?}"),
+    }
+    // equality inside the range scans, and answers match the unpruned truth
+    let r = facetful_engine::sql::run_query(&mut t, "select count(*) from t where year = 2001").unwrap();
+    assert_eq!(r.scanned_groups, 2);
+    match &r.rows[0][0] {
+        Val::Int(2) => {}
+        v => panic!("expected 2, got {v:?}"),
+    }
+}

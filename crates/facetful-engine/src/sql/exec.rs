@@ -99,6 +99,9 @@ impl BitsHash for (u8, f64) {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Val>>,
+    /// row groups actually scanned vs total (min/max pruning effect)
+    pub scanned_groups: usize,
+    pub total_groups: usize,
 }
 
 /// One row group's referenced columns, materialized.
@@ -157,6 +160,9 @@ pub fn execute<S: ReadAt>(
         }
     }
 
+    // Min/max pruning: numeric range constraints from the filter's AND-chain.
+    let constraints = q.filter.as_ref().map(collect_ranges).unwrap_or_default();
+
     // Aggregate pipeline state
     let agg_calls: Vec<Bound> = {
         let mut v = Vec::new();
@@ -170,7 +176,12 @@ pub fn execute<S: ReadAt>(
     // Non-aggregate pipeline: projected rows (+ hidden order keys)
     let mut out_rows: Vec<(Vec<Val>, Vec<Val>)> = Vec::new();
 
+    let mut scanned_groups = 0usize;
     for g in 0..table.group_count() {
+        if group_prunable(table, g, &constraints) {
+            continue;
+        }
+        scanned_groups += 1;
         let rows = table.group_rows(g);
         let mut cols = HashMap::new();
         for &c in &needed {
@@ -261,7 +272,75 @@ pub fn execute<S: ReadAt>(
     let rows: Vec<Vec<Val>> =
         rows.into_iter().skip(offset).take(limit).map(|(p, _)| p).collect();
 
-    Ok(QueryResult { columns, rows })
+    Ok(QueryResult { columns, rows, scanned_groups, total_groups: table.group_count() })
+}
+
+/// (column, lower bound incl, upper bound incl) — None = unbounded on that side.
+type Range = (usize, Option<f64>, Option<f64>);
+
+/// Extract per-column numeric ranges from the top-level AND-chain of the filter.
+/// Conservative: anything unrecognized contributes nothing (never over-prunes).
+fn collect_ranges(f: &Bound) -> Vec<Range> {
+    let mut out = Vec::new();
+    walk_and(f, &mut out);
+    out
+}
+
+fn walk_and(b: &Bound, out: &mut Vec<Range>) {
+    match b {
+        Bound::Binary { op: BinOp::And, lhs, rhs, .. } => {
+            walk_and(lhs, out);
+            walk_and(rhs, out);
+        }
+        Bound::Binary { op, lhs, rhs, .. } => {
+            let (col, lit, flipped) = match (&**lhs, &**rhs) {
+                (Bound::Column { index, .. }, Bound::Number(n, _)) => (*index, *n, false),
+                (Bound::Number(n, _), Bound::Column { index, .. }) => (*index, *n, true),
+                _ => return,
+            };
+            let op = if flipped {
+                match op {
+                    BinOp::Lt => BinOp::Gt,
+                    BinOp::Le => BinOp::Ge,
+                    BinOp::Gt => BinOp::Lt,
+                    BinOp::Ge => BinOp::Le,
+                    o => *o,
+                }
+            } else {
+                *op
+            };
+            match op {
+                BinOp::Eq => out.push((col, Some(lit), Some(lit))),
+                BinOp::Lt | BinOp::Le => out.push((col, None, Some(lit))),
+                BinOp::Gt | BinOp::Ge => out.push((col, Some(lit), None)),
+                _ => {}
+            }
+        }
+        Bound::Call { func, args, .. } if func.name == "between" => {
+            if let (Bound::Column { index, .. }, Bound::Number(lo, _), Bound::Number(hi, _)) =
+                (&args[0], &args[1], &args[2])
+            {
+                out.push((*index, Some(*lo), Some(*hi)));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn group_prunable<S: ReadAt>(table: &Table<S>, g: usize, constraints: &[Range]) -> bool {
+    use crate::format::Stats;
+    for (col, lo, hi) in constraints {
+        let stats = &table.catalog().groups[g].cols[*col].stats;
+        let (smin, smax) = match stats {
+            Stats::Int { min, max } => (*min as f64, *max as f64),
+            Stats::Float { min, max } => (*min, *max),
+            Stats::None => continue,
+        };
+        if lo.map_or(false, |l| smax < l) || hi.map_or(false, |h| smin > h) {
+            return true; // the group's range cannot intersect the constraint
+        }
+    }
+    false
 }
 
 fn collect_columns(b: &Bound, out: &mut Vec<usize>) {
@@ -400,7 +479,7 @@ fn eval_grouped(b: &Bound, o: &Overrides<'_>) -> Val {
         return o.key[i].clone();
     }
     match b {
-        Bound::Number(n) => num_val(*n),
+        Bound::Number(n, f) => num_val(*n, *f),
         Bound::Str(s) => Val::text(s.clone()),
         Bound::Null => Val::Null,
         Bound::Unary { op, expr, .. } => eval_unary(*op, eval_grouped(expr, o)),
@@ -417,8 +496,8 @@ fn eval_grouped(b: &Bound, o: &Overrides<'_>) -> Val {
 
 // ---------------- row-wise evaluation ----------------
 
-fn num_val(n: f64) -> Val {
-    if n.fract() == 0.0 && n.abs() < 9e15 {
+fn num_val(n: f64, is_float: bool) -> Val {
+    if !is_float && n.fract() == 0.0 && n.abs() < 9e15 {
         Val::Int(n as i64)
     } else {
         Val::Float(n)
@@ -427,7 +506,7 @@ fn num_val(n: f64) -> Val {
 
 fn eval(b: &Bound, ctx: &GroupCtx, row: usize, _unused: Option<()>) -> Val {
     match b {
-        Bound::Number(n) => num_val(*n),
+        Bound::Number(n, f) => num_val(*n, *f),
         Bound::Str(s) => Val::text(s.clone()),
         Bound::Null => Val::Null,
         Bound::Column { index, .. } => ctx.value(*index, row),
@@ -494,9 +573,14 @@ fn eval_binary(op: BinOp, l: Val, r: Val) -> Val {
                 }
             }
         }
-        Div => match (l.as_f64(), r.as_f64()) {
-            (Some(a), Some(b)) if b != 0.0 => Val::Float(a / b),
-            _ => Val::Null, // division by zero -> NULL (SQLite semantics)
+        Div => match (&l, &r) {
+            // SQLite semantics: int/int truncates; anything/0 -> NULL
+            (Val::Int(_), Val::Int(0)) => Val::Null,
+            (Val::Int(a), Val::Int(b)) => Val::Int(a / b),
+            _ => match (l.as_f64(), r.as_f64()) {
+                (Some(a), Some(b)) if b != 0.0 => Val::Float(a / b),
+                _ => Val::Null,
+            },
         },
         Eq | Ne | Lt | Le | Gt | Ge => {
             if l.is_null() || r.is_null() {

@@ -8,7 +8,7 @@ use super::span::{Diagnostic, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     // literals & names
-    Number(f64),
+    Number(f64, /*is_float literal*/ bool),
     Str(String),
     Ident(String),
     /// "quoted" identifier — never a keyword
@@ -234,7 +234,10 @@ pub fn lex(src: &str) -> Result<Vec<SpannedTok>, Diagnostic> {
                 let n: f64 = text.parse().map_err(|_| {
                     Diagnostic::new(format!("'{text}' is not a number"), Span::new(i, j))
                 })?;
-                out.push(SpannedTok { tok: Tok::Number(n), span: Span::new(i, j) });
+                out.push(SpannedTok {
+                    tok: Tok::Number(n, text.contains('.')),
+                    span: Span::new(i, j),
+                });
                 i = j;
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {

@@ -105,11 +105,17 @@ fn query(args: &[String]) {
                 for row in &cells {
                     println!("{}", line(row));
                 }
+                let pruned = r.total_groups - r.scanned_groups;
                 println!(
-                    "({} row{}, {:.1} ms)",
+                    "({} row{}, {:.1} ms{})",
                     cells.len(),
                     if cells.len() == 1 { "" } else { "s" },
-                    t0.elapsed().as_secs_f64() * 1000.0
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                    if pruned > 0 {
+                        format!(", skipped {pruned}/{} row groups", r.total_groups)
+                    } else {
+                        String::new()
+                    }
                 );
             }
         }

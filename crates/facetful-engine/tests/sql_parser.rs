@@ -8,7 +8,7 @@ use facetful_engine::sql::{parse_expr, parse_query};
 /// Strip spans so structurally-equal trees compare equal.
 fn shape(e: &Expr) -> String {
     match e {
-        Expr::Number(n, _) => format!("{n}"),
+        Expr::Number(n, _, _) => format!("{n}"),
         Expr::Str(s, _) => format!("'{s}'"),
         Expr::Column(c, _) => c.clone(),
         Expr::Null(_) => "null".into(),

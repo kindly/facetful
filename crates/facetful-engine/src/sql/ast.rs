@@ -7,7 +7,7 @@ use super::span::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Number(f64, Span),
+    Number(f64, bool, Span),
     Str(String, Span),
     Column(String, Span),
     /// function call — both spelled calls and desugared idioms
@@ -45,7 +45,7 @@ pub enum BinOp {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::Number(_, s)
+            Expr::Number(_, _, s)
             | Expr::Str(_, s)
             | Expr::Column(_, s)
             | Expr::Star(s)

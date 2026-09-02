@@ -173,7 +173,7 @@ impl Parser {
 
     fn integer(&mut self, ctx: &str) -> Result<u64, Diagnostic> {
         match *self.peek() {
-            Tok::Number(n) if n >= 0.0 && n.fract() == 0.0 => {
+            Tok::Number(n, false) if n >= 0.0 && n.fract() == 0.0 => {
                 self.next();
                 Ok(n as u64)
             }
@@ -294,7 +294,7 @@ impl Parser {
     fn prefix(&mut self) -> Result<Expr, Diagnostic> {
         let t = self.next();
         match t.tok {
-            Tok::Number(n) => Ok(Expr::Number(n, t.span)),
+            Tok::Number(n, f) => Ok(Expr::Number(n, f, t.span)),
             Tok::Str(s) => Ok(Expr::Str(s, t.span)),
             Tok::Null => Ok(Expr::Null(t.span)),
             Tok::Star => Ok(Expr::Star(t.span)),
@@ -408,7 +408,7 @@ impl Parser {
 
 fn describe(t: &Tok) -> String {
     match t {
-        Tok::Number(n) => format!("the number {n}"),
+        Tok::Number(n, _) => format!("the number {n}"),
         Tok::Str(s) => format!("the string '{s}'"),
         Tok::Ident(s) => format!("'{s}'"),
         Tok::QuotedIdent(s) => format!("\"{s}\""),
