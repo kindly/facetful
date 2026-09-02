@@ -149,3 +149,15 @@ hint: did you mean 'country'?
 
 **Known backlog, deliberately deferred**: row-group min/max pruning isn't wired into SQL scans yet; expression evaluation is row-wise (52 ms for a filtered GROUP BY at 200K vs ~1 ms for the specialized facet kernels — the gap is the vectorization work); dict-code fast paths for string equality. Correctness first, then the M6 benchmarks decide where optimization effort goes.
 </sv-prose>
+
+<sv-prose id="p7">
+## Build log 4: M3 complete — the engine agrees with SQLite
+
+**The differential suite is the milestone's proof, and it passes**: 15 queries from the dialect intersection (which is exactly the LLM idiom set — that choice paying off again) run over the same 200K rows through facetful and SQLite 3.53, compared cell-for-cell with 1e-9 float tolerance. Coverage: group-bys with tiebroken ordering, IN/string-BETWEEN/LIKE/IS NULL, CASE-expression grouping, CAST-grouping, truncating integer division and modulo, three-valued logic under NOT, NULL-first ascending ordering, empty-aggregate semantics, and expressions over aggregates. It runs in plain `cargo test` (graceful skip without sqlite3).
+
+**Caught by writing it**: integer division — we returned floats, SQLite truncates; fixing it exposed that float literals (`7.0`) were collapsing to Int in the AST, so literal float-ness now threads from the lexer all the way to execution.
+
+**Also landed**: min/max row-group pruning in SQL scans (numeric ranges from the filter's AND-chain; the REPL now prints `skipped N/M row groups`), and scan stats on QueryResult.
+
+M3 is done: parser → binder → executor → REPL, 35 tests, SQLite agreement. Next milestone (M4): the wasm/worker/JS productization — `run_query` across the wasm boundary with the agreed transferable result representation, the Parquet→OPFS-cache flow, and the first real size number for the engine with the SQL layer linked in.
+</sv-prose>
