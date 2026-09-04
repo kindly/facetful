@@ -1,0 +1,99 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>facetful demo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 64rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; min-height: 5.5rem; font: 13px/1.5 ui-monospace, monospace; padding: .5rem; box-sizing: border-box; }
+  pre.err { color: #c0392b; white-space: pre-wrap; font: 13px/1.4 ui-monospace, monospace; }
+  table { border-collapse: collapse; margin-top: 1rem; }
+  th, td { text-align: left; padding: .25rem .7rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); font-variant-numeric: tabular-nums; }
+  td.num { text-align: right; }
+  button { font: inherit; padding: .35rem 1rem; }
+  .muted { opacity: .65; font-size: .85em; }
+</style>
+<h1>facetful</h1>
+<p class="muted" id="status">loading engine + 200K-row image…</p>
+<textarea id="sql">select country, count(*) as n, round(sum(capacity), 1) as total
+from t
+where status in ('status_0', 'status_1') and capacity is not null
+group by country
+order by total desc
+limit 15</textarea>
+<p>
+  <button id="run">Run (ctrl-enter)</button>
+  <span class="muted" id="meta"></span>
+</p>
+<div id="out"></div>
+<script type="module">
+  import { Facetful } from "/js/facetful/index.js";
+
+  const el = (id) => document.getElementById(id);
+  let db;
+
+  const t0 = performance.now();
+  try {
+    db = await Facetful.open({
+      wasmUrl: "/target/wasm32-unknown-unknown/release/facetful_wasm.wasm",
+      workerUrl: new URL("/js/facetful/worker.js", location.href),
+    });
+    const buf = await (await fetch("/spikes/facet-spike/data-200000.facetful")).arrayBuffer();
+    const { rows } = await db.load("t", buf);
+    el("status").textContent =
+      `ready — ${rows.toLocaleString()} rows loaded in ${(performance.now() - t0).toFixed(0)} ms (engine + image, cold)`;
+    run();
+  } catch (e) {
+    el("status").textContent = "failed to load: " + e.message;
+  }
+
+  async function run() {
+    const sql = el("sql").value;
+    el("out").innerHTML = "";
+    el("meta").textContent = "…";
+    try {
+      const r = await db.query(sql);
+      const pruned = r.stats.totalGroups - r.stats.scannedGroups;
+      el("meta").textContent =
+        `${r.rowCount.toLocaleString()} row${r.rowCount === 1 ? "" : "s"} · ${r.elapsedMs.toFixed(1)} ms in worker` +
+        (pruned > 0 ? ` · skipped ${pruned}/${r.stats.totalGroups} row groups` : "");
+      const table = document.createElement("table");
+      const thead = table.createTHead().insertRow();
+      for (const c of r.columns) {
+        const th = document.createElement("th");
+        th.textContent = c.name;
+        thead.appendChild(th);
+      }
+      const body = table.createTBody();
+      const shown = Math.min(r.rowCount, 500);
+      const rows = r.rows();
+      for (let i = 0; i < shown; i++) {
+        const row = rows.next().value;
+        const tr = body.insertRow();
+        for (const c of r.columns) {
+          const td = tr.insertCell();
+          const v = row[c.name];
+          td.textContent = v === null ? "∅" : c.kind === "float" ? (+v).toLocaleString() : v;
+          if (c.kind === "int" || c.kind === "float") td.className = "num";
+        }
+      }
+      if (r.rowCount > shown) {
+        const note = document.createElement("p");
+        note.className = "muted";
+        note.textContent = `showing first ${shown} of ${r.rowCount.toLocaleString()} rows`;
+        el("out").appendChild(note);
+      }
+      el("out").appendChild(table);
+    } catch (e) {
+      el("meta").textContent = "";
+      const pre = document.createElement("pre");
+      pre.className = "err";
+      pre.textContent = e.message;
+      el("out").appendChild(pre);
+    }
+  }
+
+  el("run").onclick = run;
+  el("sql").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) run();
+  });
+</script>
