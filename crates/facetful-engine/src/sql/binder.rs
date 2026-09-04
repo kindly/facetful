@@ -457,11 +457,8 @@ impl<'a> Binder<'a> {
                     )
                     .with_hint("to join text use '||' or concat()"));
                 }
-                Ok(if l.ty() == Ty::Float || r.ty() == Ty::Float || op == Div {
-                    Ty::Float
-                } else {
-                    Ty::Int
-                })
+                // SQLite semantics: int/int stays Int (truncating division)
+                Ok(if l.ty() == Ty::Float || r.ty() == Ty::Float { Ty::Float } else { Ty::Int })
             }
             Eq | Ne | Lt | Le | Gt | Ge => {
                 if !(l.ty().coerces_to(r.ty()) || r.ty().coerces_to(l.ty())) {

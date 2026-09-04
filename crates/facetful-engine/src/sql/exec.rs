@@ -1,19 +1,22 @@
-//! Execution: run a BoundQuery against a Table. v1 shape — correct first:
-//! per-row-group scan over cached column vectors, a row-wise expression
-//! interpreter with SQL three-valued logic and null-skipping aggregates,
-//! hash aggregation keyed by group-by values, Val-ordered sort, limit/offset.
-//! (Row-group stats pruning and vectorized expression kernels are planned
-//! optimizations; the flagship facet path keeps its specialized kernels.)
+//! Vectorized execution (M6 stage 1). Expressions evaluate ONCE per row group
+//! into column vectors; per-row work happens only inside flat kernel loops.
+//! Hot paths are specialized: numeric comparisons, dictionary-code fast paths
+//! for =/IN/LIKE against string literals (predicates evaluated once per
+//! dictionary entry, scans compare integers), three-valued mask logic,
+//! aggregation update loops, and direct-indexed grouping when every group-by
+//! dim is a dict column. Cold ops (string functions, CASE, casts) run through
+//! per-lane accessors — still no per-row tree walks or Val allocations.
 
 use super::ast::{BinOp, SortDir, UnOp};
-use super::binder::{Bound, FuncKind};
+use super::binder::{Bound, FuncKind, Ty};
 use crate::format::read::ReadAt;
 use crate::format::{ColumnType, FormatError};
 use crate::Table;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// A computed value. Text is Rc'd so dictionary values clone cheaply per row.
+// ---------------- values (output + group keys only) ----------------
+
 #[derive(Debug, Clone)]
 pub enum Val {
     Null,
@@ -37,7 +40,6 @@ impl Val {
             _ => None,
         }
     }
-    /// SQL ordering: NULL smallest; numbers cross-compare; text lexicographic.
     fn cmp_sql(&self, other: &Val) -> core::cmp::Ordering {
         use core::cmp::Ordering::*;
         use Val::*;
@@ -49,7 +51,7 @@ impl Val {
             (Text(a), Text(b)) => a.cmp(b),
             (a, b) => match (a.as_f64(), b.as_f64()) {
                 (Some(x), Some(y)) => x.total_cmp(&y),
-                _ => Equal, // incomparable kinds — binder prevents this
+                _ => Equal,
             },
         }
     }
@@ -63,9 +65,8 @@ impl Val {
 
 impl PartialEq for Val {
     fn eq(&self, other: &Self) -> bool {
-        // grouping equality: NULLs group together (SQL GROUP BY semantics)
         match (self, other) {
-            (Val::Null, Val::Null) => true,
+            (Val::Null, Val::Null) => true, // grouping semantics
             (Val::Null, _) | (_, Val::Null) => false,
             _ => self.cmp_sql(other) == core::cmp::Ordering::Equal,
         }
@@ -74,212 +75,999 @@ impl PartialEq for Val {
 impl Eq for Val {}
 impl core::hash::Hash for Val {
     fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        use core::hash::Hash;
         match self {
             Val::Null => 0u8.hash(h),
             Val::Bool(b) => (1u8, b).hash(h),
-            Val::Int(i) => (2u8, *i as f64).to_bits_hash(h),
-            Val::Float(f) => (2u8, *f).to_bits_hash(h),
+            Val::Int(i) => {
+                2u8.hash(h);
+                (*i as f64).to_bits().hash(h);
+            }
+            Val::Float(f) => {
+                2u8.hash(h);
+                f.to_bits().hash(h);
+            }
             Val::Text(s) => (3u8, s).hash(h),
         }
-    }
-}
-
-trait BitsHash {
-    fn to_bits_hash<H: core::hash::Hasher>(&self, h: &mut H);
-}
-impl BitsHash for (u8, f64) {
-    fn to_bits_hash<H: core::hash::Hasher>(&self, h: &mut H) {
-        use core::hash::Hash;
-        self.0.hash(h);
-        // Int and Float hash identically when numerically equal (1 == 1.0)
-        self.1.to_bits().hash(h);
     }
 }
 
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Val>>,
-    /// row groups actually scanned vs total (min/max pruning effect)
     pub scanned_groups: usize,
     pub total_groups: usize,
 }
 
-/// One row group's referenced columns, materialized.
+// ---------------- vectors ----------------
+
+type VStr = Rc<String>;
+
+#[derive(Clone)]
+enum Data {
+    I64(Rc<Vec<i64>>),
+    F64(Rc<Vec<f64>>),
+    /// dictionary column: codes + shared dict
+    Codes { codes: Rc<Vec<u16>>, dict: Rc<Vec<VStr>> },
+    Text(Rc<Vec<VStr>>),
+    Bool(Rc<Vec<u8>>),
+    /// broadcast literal
+    Const(Val),
+}
+
+#[derive(Clone)]
+struct VV {
+    data: Data,
+    /// validity bitmap (bit set = present); None = all valid
+    valid: Option<Rc<Vec<u8>>>,
+}
+
+#[inline]
+fn bit(v: &Option<Rc<Vec<u8>>>, i: usize) -> bool {
+    v.as_ref().map_or(true, |b| b[i / 8] & (1 << (i % 8)) != 0)
+}
+
+impl VV {
+    fn all_valid(data: Data) -> VV {
+        VV { data, valid: None }
+    }
+    fn const_val(v: Val) -> VV {
+        VV { data: Data::Const(v), valid: None }
+    }
+    #[inline]
+    fn is_valid(&self, i: usize) -> bool {
+        if let Data::Const(v) = &self.data {
+            return !v.is_null();
+        }
+        bit(&self.valid, i)
+    }
+    #[inline]
+    fn f64_at(&self, i: usize) -> f64 {
+        match &self.data {
+            Data::F64(v) => v[i],
+            Data::I64(v) => v[i] as f64,
+            Data::Const(c) => c.as_f64().unwrap_or(0.0),
+            _ => 0.0,
+        }
+    }
+    #[inline]
+    fn i64_at(&self, i: usize) -> i64 {
+        match &self.data {
+            Data::I64(v) => v[i],
+            Data::F64(v) => v[i] as i64,
+            Data::Const(Val::Int(x)) => *x,
+            Data::Const(Val::Float(x)) => *x as i64,
+            _ => 0,
+        }
+    }
+    /// three-valued bool at lane i
+    #[inline]
+    fn bool3_at(&self, i: usize) -> Option<bool> {
+        if !self.is_valid(i) {
+            return None;
+        }
+        match &self.data {
+            Data::Bool(v) => Some(v[i] != 0),
+            Data::Const(Val::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+    fn text_at(&self, i: usize) -> Option<VStr> {
+        if !self.is_valid(i) {
+            return None;
+        }
+        match &self.data {
+            Data::Codes { codes, dict } => dict.get(codes[i] as usize).cloned(),
+            Data::Text(v) => Some(v[i].clone()),
+            Data::Const(Val::Text(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+    /// output materialization
+    fn val_at(&self, i: usize, ty: Ty) -> Val {
+        if !self.is_valid(i) {
+            return Val::Null;
+        }
+        match (&self.data, ty) {
+            (Data::Const(v), _) => v.clone(),
+            (Data::Bool(v), _) => Val::Bool(v[i] != 0),
+            (Data::Codes { codes, dict }, _) => match dict.get(codes[i] as usize) {
+                Some(s) => Val::Text(s.clone()),
+                None => Val::Null,
+            },
+            (Data::Text(v), _) => Val::Text(v[i].clone()),
+            (Data::I64(v), Ty::Float) => Val::Float(v[i] as f64),
+            (Data::I64(v), _) => Val::Int(v[i]),
+            (Data::F64(v), Ty::Int) => Val::Int(v[i] as i64),
+            (Data::F64(v), _) => Val::Float(v[i]),
+        }
+    }
+}
+
+/// intersect validities (arithmetic null propagation)
+fn valid_and(rows: usize, a: &VV, b: &VV) -> Option<Rc<Vec<u8>>> {
+    let an = matches!(&a.data, Data::Const(v) if v.is_null());
+    let bn = matches!(&b.data, Data::Const(v) if v.is_null());
+    if an || bn {
+        return Some(Rc::new(vec![0u8; (rows + 7) / 8]));
+    }
+    match (&a.valid, &b.valid) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x.clone()),
+        (Some(x), Some(y)) => Some(Rc::new(x.iter().zip(y.iter()).map(|(p, q)| p & q).collect())),
+    }
+}
+
+// ---------------- group context ----------------
+
 enum GroupCol {
-    I64(Vec<i64>),
-    F64(Vec<f64>),
-    Dict { codes: Vec<u16>, dict: Rc<Vec<Rc<String>>> },
-    Text(Vec<Rc<String>>),
+    I64(Rc<Vec<i64>>),
+    F64(Rc<Vec<f64>>),
+    Dict { codes: Rc<Vec<u16>>, dict: Rc<Vec<VStr>> },
+    Text(Rc<Vec<VStr>>),
 }
 
 struct GroupCtx {
-    cols: HashMap<usize, (GroupCol, Option<Vec<u8>>)>,
+    cols: HashMap<usize, (GroupCol, Option<Rc<Vec<u8>>>)>,
+    rows: usize,
 }
 
 impl GroupCtx {
-    fn value(&self, col: usize, row: usize) -> Val {
-        let (c, validity) = &self.cols[&col];
-        if let Some(v) = validity {
-            if v[row / 8] & (1 << (row % 8)) == 0 {
-                return Val::Null;
+    fn column(&self, idx: usize) -> VV {
+        let (c, valid) = &self.cols[&idx];
+        let data = match c {
+            GroupCol::I64(v) => Data::I64(v.clone()),
+            GroupCol::F64(v) => Data::F64(v.clone()),
+            GroupCol::Dict { codes, dict } => {
+                Data::Codes { codes: codes.clone(), dict: dict.clone() }
+            }
+            GroupCol::Text(v) => Data::Text(v.clone()),
+        };
+        VV { data, valid: valid.clone() }
+    }
+}
+
+// ---------------- vector evaluation ----------------
+
+fn eval_vec(b: &Bound, ctx: &GroupCtx) -> VV {
+    let rows = ctx.rows;
+    match b {
+        Bound::Number(n, is_float) => VV::const_val(if *is_float {
+            Val::Float(*n)
+        } else if n.fract() == 0.0 && n.abs() < 9e15 {
+            Val::Int(*n as i64)
+        } else {
+            Val::Float(*n)
+        }),
+        Bound::Str(s) => VV::const_val(Val::text(s.clone())),
+        Bound::Null => VV::const_val(Val::Null),
+        Bound::Column { index, .. } => ctx.column(*index),
+        Bound::Unary { op, expr, ty } => {
+            let a = eval_vec(expr, ctx);
+            match op {
+                UnOp::Neg => {
+                    if let Data::Const(v) = &a.data {
+                        return VV::const_val(match v {
+                            Val::Int(i) => Val::Int(-i),
+                            Val::Float(f) => Val::Float(-f),
+                            _ => Val::Null,
+                        });
+                    }
+                    if *ty == Ty::Int {
+                        let out: Vec<i64> = (0..rows).map(|i| -a.i64_at(i)).collect();
+                        VV { data: Data::I64(Rc::new(out)), valid: a.valid.clone() }
+                    } else {
+                        let out: Vec<f64> = (0..rows).map(|i| -a.f64_at(i)).collect();
+                        VV { data: Data::F64(Rc::new(out)), valid: a.valid.clone() }
+                    }
+                }
+                UnOp::Not => {
+                    let mut out = vec![0u8; rows];
+                    let mut valid = vec![0u8; (rows + 7) / 8];
+                    for i in 0..rows {
+                        if let Some(x) = a.bool3_at(i) {
+                            out[i] = !x as u8;
+                            valid[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    VV { data: Data::Bool(Rc::new(out)), valid: Some(Rc::new(valid)) }
+                }
             }
         }
-        match c {
-            GroupCol::I64(v) => Val::Int(v[row]),
-            GroupCol::F64(v) => Val::Float(v[row]),
-            GroupCol::Dict { codes, dict } => Val::Text(dict[codes[row] as usize].clone()),
-            GroupCol::Text(v) => Val::Text(v[row].clone()),
+        Bound::Binary { op, lhs, rhs, ty } => {
+            let a = eval_vec(lhs, ctx);
+            let b2 = eval_vec(rhs, ctx);
+            eval_binary_vec(*op, a, b2, *ty, rows)
+        }
+        Bound::Call { func, args, ty } => eval_call_vec(func.name, args, *ty, ctx),
+    }
+}
+
+fn eval_binary_vec(op: BinOp, a: VV, b: VV, ty: Ty, rows: usize) -> VV {
+    use BinOp::*;
+    match op {
+        And | Or => {
+            let mut out = vec![0u8; rows];
+            let mut valid = vec![0u8; (rows + 7) / 8];
+            for i in 0..rows {
+                let (x, y) = (a.bool3_at(i), b.bool3_at(i));
+                let r = if op == And {
+                    match (x, y) {
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    }
+                } else {
+                    match (x, y) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                };
+                if let Some(r) = r {
+                    out[i] = r as u8;
+                    valid[i / 8] |= 1 << (i % 8);
+                }
+            }
+            VV { data: Data::Bool(Rc::new(out)), valid: Some(Rc::new(valid)) }
+        }
+        Eq | Ne | Lt | Le | Gt | Ge => cmp_vec(op, a, b, rows),
+        Add | Sub | Mul | Mod | Div => {
+            let valid = valid_and(rows, &a, &b);
+            if ty == Ty::Int && op != Div && op != Mod {
+                let out: Vec<i64> = (0..rows)
+                    .map(|i| {
+                        let (x, y) = (a.i64_at(i), b.i64_at(i));
+                        match op {
+                            Add => x.wrapping_add(y),
+                            Sub => x.wrapping_sub(y),
+                            Mul => x.wrapping_mul(y),
+                            _ => unreachable!(),
+                        }
+                    })
+                    .collect();
+                VV { data: Data::I64(Rc::new(out)), valid }
+            } else if ty == Ty::Int {
+                // SQLite: int/int truncates; /0 and %0 -> NULL
+                let mut v = to_bitmap(rows, &valid);
+                let out: Vec<i64> = (0..rows)
+                    .map(|i| {
+                        let y = b.i64_at(i);
+                        if y == 0 {
+                            v[i / 8] &= !(1 << (i % 8));
+                            0
+                        } else if op == Div {
+                            a.i64_at(i) / y
+                        } else {
+                            a.i64_at(i) % y
+                        }
+                    })
+                    .collect();
+                VV { data: Data::I64(Rc::new(out)), valid: Some(Rc::new(v)) }
+            } else {
+                let mut v = to_bitmap(rows, &valid);
+                let out: Vec<f64> = (0..rows)
+                    .map(|i| {
+                        let (x, y) = (a.f64_at(i), b.f64_at(i));
+                        match op {
+                            Add => x + y,
+                            Sub => x - y,
+                            Mul => x * y,
+                            Mod | Div => {
+                                if y == 0.0 {
+                                    v[i / 8] &= !(1 << (i % 8));
+                                    0.0
+                                } else if op == Div {
+                                    x / y
+                                } else {
+                                    x % y
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    })
+                    .collect();
+                VV { data: Data::F64(Rc::new(out)), valid: Some(Rc::new(v)) }
+            }
         }
     }
 }
 
-pub fn execute<S: ReadAt>(
-    table: &mut Table<S>,
-    q: &super::binder::BoundQuery,
-) -> Result<QueryResult, FormatError> {
-    let columns: Vec<String> = q.select.iter().map(|s| s.name.clone()).collect();
-
-    // Which columns do we need to load per group?
-    let mut needed = Vec::new();
-    let mut visit_all = |b: &Bound| collect_columns(b, &mut needed);
-    q.select.iter().for_each(|s| visit_all(&s.expr));
-    if let Some(f) = &q.filter {
-        visit_all(f);
+fn to_bitmap(rows: usize, valid: &Option<Rc<Vec<u8>>>) -> Vec<u8> {
+    match valid {
+        Some(v) => v.as_ref().clone(),
+        None => vec![0xffu8; (rows + 7) / 8],
     }
-    q.group_by.iter().for_each(|g| visit_all(g));
-    q.order_by.iter().for_each(|(e, _)| visit_all(e));
-    needed.sort_unstable();
-    needed.dedup();
+}
 
-    // Shared dictionaries, Rc'd once.
-    let mut dicts: HashMap<usize, Rc<Vec<Rc<String>>>> = HashMap::new();
-    for &c in &needed {
-        if table.catalog().schema.columns[c].is_dict() {
-            let d = table.dictionary(c)?;
-            dicts.insert(c, Rc::new(d.into_iter().map(Rc::new).collect()));
+fn cmp_ord(op: BinOp, o: core::cmp::Ordering) -> bool {
+    use BinOp::*;
+    match op {
+        Eq => o.is_eq(),
+        Ne => !o.is_eq(),
+        Lt => o.is_lt(),
+        Le => o.is_le(),
+        Gt => o.is_gt(),
+        Ge => o.is_ge(),
+        _ => unreachable!(),
+    }
+}
+
+fn cmp_vec(op: BinOp, a: VV, b: VV, rows: usize) -> VV {
+    // fast path: dict codes vs string literal
+    if let (Data::Codes { codes, dict }, Data::Const(Val::Text(lit))) = (&a.data, &b.data) {
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
+            let code = dict.iter().position(|s| **s == **lit);
+            let mut out = vec![0u8; rows];
+            match code {
+                Some(c) => {
+                    let c = c as u16;
+                    for i in 0..rows {
+                        let hit = codes[i] == c;
+                        out[i] = (if op == BinOp::Eq { hit } else { !hit }) as u8;
+                    }
+                }
+                None => {
+                    if op == BinOp::Ne {
+                        out.fill(1);
+                    }
+                }
+            }
+            return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
         }
+        // ordered comparison vs literal: per-code truth table
+        let table: Vec<u8> =
+            dict.iter().map(|s| cmp_ord(op, s.as_str().cmp(lit.as_str())) as u8).collect();
+        let out: Vec<u8> = codes.iter().map(|&c| table[c as usize]).collect();
+        return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
     }
-
-    // Min/max pruning: numeric range constraints from the filter's AND-chain.
-    let constraints = q.filter.as_ref().map(collect_ranges).unwrap_or_default();
-
-    // Aggregate pipeline state
-    let agg_calls: Vec<Bound> = {
-        let mut v = Vec::new();
-        q.select.iter().for_each(|s| collect_aggs(&s.expr, &mut v));
-        q.order_by.iter().for_each(|(e, _)| collect_aggs(e, &mut v));
-        v
+    // numeric path
+    let numeric = |d: &Data| {
+        matches!(d, Data::I64(_) | Data::F64(_))
+            || matches!(d, Data::Const(v) if v.as_f64().is_some())
     };
-    let mut groups: HashMap<Vec<Val>, Vec<AggState>> = HashMap::new();
-    let mut group_order: Vec<Vec<Val>> = Vec::new(); // stable first-seen order
-
-    // Non-aggregate pipeline: projected rows (+ hidden order keys)
-    let mut out_rows: Vec<(Vec<Val>, Vec<Val>)> = Vec::new();
-
-    let mut scanned_groups = 0usize;
-    for g in 0..table.group_count() {
-        if group_prunable(table, g, &constraints) {
+    if numeric(&a.data) && numeric(&b.data) {
+        let valid = valid_and(rows, &a, &b);
+        let out: Vec<u8> =
+            (0..rows).map(|i| cmp_ord(op, a.f64_at(i).total_cmp(&b.f64_at(i))) as u8).collect();
+        return VV { data: Data::Bool(Rc::new(out)), valid };
+    }
+    // generic (text/text, codes/codes, …)
+    let valid = valid_and(rows, &a, &b);
+    let mut out = vec![0u8; rows];
+    for i in 0..rows {
+        if !bit(&valid, i) {
             continue;
         }
-        scanned_groups += 1;
-        let rows = table.group_rows(g);
-        let mut cols = HashMap::new();
-        for &c in &needed {
-            let (ty, is_dict) = {
-                let def = &table.catalog().schema.columns[c];
-                (def.ty, def.is_dict())
-            };
-            let validity = table.validity(g, c)?;
-            let col = if is_dict {
-                GroupCol::Dict { codes: table.codes(g, c)?, dict: dicts[&c].clone() }
-            } else {
-                match ty {
-                    ColumnType::Float64 => GroupCol::F64(table.f64s(g, c)?),
-                    ColumnType::Utf8 => {
-                        GroupCol::Text(table.texts(g, c)?.into_iter().map(Rc::new).collect())
-                    }
-                    _ => GroupCol::I64(table.i64s(g, c)?),
-                }
-            };
-            cols.insert(c, (col, validity));
-        }
-        let ctx = GroupCtx { cols };
-
-        for row in 0..rows {
-            if let Some(f) = &q.filter {
-                // three-valued logic: only TRUE passes
-                if !matches!(eval(f, &ctx, row, None), Val::Bool(true)) {
-                    continue;
-                }
-            }
-            if q.is_aggregate {
-                let key: Vec<Val> =
-                    q.group_by.iter().map(|e| eval(e, &ctx, row, None)).collect();
-                let states = groups.entry(key.clone()).or_insert_with(|| {
-                    group_order.push(key);
-                    agg_calls.iter().map(AggState::new).collect()
-                });
-                for (st, call) in states.iter_mut().zip(&agg_calls) {
-                    st.update(call, &ctx, row);
-                }
-            } else {
-                let projected: Vec<Val> =
-                    q.select.iter().map(|s| eval(&s.expr, &ctx, row, None)).collect();
-                let order: Vec<Val> =
-                    q.order_by.iter().map(|(e, _)| eval(e, &ctx, row, None)).collect();
-                out_rows.push((projected, order));
-            }
-        }
+        let r = match (a.text_at(i), b.text_at(i)) {
+            (Some(x), Some(y)) => cmp_ord(op, x.cmp(&y)),
+            _ => cmp_ord(op, a.f64_at(i).total_cmp(&b.f64_at(i))),
+        };
+        out[i] = r as u8;
     }
-
-    let mut rows: Vec<(Vec<Val>, Vec<Val>)> = if q.is_aggregate {
-        // no rows + no GROUP BY still yields one output row (SQL: sum over empty = null, count = 0)
-        if q.group_by.is_empty() && group_order.is_empty() {
-            group_order.push(Vec::new());
-            groups.insert(Vec::new(), agg_calls.iter().map(AggState::new).collect());
-        }
-        group_order
-            .into_iter()
-            .map(|key| {
-                let states = &groups[&key];
-                let overrides = Overrides { group_by: &q.group_by, key: &key, aggs: &agg_calls, states };
-                let projected: Vec<Val> =
-                    q.select.iter().map(|s| eval_grouped(&s.expr, &overrides)).collect();
-                let order: Vec<Val> =
-                    q.order_by.iter().map(|(e, _)| eval_grouped(e, &overrides)).collect();
-                (projected, order)
-            })
-            .collect()
-    } else {
-        out_rows
-    };
-
-    if !q.order_by.is_empty() {
-        rows.sort_by(|a, b| {
-            for (i, (_, dir)) in q.order_by.iter().enumerate() {
-                let ord = a.1[i].cmp_sql(&b.1[i]);
-                let ord = if *dir == SortDir::Desc { ord.reverse() } else { ord };
-                if ord != core::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            core::cmp::Ordering::Equal
-        });
-    }
-
-    let offset = q.offset.unwrap_or(0) as usize;
-    let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
-    let rows: Vec<Vec<Val>> =
-        rows.into_iter().skip(offset).take(limit).map(|(p, _)| p).collect();
-
-    Ok(QueryResult { columns, rows, scanned_groups, total_groups: table.group_count() })
+    VV { data: Data::Bool(Rc::new(out)), valid }
 }
 
-/// (column, lower bound incl, upper bound incl) — None = unbounded on that side.
+/// SQL LIKE (%/_ wildcards, ascii-case-insensitive)
+fn like_match(pattern: &str, s: &str) -> bool {
+    fn rec(p: &[char], s: &[char]) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some('%') => (0..=s.len()).any(|k| rec(&p[1..], &s[k..])),
+            Some('_') => !s.is_empty() && rec(&p[1..], &s[1..]),
+            Some(c) => !s.is_empty() && s[0].eq_ignore_ascii_case(c) && rec(&p[1..], &s[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let sc: Vec<char> = s.chars().collect();
+    rec(&p, &sc)
+}
+
+fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
+    let rows = ctx.rows;
+    match name {
+        "isnull" => {
+            let a = eval_vec(&args[0], ctx);
+            let out: Vec<u8> = (0..rows).map(|i| !a.is_valid(i) as u8).collect();
+            VV::all_valid(Data::Bool(Rc::new(out)))
+        }
+        "between" => {
+            let x = eval_vec(&args[0], ctx);
+            let lo = eval_vec(&args[1], ctx);
+            let hi = eval_vec(&args[2], ctx);
+            let ge = cmp_vec(BinOp::Ge, x.clone(), lo, rows);
+            let le = cmp_vec(BinOp::Le, x, hi, rows);
+            eval_binary_vec(BinOp::And, ge, le, Ty::Bool, rows)
+        }
+        "in" => {
+            let needle = eval_vec(&args[0], ctx);
+            // dict-aware: string list vs codes -> per-code membership table
+            if let Data::Codes { codes, dict } = &needle.data {
+                let lits: Option<Vec<&str>> = args[1..]
+                    .iter()
+                    .map(|a| match a {
+                        Bound::Str(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(lits) = lits {
+                    let table: Vec<u8> = dict
+                        .iter()
+                        .map(|s| lits.iter().any(|l| *l == s.as_str()) as u8)
+                        .collect();
+                    let out: Vec<u8> = codes.iter().map(|&c| table[c as usize]).collect();
+                    return VV { data: Data::Bool(Rc::new(out)), valid: needle.valid.clone() };
+                }
+            }
+            // generic with SQL IN null semantics
+            let items: Vec<VV> = args[1..].iter().map(|a| eval_vec(a, ctx)).collect();
+            let mut out = vec![0u8; rows];
+            let mut valid = vec![0u8; (rows + 7) / 8];
+            for i in 0..rows {
+                if !needle.is_valid(i) {
+                    continue;
+                }
+                let nv = lane_val(&needle, i);
+                let mut saw_null = false;
+                let mut hit = false;
+                for it in &items {
+                    if !it.is_valid(i) {
+                        saw_null = true;
+                        continue;
+                    }
+                    if nv.eq_sql(&lane_val(it, i)) == Some(true) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if hit {
+                    out[i] = 1;
+                    valid[i / 8] |= 1 << (i % 8);
+                } else if !saw_null {
+                    valid[i / 8] |= 1 << (i % 8);
+                }
+            }
+            VV { data: Data::Bool(Rc::new(out)), valid: Some(Rc::new(valid)) }
+        }
+        "like" => {
+            let a = eval_vec(&args[0], ctx);
+            let pat = eval_vec(&args[1], ctx);
+            if let (Data::Codes { codes, dict }, Data::Const(Val::Text(p))) = (&a.data, &pat.data) {
+                // pattern evaluated once per dictionary entry
+                let table: Vec<u8> = dict.iter().map(|s| like_match(p, s) as u8).collect();
+                let out: Vec<u8> = codes.iter().map(|&c| table[c as usize]).collect();
+                return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
+            }
+            let valid = valid_and(rows, &a, &pat);
+            let mut out = vec![0u8; rows];
+            for i in 0..rows {
+                if bit(&valid, i) {
+                    if let (Some(s), Some(p)) = (a.text_at(i), pat.text_at(i)) {
+                        out[i] = like_match(&p, &s) as u8;
+                    }
+                }
+            }
+            VV { data: Data::Bool(Rc::new(out)), valid }
+        }
+        "coalesce" => {
+            let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+            lanes_to_vv(rows, ty, |i| {
+                items.iter().find(|v| v.is_valid(i)).map(|v| lane_val(v, i)).unwrap_or(Val::Null)
+            })
+        }
+        "if" | "case" => {
+            let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+            lanes_to_vv(rows, ty, |i| {
+                let mut k = 0;
+                while k + 1 < items.len() {
+                    if items[k].bool3_at(i) == Some(true) {
+                        return lane_val(&items[k + 1], i);
+                    }
+                    k += 2;
+                }
+                if items.len() % 2 == 1 {
+                    lane_val(items.last().unwrap(), i)
+                } else {
+                    Val::Null
+                }
+            })
+        }
+        // remaining scalars through lanes (cold path)
+        _ => {
+            let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+            lanes_to_vv(rows, ty, |i| {
+                let vals: Vec<Val> = items.iter().map(|v| lane_val(v, i)).collect();
+                scalar_fn(name, vals)
+            })
+        }
+    }
+}
+
+fn lane_val(v: &VV, i: usize) -> Val {
+    if !v.is_valid(i) {
+        return Val::Null;
+    }
+    match &v.data {
+        Data::I64(x) => Val::Int(x[i]),
+        Data::F64(x) => Val::Float(x[i]),
+        Data::Bool(x) => Val::Bool(x[i] != 0),
+        Data::Codes { codes, dict } => {
+            dict.get(codes[i] as usize).map(|s| Val::Text(s.clone())).unwrap_or(Val::Null)
+        }
+        Data::Text(x) => Val::Text(x[i].clone()),
+        Data::Const(c) => c.clone(),
+    }
+}
+
+/// Build a typed vector from a per-lane Val producer (cold-op path).
+fn lanes_to_vv(rows: usize, ty: Ty, f: impl Fn(usize) -> Val) -> VV {
+    let mut valid = vec![0u8; (rows + 7) / 8];
+    match ty {
+        Ty::Int => {
+            let mut out = vec![0i64; rows];
+            for i in 0..rows {
+                match f(i) {
+                    Val::Int(x) => {
+                        out[i] = x;
+                        valid[i / 8] |= 1 << (i % 8);
+                    }
+                    Val::Float(x) => {
+                        out[i] = x as i64;
+                        valid[i / 8] |= 1 << (i % 8);
+                    }
+                    _ => {}
+                }
+            }
+            VV { data: Data::I64(Rc::new(out)), valid: Some(Rc::new(valid)) }
+        }
+        Ty::Float => {
+            let mut out = vec![0f64; rows];
+            for i in 0..rows {
+                if let Some(x) = f(i).as_f64() {
+                    out[i] = x;
+                    valid[i / 8] |= 1 << (i % 8);
+                }
+            }
+            VV { data: Data::F64(Rc::new(out)), valid: Some(Rc::new(valid)) }
+        }
+        Ty::Bool => {
+            let mut out = vec![0u8; rows];
+            for i in 0..rows {
+                if let Val::Bool(b) = f(i) {
+                    out[i] = b as u8;
+                    valid[i / 8] |= 1 << (i % 8);
+                }
+            }
+            VV { data: Data::Bool(Rc::new(out)), valid: Some(Rc::new(valid)) }
+        }
+        _ => {
+            let empty = Rc::new(String::new());
+            let mut out: Vec<VStr> = vec![empty; rows];
+            for i in 0..rows {
+                if let Val::Text(s) = f(i) {
+                    out[i] = s;
+                    valid[i / 8] |= 1 << (i % 8);
+                }
+            }
+            VV { data: Data::Text(Rc::new(out)), valid: Some(Rc::new(valid)) }
+        }
+    }
+}
+
+/// scalar function on materialized values — cold path + grouped-context eval
+fn scalar_fn(name: &str, mut args: Vec<Val>) -> Val {
+    match name {
+        "isnull" => Val::Bool(args[0].is_null()),
+        "coalesce" => args.into_iter().find(|v| !v.is_null()).unwrap_or(Val::Null),
+        "in" => {
+            let needle = args.remove(0);
+            if needle.is_null() {
+                return Val::Null;
+            }
+            let mut saw_null = false;
+            for v in &args {
+                match needle.eq_sql(v) {
+                    Some(true) => return Val::Bool(true),
+                    None => saw_null = true,
+                    _ => {}
+                }
+            }
+            if saw_null { Val::Null } else { Val::Bool(false) }
+        }
+        "between" => {
+            let (x, lo, hi) = (args[0].clone(), args[1].clone(), args[2].clone());
+            if x.is_null() || lo.is_null() || hi.is_null() {
+                return Val::Null;
+            }
+            Val::Bool(
+                x.cmp_sql(&lo) != core::cmp::Ordering::Less
+                    && x.cmp_sql(&hi) != core::cmp::Ordering::Greater,
+            )
+        }
+        "like" => match (&args[0], &args[1]) {
+            (Val::Text(s), Val::Text(p)) => Val::Bool(like_match(p, s)),
+            _ => Val::Null,
+        },
+        "if" | "case" => {
+            let mut i = 0;
+            while i + 1 < args.len() {
+                if matches!(args[i], Val::Bool(true)) {
+                    return args[i + 1].clone();
+                }
+                i += 2;
+            }
+            if args.len() % 2 == 1 { args.last().unwrap().clone() } else { Val::Null }
+        }
+        "concat" => {
+            let mut out = String::new();
+            for v in &args {
+                match v {
+                    Val::Null => return Val::Null,
+                    Val::Text(s) => out.push_str(s),
+                    Val::Int(i) => out.push_str(&i.to_string()),
+                    Val::Float(f) => out.push_str(&f.to_string()),
+                    Val::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                }
+            }
+            Val::text(out)
+        }
+        "lower" | "upper" => match &args[0] {
+            Val::Text(s) => {
+                Val::text(if name == "lower" { s.to_lowercase() } else { s.to_uppercase() })
+            }
+            _ => Val::Null,
+        },
+        "length" => match &args[0] {
+            Val::Text(s) => Val::Int(s.chars().count() as i64),
+            _ => Val::Null,
+        },
+        "substr" => match &args[0] {
+            Val::Text(s) => {
+                let start = match args.get(1).and_then(Val::as_f64) {
+                    Some(f) => (f as i64 - 1).max(0) as usize,
+                    None => return Val::Null,
+                };
+                let len = args.get(2).and_then(Val::as_f64).map(|f| f as usize);
+                let chars: Vec<char> = s.chars().collect();
+                let end = len.map(|l| (start + l).min(chars.len())).unwrap_or(chars.len());
+                if start >= chars.len() {
+                    Val::text("")
+                } else {
+                    Val::text(chars[start..end].iter().collect::<String>())
+                }
+            }
+            _ => Val::Null,
+        },
+        "abs" => match &args[0] {
+            Val::Int(i) => Val::Int(i.abs()),
+            Val::Float(f) => Val::Float(f.abs()),
+            _ => Val::Null,
+        },
+        "floor" | "ceil" | "round" => match args[0].as_f64() {
+            Some(f) => {
+                let r = match name {
+                    "floor" => f.floor(),
+                    "ceil" => f.ceil(),
+                    _ => {
+                        let digits = args.get(1).and_then(Val::as_f64).unwrap_or(0.0) as i32;
+                        let m = 10f64.powi(digits);
+                        (f * m).round() / m
+                    }
+                };
+                if matches!(args[0], Val::Int(_)) && name != "round" {
+                    Val::Int(r as i64)
+                } else {
+                    Val::Float(r)
+                }
+            }
+            None => Val::Null,
+        },
+        "int" => match &args[0] {
+            Val::Int(i) => Val::Int(*i),
+            Val::Float(f) => Val::Int(*f as i64),
+            Val::Text(s) => s.trim().parse::<i64>().map(Val::Int).unwrap_or(Val::Null),
+            Val::Bool(b) => Val::Int(*b as i64),
+            Val::Null => Val::Null,
+        },
+        "float" => match &args[0] {
+            Val::Int(i) => Val::Float(*i as f64),
+            Val::Float(f) => Val::Float(*f),
+            Val::Text(s) => s.trim().parse::<f64>().map(Val::Float).unwrap_or(Val::Null),
+            Val::Bool(b) => Val::Float(*b as i64 as f64),
+            Val::Null => Val::Null,
+        },
+        "text" => match &args[0] {
+            Val::Null => Val::Null,
+            Val::Text(s) => Val::Text(s.clone()),
+            Val::Int(i) => Val::text(i.to_string()),
+            Val::Float(f) => Val::text(f.to_string()),
+            Val::Bool(b) => Val::text(if *b { "true" } else { "false" }),
+        },
+        other => unreachable!("unbound scalar function {other}"),
+    }
+}
+
+// ---------------- aggregation ----------------
+
+enum AggAcc {
+    Count(Vec<i64>),
+    CountDistinct(Vec<std::collections::HashSet<Val>>),
+    SumI { v: Vec<i64>, any: Vec<bool> },
+    SumF { v: Vec<f64>, any: Vec<bool> },
+    Avg { sum: Vec<f64>, n: Vec<i64> },
+    Min(Vec<Val>),
+    Max(Vec<Val>),
+}
+
+impl AggAcc {
+    fn new(call: &Bound) -> AggAcc {
+        let Bound::Call { func, args, .. } = call else { unreachable!() };
+        match func.name {
+            "count" => AggAcc::Count(Vec::new()),
+            "count_distinct" => AggAcc::CountDistinct(Vec::new()),
+            "sum" => {
+                if args[0].ty() == Ty::Int {
+                    AggAcc::SumI { v: Vec::new(), any: Vec::new() }
+                } else {
+                    AggAcc::SumF { v: Vec::new(), any: Vec::new() }
+                }
+            }
+            "avg" => AggAcc::Avg { sum: Vec::new(), n: Vec::new() },
+            "min" => AggAcc::Min(Vec::new()),
+            "max" => AggAcc::Max(Vec::new()),
+            _ => unreachable!(),
+        }
+    }
+    fn grow(&mut self, n: usize) {
+        match self {
+            AggAcc::Count(v) => v.resize(n, 0),
+            AggAcc::CountDistinct(v) => v.resize_with(n, Default::default),
+            AggAcc::SumI { v, any } => {
+                v.resize(n, 0);
+                any.resize(n, false);
+            }
+            AggAcc::SumF { v, any } => {
+                v.resize(n, 0.0);
+                any.resize(n, false);
+            }
+            AggAcc::Avg { sum, n: c } => {
+                sum.resize(n, 0.0);
+                c.resize(n, 0);
+            }
+            AggAcc::Min(v) | AggAcc::Max(v) => v.resize(n, Val::Null),
+        }
+    }
+    #[inline]
+    fn update(&mut self, gid: usize, arg: &VV, i: usize) {
+        match self {
+            AggAcc::Count(v) => {
+                if arg.is_valid(i) {
+                    v[gid] += 1;
+                }
+            }
+            AggAcc::CountDistinct(v) => {
+                if arg.is_valid(i) {
+                    v[gid].insert(lane_val(arg, i));
+                }
+            }
+            AggAcc::SumI { v, any } => {
+                if arg.is_valid(i) {
+                    v[gid] += arg.i64_at(i);
+                    any[gid] = true;
+                }
+            }
+            AggAcc::SumF { v, any } => {
+                if arg.is_valid(i) {
+                    v[gid] += arg.f64_at(i);
+                    any[gid] = true;
+                }
+            }
+            AggAcc::Avg { sum, n } => {
+                if arg.is_valid(i) {
+                    sum[gid] += arg.f64_at(i);
+                    n[gid] += 1;
+                }
+            }
+            AggAcc::Min(v) => {
+                if arg.is_valid(i) {
+                    let x = lane_val(arg, i);
+                    if v[gid].is_null() || x.cmp_sql(&v[gid]).is_lt() {
+                        v[gid] = x;
+                    }
+                }
+            }
+            AggAcc::Max(v) => {
+                if arg.is_valid(i) {
+                    let x = lane_val(arg, i);
+                    if v[gid].is_null() || x.cmp_sql(&v[gid]).is_gt() {
+                        v[gid] = x;
+                    }
+                }
+            }
+        }
+    }
+    fn finish(&self, gid: usize) -> Val {
+        match self {
+            AggAcc::Count(v) => Val::Int(v[gid]),
+            AggAcc::CountDistinct(v) => Val::Int(v[gid].len() as i64),
+            AggAcc::SumI { v, any } => {
+                if any[gid] { Val::Int(v[gid]) } else { Val::Null }
+            }
+            AggAcc::SumF { v, any } => {
+                if any[gid] { Val::Float(v[gid]) } else { Val::Null }
+            }
+            AggAcc::Avg { sum, n } => {
+                if n[gid] == 0 { Val::Null } else { Val::Float(sum[gid] / n[gid] as f64) }
+            }
+            AggAcc::Min(v) | AggAcc::Max(v) => v[gid].clone(),
+        }
+    }
+}
+
+fn collect_aggs(b: &Bound, out: &mut Vec<Bound>) {
+    match b {
+        Bound::Call { func, .. } if func.kind == FuncKind::Aggregate => {
+            if !out.contains(b) {
+                out.push(b.clone());
+            }
+        }
+        Bound::Call { args, .. } => args.iter().for_each(|a| collect_aggs(a, out)),
+        Bound::Unary { expr, .. } => collect_aggs(expr, out),
+        Bound::Binary { lhs, rhs, .. } => {
+            collect_aggs(lhs, out);
+            collect_aggs(rhs, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_columns(b: &Bound, out: &mut Vec<usize>) {
+    match b {
+        Bound::Column { index, .. } => out.push(*index),
+        Bound::Call { args, .. } => args.iter().for_each(|a| collect_columns(a, out)),
+        Bound::Unary { expr, .. } => collect_columns(expr, out),
+        Bound::Binary { lhs, rhs, .. } => {
+            collect_columns(lhs, out);
+            collect_columns(rhs, out);
+        }
+        _ => {}
+    }
+}
+
+// grouped-context evaluation (per output group — groups are few)
+struct Overrides<'a> {
+    group_by: &'a [Bound],
+    key: &'a [Val],
+    aggs: &'a [Bound],
+    accs: &'a [AggAcc],
+    gid: usize,
+}
+
+fn eval_grouped(b: &Bound, o: &Overrides<'_>) -> Val {
+    if let Some(i) = o.aggs.iter().position(|a| a == b) {
+        return o.accs[i].finish(o.gid);
+    }
+    if let Some(i) = o.group_by.iter().position(|g| g == b) {
+        return o.key[i].clone();
+    }
+    match b {
+        Bound::Number(n, is_float) => {
+            if *is_float || n.fract() != 0.0 {
+                Val::Float(*n)
+            } else {
+                Val::Int(*n as i64)
+            }
+        }
+        Bound::Str(s) => Val::text(s.clone()),
+        Bound::Null => Val::Null,
+        Bound::Unary { op, expr, .. } => {
+            let v = eval_grouped(expr, o);
+            match (op, v) {
+                (_, Val::Null) => Val::Null,
+                (UnOp::Neg, Val::Int(i)) => Val::Int(-i),
+                (UnOp::Neg, Val::Float(f)) => Val::Float(-f),
+                (UnOp::Not, Val::Bool(x)) => Val::Bool(!x),
+                _ => Val::Null,
+            }
+        }
+        Bound::Binary { op, lhs, rhs, ty } => {
+            let l = eval_grouped(lhs, o);
+            let r = eval_grouped(rhs, o);
+            scalar_binary(*op, l, r, *ty)
+        }
+        Bound::Call { func, args, .. } => {
+            let vals: Vec<Val> = args.iter().map(|a| eval_grouped(a, o)).collect();
+            scalar_fn(func.name, vals)
+        }
+        Bound::Column { .. } => Val::Null,
+    }
+}
+
+fn scalar_binary(op: BinOp, l: Val, r: Val, ty: Ty) -> Val {
+    use BinOp::*;
+    match op {
+        And => match (as_b3(&l), as_b3(&r)) {
+            (Some(false), _) | (_, Some(false)) => Val::Bool(false),
+            (Some(true), Some(true)) => Val::Bool(true),
+            _ => Val::Null,
+        },
+        Or => match (as_b3(&l), as_b3(&r)) {
+            (Some(true), _) | (_, Some(true)) => Val::Bool(true),
+            (Some(false), Some(false)) => Val::Bool(false),
+            _ => Val::Null,
+        },
+        Eq | Ne | Lt | Le | Gt | Ge => {
+            if l.is_null() || r.is_null() {
+                return Val::Null;
+            }
+            Val::Bool(cmp_ord(op, l.cmp_sql(&r)))
+        }
+        _ => {
+            if l.is_null() || r.is_null() {
+                return Val::Null;
+            }
+            match (ty, &l, &r) {
+                (Ty::Int, Val::Int(a), Val::Int(b)) => match op {
+                    Add => Val::Int(a + b),
+                    Sub => Val::Int(a - b),
+                    Mul => Val::Int(a * b),
+                    Div => {
+                        if *b == 0 { Val::Null } else { Val::Int(a / b) }
+                    }
+                    _ => {
+                        if *b == 0 { Val::Null } else { Val::Int(a % b) }
+                    }
+                },
+                _ => match (l.as_f64(), r.as_f64()) {
+                    (Some(a), Some(b)) => match op {
+                        Add => Val::Float(a + b),
+                        Sub => Val::Float(a - b),
+                        Mul => Val::Float(a * b),
+                        Div => {
+                            if b == 0.0 { Val::Null } else { Val::Float(a / b) }
+                        }
+                        _ => {
+                            if b == 0.0 { Val::Null } else { Val::Float(a % b) }
+                        }
+                    },
+                    _ => Val::Null,
+                },
+            }
+        }
+    }
+}
+
+fn as_b3(v: &Val) -> Option<bool> {
+    match v {
+        Val::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+
+// ---------------- pruning ----------------
+
 type Range = (usize, Option<f64>, Option<f64>);
 
-/// Extract per-column numeric ranges from the top-level AND-chain of the filter.
-/// Conservative: anything unrecognized contributes nothing (never over-prunes).
 fn collect_ranges(f: &Bound) -> Vec<Range> {
     let mut out = Vec::new();
     walk_and(f, &mut out);
@@ -337,426 +1125,338 @@ fn group_prunable<S: ReadAt>(table: &Table<S>, g: usize, constraints: &[Range]) 
             Stats::None => continue,
         };
         if lo.map_or(false, |l| smax < l) || hi.map_or(false, |h| smin > h) {
-            return true; // the group's range cannot intersect the constraint
+            return true;
         }
     }
     false
 }
 
-fn collect_columns(b: &Bound, out: &mut Vec<usize>) {
-    match b {
-        Bound::Column { index, .. } => out.push(*index),
-        Bound::Call { args, .. } => args.iter().for_each(|a| collect_columns(a, out)),
-        Bound::Unary { expr, .. } => collect_columns(expr, out),
-        Bound::Binary { lhs, rhs, .. } => {
-            collect_columns(lhs, out);
-            collect_columns(rhs, out);
-        }
-        _ => {}
-    }
+// ---------------- grouping plans ----------------
+
+/// Direct-index grouping: all group-bys are dict columns with a small
+/// cardinality product — gid from arithmetic on codes, no hashing.
+struct DirectGroups {
+    cols: Vec<usize>,
+    cards: Vec<usize>,
+    dense: Vec<i32>,
 }
 
-fn collect_aggs(b: &Bound, out: &mut Vec<Bound>) {
-    match b {
-        Bound::Call { func, .. } if func.kind == FuncKind::Aggregate => {
-            if !out.contains(b) {
-                out.push(b.clone());
+fn direct_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<DirectGroups> {
+    let mut cols = Vec::new();
+    for g in group_by {
+        match g {
+            Bound::Column { index, .. } if table.catalog().schema.columns[*index].is_dict() => {
+                cols.push(*index)
             }
+            _ => return None,
         }
-        Bound::Call { args, .. } => args.iter().for_each(|a| collect_aggs(a, out)),
-        Bound::Unary { expr, .. } => collect_aggs(expr, out),
-        Bound::Binary { lhs, rhs, .. } => {
-            collect_aggs(lhs, out);
-            collect_aggs(rhs, out);
-        }
-        _ => {}
     }
+    if cols.is_empty() {
+        return None;
+    }
+    let mut cards = Vec::new();
+    let mut product: usize = 1;
+    for &c in &cols {
+        let card = table.dictionary(c).ok()?.len() + 1; // extra lane for nulls
+        product = product.checked_mul(card)?;
+        if product > (1 << 22) {
+            return None;
+        }
+        cards.push(card);
+    }
+    Some(DirectGroups { cols, cards, dense: vec![-1; product] })
 }
 
-// ---------------- aggregation ----------------
+// ---------------- execute ----------------
 
-enum AggState {
-    Count(i64),
-    CountDistinct(std::collections::HashSet<Val>),
-    Sum { int: i64, float: f64, any: bool, is_float: bool },
-    Avg { sum: f64, n: i64 },
-    MinMax { best: Val, is_min: bool },
-}
+pub fn execute<S: ReadAt>(
+    table: &mut Table<S>,
+    q: &super::binder::BoundQuery,
+) -> Result<QueryResult, FormatError> {
+    let columns: Vec<String> = q.select.iter().map(|s| s.name.clone()).collect();
 
-impl AggState {
-    fn new(call: &Bound) -> AggState {
-        let Bound::Call { func, .. } = call else { unreachable!() };
-        match func.name {
-            "count" => AggState::Count(0),
-            "count_distinct" => AggState::CountDistinct(Default::default()),
-            "sum" => AggState::Sum { int: 0, float: 0.0, any: false, is_float: false },
-            "avg" => AggState::Avg { sum: 0.0, n: 0 },
-            "min" => AggState::MinMax { best: Val::Null, is_min: true },
-            "max" => AggState::MinMax { best: Val::Null, is_min: false },
-            _ => unreachable!("unknown aggregate"),
+    let mut needed = Vec::new();
+    q.select.iter().for_each(|s| collect_columns(&s.expr, &mut needed));
+    if let Some(f) = &q.filter {
+        collect_columns(f, &mut needed);
+    }
+    q.group_by.iter().for_each(|g| collect_columns(g, &mut needed));
+    q.order_by.iter().for_each(|(e, _)| collect_columns(e, &mut needed));
+    needed.sort_unstable();
+    needed.dedup();
+
+    let mut dicts: HashMap<usize, Rc<Vec<VStr>>> = HashMap::new();
+    for &c in &needed {
+        if table.catalog().schema.columns[c].is_dict() {
+            let d = table.dictionary(c)?;
+            dicts.insert(c, Rc::new(d.into_iter().map(Rc::new).collect()));
         }
     }
 
-    fn update(&mut self, call: &Bound, ctx: &GroupCtx, row: usize) {
-        let Bound::Call { args, .. } = call else { unreachable!() };
-        let v = eval(&args[0], ctx, row, None);
-        match self {
-            AggState::Count(n) => {
-                if !v.is_null() {
-                    *n += 1;
-                }
-            }
-            AggState::CountDistinct(set) => {
-                if !v.is_null() {
-                    set.insert(v);
-                }
-            }
-            AggState::Sum { int, float, any, is_float } => match v {
-                Val::Int(i) => {
-                    *int += i;
-                    *float += i as f64;
-                    *any = true;
-                }
-                Val::Float(f) => {
-                    *float += f;
-                    *any = true;
-                    *is_float = true;
-                }
-                _ => {}
-            },
-            AggState::Avg { sum, n } => {
-                if let Some(f) = v.as_f64() {
-                    *sum += f;
-                    *n += 1;
-                }
-            }
-            AggState::MinMax { best, is_min } => {
-                if v.is_null() {
-                    return;
-                }
-                let better = if best.is_null() {
-                    true
-                } else {
-                    let ord = v.cmp_sql(best);
-                    if *is_min { ord.is_lt() } else { ord.is_gt() }
-                };
-                if better {
-                    *best = v;
-                }
-            }
-        }
-    }
+    let constraints = q.filter.as_ref().map(collect_ranges).unwrap_or_default();
 
-    fn finish(&self) -> Val {
-        match self {
-            AggState::Count(n) => Val::Int(*n),
-            AggState::CountDistinct(s) => Val::Int(s.len() as i64),
-            AggState::Sum { any: false, .. } => Val::Null,
-            AggState::Sum { int, float, is_float, .. } => {
-                if *is_float { Val::Float(*float) } else { Val::Int(*int) }
-            }
-            AggState::Avg { n: 0, .. } => Val::Null,
-            AggState::Avg { sum, n } => Val::Float(sum / *n as f64),
-            AggState::MinMax { best, .. } => best.clone(),
-        }
-    }
-}
+    let agg_calls: Vec<Bound> = {
+        let mut v = Vec::new();
+        q.select.iter().for_each(|s| collect_aggs(&s.expr, &mut v));
+        q.order_by.iter().for_each(|(e, _)| collect_aggs(e, &mut v));
+        v
+    };
 
-struct Overrides<'a> {
-    group_by: &'a [Bound],
-    key: &'a [Val],
-    aggs: &'a [Bound],
-    states: &'a [AggState],
-}
+    let mut direct = if q.is_aggregate { direct_plan(table, &q.group_by) } else { None };
+    let mut hash_groups: HashMap<Vec<Val>, usize> = HashMap::new();
+    let mut group_keys: Vec<Vec<Val>> = Vec::new();
+    let mut accs: Vec<AggAcc> = agg_calls.iter().map(AggAcc::new).collect();
+    let mut n_groups = 0usize;
 
-/// Evaluate a select/order expression in group context: aggregate calls and
-/// group-by expressions resolve to their computed values.
-fn eval_grouped(b: &Bound, o: &Overrides<'_>) -> Val {
-    if let Some(i) = o.aggs.iter().position(|a| a == b) {
-        return o.states[i].finish();
-    }
-    if let Some(i) = o.group_by.iter().position(|g| g == b) {
-        return o.key[i].clone();
-    }
-    match b {
-        Bound::Number(n, f) => num_val(*n, *f),
-        Bound::Str(s) => Val::text(s.clone()),
-        Bound::Null => Val::Null,
-        Bound::Unary { op, expr, .. } => eval_unary(*op, eval_grouped(expr, o)),
-        Bound::Binary { op, lhs, rhs, .. } => {
-            eval_binary(*op, eval_grouped(lhs, o), eval_grouped(rhs, o))
-        }
-        Bound::Call { func, args, .. } => {
-            let vals: Vec<Val> = args.iter().map(|a| eval_grouped(a, o)).collect();
-            eval_scalar_fn(func.name, vals)
-        }
-        Bound::Column { .. } => Val::Null, // binder guarantees this can't happen
-    }
-}
+    let sel_tys: Vec<Ty> = q.select.iter().map(|s| s.expr.ty()).collect();
+    let ord_tys: Vec<Ty> = q.order_by.iter().map(|(e, _)| e.ty()).collect();
+    let mut out_rows: Vec<(Vec<Val>, Vec<Val>)> = Vec::new();
 
-// ---------------- row-wise evaluation ----------------
-
-fn num_val(n: f64, is_float: bool) -> Val {
-    if !is_float && n.fract() == 0.0 && n.abs() < 9e15 {
-        Val::Int(n as i64)
+    // Bounded top-k: ORDER BY + LIMIT with a small window — keep only ~2*cap
+    // candidates, cheap first-key reject for the vast majority of rows, and
+    // project ONLY the winners at the end.
+    let topk_cap = if !q.is_aggregate && !q.order_by.is_empty() {
+        q.limit
+            .map(|l| (l + q.offset.unwrap_or(0)) as usize)
+            .filter(|c| *c <= 100_000)
     } else {
-        Val::Float(n)
+        None
+    };
+    struct Cand {
+        keys: Vec<Val>,
+        gslot: u32,
+        row: u32,
     }
-}
-
-fn eval(b: &Bound, ctx: &GroupCtx, row: usize, _unused: Option<()>) -> Val {
-    match b {
-        Bound::Number(n, f) => num_val(*n, *f),
-        Bound::Str(s) => Val::text(s.clone()),
-        Bound::Null => Val::Null,
-        Bound::Column { index, .. } => ctx.value(*index, row),
-        Bound::Unary { op, expr, .. } => eval_unary(*op, eval(expr, ctx, row, None)),
-        Bound::Binary { op, lhs, rhs, .. } => {
-            eval_binary(*op, eval(lhs, ctx, row, None), eval(rhs, ctx, row, None))
-        }
-        Bound::Call { func, args, .. } => {
-            let vals: Vec<Val> = args.iter().map(|a| eval(a, ctx, row, None)).collect();
-            eval_scalar_fn(func.name, vals)
-        }
-    }
-}
-
-fn eval_unary(op: UnOp, v: Val) -> Val {
-    match (op, v) {
-        (_, Val::Null) => Val::Null,
-        (UnOp::Neg, Val::Int(i)) => Val::Int(-i),
-        (UnOp::Neg, Val::Float(f)) => Val::Float(-f),
-        (UnOp::Not, Val::Bool(b)) => Val::Bool(!b),
-        _ => Val::Null,
-    }
-}
-
-fn eval_binary(op: BinOp, l: Val, r: Val) -> Val {
-    use BinOp::*;
-    match op {
-        And => match (as_bool3(&l), as_bool3(&r)) {
-            (Some(false), _) | (_, Some(false)) => Val::Bool(false),
-            (Some(true), Some(true)) => Val::Bool(true),
-            _ => Val::Null,
-        },
-        Or => match (as_bool3(&l), as_bool3(&r)) {
-            (Some(true), _) | (_, Some(true)) => Val::Bool(true),
-            (Some(false), Some(false)) => Val::Bool(false),
-            _ => Val::Null,
-        },
-        Add | Sub | Mul | Mod => {
-            if l.is_null() || r.is_null() {
-                return Val::Null;
-            }
-            match (&l, &r) {
-                (Val::Int(a), Val::Int(b)) => match op {
-                    Add => Val::Int(a + b),
-                    Sub => Val::Int(a - b),
-                    Mul => Val::Int(a * b),
-                    _ => {
-                        if *b == 0 { Val::Null } else { Val::Int(a % b) }
-                    }
-                },
-                _ => {
-                    let (a, b) = (l.as_f64(), r.as_f64());
-                    match (a, b) {
-                        (Some(a), Some(b)) => match op {
-                            Add => Val::Float(a + b),
-                            Sub => Val::Float(a - b),
-                            Mul => Val::Float(a * b),
-                            _ => {
-                                if b == 0.0 { Val::Null } else { Val::Float(a % b) }
-                            }
-                        },
-                        _ => Val::Null,
-                    }
-                }
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut bound_key: Option<Vec<Val>> = None; // full key of current cutoff
+    let mut kept_sel: Vec<Vec<VV>> = Vec::new(); // per scanned group, for late projection
+    let cmp_keys = |a: &Vec<Val>, b: &Vec<Val>, order_by: &[(Bound, SortDir)]| {
+        for (i, (_, dir)) in order_by.iter().enumerate() {
+            let ord = a[i].cmp_sql(&b[i]);
+            let ord = if *dir == SortDir::Desc { ord.reverse() } else { ord };
+            if ord != core::cmp::Ordering::Equal {
+                return ord;
             }
         }
-        Div => match (&l, &r) {
-            // SQLite semantics: int/int truncates; anything/0 -> NULL
-            (Val::Int(_), Val::Int(0)) => Val::Null,
-            (Val::Int(a), Val::Int(b)) => Val::Int(a / b),
-            _ => match (l.as_f64(), r.as_f64()) {
-                (Some(a), Some(b)) if b != 0.0 => Val::Float(a / b),
-                _ => Val::Null,
-            },
-        },
-        Eq | Ne | Lt | Le | Gt | Ge => {
-            if l.is_null() || r.is_null() {
-                return Val::Null;
-            }
-            let ord = l.cmp_sql(&r);
-            let b = match op {
-                Eq => ord.is_eq(),
-                Ne => !ord.is_eq(),
-                Lt => ord.is_lt(),
-                Le => ord.is_le(),
-                Gt => ord.is_gt(),
-                Ge => ord.is_ge(),
-                _ => unreachable!(),
+        core::cmp::Ordering::Equal
+    };
+
+    let mut scanned_groups = 0usize;
+    for g in 0..table.group_count() {
+        if group_prunable(table, g, &constraints) {
+            continue;
+        }
+        scanned_groups += 1;
+        let rows = table.group_rows(g);
+        let mut cols = HashMap::new();
+        for &c in &needed {
+            let (cty, is_dict) = {
+                let def = &table.catalog().schema.columns[c];
+                (def.ty, def.is_dict())
             };
-            Val::Bool(b)
-        }
-    }
-}
-
-fn as_bool3(v: &Val) -> Option<bool> {
-    match v {
-        Val::Bool(b) => Some(*b),
-        Val::Null => None,
-        _ => None,
-    }
-}
-
-fn eval_scalar_fn(name: &str, mut args: Vec<Val>) -> Val {
-    match name {
-        "isnull" => Val::Bool(args[0].is_null()),
-        "coalesce" => args.into_iter().find(|v| !v.is_null()).unwrap_or(Val::Null),
-        "in" => {
-            let needle = args.remove(0);
-            if needle.is_null() {
-                return Val::Null;
-            }
-            let mut saw_null = false;
-            for v in &args {
-                match needle.eq_sql(v) {
-                    Some(true) => return Val::Bool(true),
-                    None => saw_null = true,
-                    Some(false) => {}
-                }
-            }
-            if saw_null { Val::Null } else { Val::Bool(false) }
-        }
-        "between" => {
-            let (x, lo, hi) = (args[0].clone(), args[1].clone(), args[2].clone());
-            eval_binary(
-                BinOp::And,
-                eval_binary(BinOp::Ge, x.clone(), lo),
-                eval_binary(BinOp::Le, x, hi),
-            )
-        }
-        "like" => match (&args[0], &args[1]) {
-            (Val::Text(s), Val::Text(p)) => Val::Bool(like_match(p, s)),
-            (Val::Null, _) | (_, Val::Null) => Val::Null,
-            _ => Val::Null,
-        },
-        "if" | "case" => {
-            // case(c1, v1, c2, v2, ..., else?)
-            let mut i = 0;
-            while i + 1 < args.len() {
-                if matches!(as_bool3(&args[i]), Some(true)) {
-                    return args[i + 1].clone();
-                }
-                i += 2;
-            }
-            if args.len() % 2 == 1 { args.last().unwrap().clone() } else { Val::Null }
-        }
-        "concat" => {
-            let mut out = String::new();
-            for v in &args {
-                match v {
-                    Val::Null => return Val::Null,
-                    Val::Text(s) => out.push_str(s),
-                    Val::Int(i) => out.push_str(&i.to_string()),
-                    Val::Float(f) => out.push_str(&f.to_string()),
-                    Val::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-                }
-            }
-            Val::text(out)
-        }
-        "lower" | "upper" => match &args[0] {
-            Val::Text(s) => Val::text(if name == "lower" {
-                s.to_lowercase()
+            let validity = table.validity(g, c)?.map(Rc::new);
+            let col = if is_dict {
+                GroupCol::Dict { codes: Rc::new(table.codes(g, c)?), dict: dicts[&c].clone() }
             } else {
-                s.to_uppercase()
-            }),
-            _ => Val::Null,
-        },
-        "length" => match &args[0] {
-            Val::Text(s) => Val::Int(s.chars().count() as i64),
-            _ => Val::Null,
-        },
-        "substr" => match &args[0] {
-            Val::Text(s) => {
-                let start = match args.get(1).and_then(Val::as_f64) {
-                    Some(f) => (f as i64 - 1).max(0) as usize, // SQL substr is 1-based
-                    None => return Val::Null,
-                };
-                let len = args.get(2).and_then(Val::as_f64).map(|f| f as usize);
-                let chars: Vec<char> = s.chars().collect();
-                let end = len.map(|l| (start + l).min(chars.len())).unwrap_or(chars.len());
-                if start >= chars.len() {
-                    Val::text("")
-                } else {
-                    Val::text(chars[start..end].iter().collect::<String>())
+                match cty {
+                    ColumnType::Float64 => GroupCol::F64(Rc::new(table.f64s(g, c)?)),
+                    ColumnType::Utf8 => GroupCol::Text(Rc::new(
+                        table.texts(g, c)?.into_iter().map(Rc::new).collect(),
+                    )),
+                    _ => GroupCol::I64(Rc::new(table.i64s(g, c)?)),
                 }
-            }
-            _ => Val::Null,
-        },
-        "abs" => match &args[0] {
-            Val::Int(i) => Val::Int(i.abs()),
-            Val::Float(f) => Val::Float(f.abs()),
-            _ => Val::Null,
-        },
-        "floor" | "ceil" | "round" => match args[0].as_f64() {
-            Some(f) => {
-                let r = match name {
-                    "floor" => f.floor(),
-                    "ceil" => f.ceil(),
-                    _ => {
-                        let digits =
-                            args.get(1).and_then(Val::as_f64).unwrap_or(0.0) as i32;
-                        let m = 10f64.powi(digits);
-                        (f * m).round() / m
-                    }
-                };
-                if matches!(args[0], Val::Int(_)) && name != "round" {
-                    Val::Int(r as i64)
-                } else {
-                    Val::Float(r)
-                }
-            }
-            None => Val::Null,
-        },
-        "int" => match &args[0] {
-            Val::Int(i) => Val::Int(*i),
-            Val::Float(f) => Val::Int(*f as i64),
-            Val::Text(s) => s.trim().parse::<i64>().map(Val::Int).unwrap_or(Val::Null),
-            Val::Bool(b) => Val::Int(*b as i64),
-            Val::Null => Val::Null,
-        },
-        "float" => match &args[0] {
-            Val::Int(i) => Val::Float(*i as f64),
-            Val::Float(f) => Val::Float(*f),
-            Val::Text(s) => s.trim().parse::<f64>().map(Val::Float).unwrap_or(Val::Null),
-            Val::Bool(b) => Val::Float(*b as i64 as f64),
-            Val::Null => Val::Null,
-        },
-        "text" => match &args[0] {
-            Val::Null => Val::Null,
-            Val::Text(s) => Val::Text(s.clone()),
-            Val::Int(i) => Val::text(i.to_string()),
-            Val::Float(f) => Val::text(f.to_string()),
-            Val::Bool(b) => Val::text(if *b { "true" } else { "false" }),
-        },
-        other => unreachable!("unbound scalar function {other}"),
-    }
-}
+            };
+            cols.insert(c, (col, validity));
+        }
+        let ctx = GroupCtx { cols, rows };
 
-/// SQL LIKE: % = any run, _ = any one char; ASCII-case-insensitive (SQLite default).
-fn like_match(pattern: &str, s: &str) -> bool {
-    fn rec(p: &[char], s: &[char]) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some('%') => (0..=s.len()).any(|k| rec(&p[1..], &s[k..])),
-            Some('_') => !s.is_empty() && rec(&p[1..], &s[1..]),
-            Some(c) => {
-                !s.is_empty() && s[0].eq_ignore_ascii_case(c) && rec(&p[1..], &s[1..])
+        let keep: Option<Vec<u8>> = q.filter.as_ref().map(|f| {
+            let m = eval_vec(f, &ctx);
+            (0..rows).map(|i| (m.bool3_at(i) == Some(true)) as u8).collect()
+        });
+        let kept = |i: usize| keep.as_ref().map_or(true, |k| k[i] != 0);
+
+        if q.is_aggregate {
+            let gids: Vec<u32> = if let Some(d) = &mut direct {
+                let code_cols: Vec<(VV, usize)> = d
+                    .cols
+                    .iter()
+                    .zip(&d.cards)
+                    .map(|(&c, &card)| (ctx.column(c), card))
+                    .collect();
+                let mut gids = vec![u32::MAX; rows];
+                for i in 0..rows {
+                    if !kept(i) {
+                        continue;
+                    }
+                    let mut composite = 0usize;
+                    for (vv, card) in &code_cols {
+                        let code = match &vv.data {
+                            Data::Codes { codes, .. } if vv.is_valid(i) => codes[i] as usize,
+                            _ => card - 1,
+                        };
+                        composite = composite * card + code;
+                    }
+                    let dense = &mut d.dense[composite];
+                    if *dense < 0 {
+                        *dense = n_groups as i32;
+                        let key: Vec<Val> =
+                            code_cols.iter().map(|(vv, _)| lane_val(vv, i)).collect();
+                        group_keys.push(key);
+                        n_groups += 1;
+                        for a in &mut accs {
+                            a.grow(n_groups);
+                        }
+                    }
+                    gids[i] = *dense as u32;
+                }
+                gids
+            } else {
+                let key_vvs: Vec<VV> = q.group_by.iter().map(|e| eval_vec(e, &ctx)).collect();
+                let mut gids = vec![u32::MAX; rows];
+                for i in 0..rows {
+                    if !kept(i) {
+                        continue;
+                    }
+                    let key: Vec<Val> = key_vvs.iter().map(|v| lane_val(v, i)).collect();
+                    let next = n_groups;
+                    let gid = *hash_groups.entry(key).or_insert_with_key(|k| {
+                        group_keys.push(k.clone());
+                        next
+                    });
+                    if gid == next && gid == n_groups {
+                        n_groups += 1;
+                        for a in &mut accs {
+                            a.grow(n_groups);
+                        }
+                    }
+                    gids[i] = gid as u32;
+                }
+                gids
+            };
+            for (acc, call) in accs.iter_mut().zip(&agg_calls) {
+                let Bound::Call { args, .. } = call else { unreachable!() };
+                let arg = eval_vec(&args[0], &ctx);
+                for i in 0..rows {
+                    let gid = gids[i];
+                    if gid != u32::MAX {
+                        acc.update(gid as usize, &arg, i);
+                    }
+                }
+            }
+        } else if let Some(cap) = topk_cap {
+            let sel_vvs: Vec<VV> = q.select.iter().map(|s| eval_vec(&s.expr, &ctx)).collect();
+            let ord_vvs: Vec<VV> = q.order_by.iter().map(|(e, _)| eval_vec(e, &ctx)).collect();
+            let gslot = kept_sel.len() as u32;
+            for i in 0..rows {
+                if !kept(i) {
+                    continue;
+                }
+                // cheap reject on the first order key against the cutoff
+                if let Some(bk) = &bound_key {
+                    let k0 = ord_vvs[0].val_at(i, ord_tys[0]);
+                    let ord = k0.cmp_sql(&bk[0]);
+                    let ord =
+                        if q.order_by[0].1 == SortDir::Desc { ord.reverse() } else { ord };
+                    if ord == core::cmp::Ordering::Greater {
+                        continue;
+                    }
+                }
+                let keys: Vec<Val> =
+                    ord_vvs.iter().zip(&ord_tys).map(|(v, t)| v.val_at(i, *t)).collect();
+                cands.push(Cand { keys, gslot, row: i as u32 });
+                if cands.len() >= cap * 2 + 16 {
+                    cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
+                    cands.truncate(cap);
+                    bound_key = cands.last().map(|c| c.keys.clone());
+                }
+            }
+            kept_sel.push(sel_vvs);
+        } else {
+            let sel_vvs: Vec<VV> = q.select.iter().map(|s| eval_vec(&s.expr, &ctx)).collect();
+            let ord_vvs: Vec<VV> = q.order_by.iter().map(|(e, _)| eval_vec(e, &ctx)).collect();
+            for i in 0..rows {
+                if !kept(i) {
+                    continue;
+                }
+                let projected: Vec<Val> =
+                    sel_vvs.iter().zip(&sel_tys).map(|(v, t)| v.val_at(i, *t)).collect();
+                let order: Vec<Val> =
+                    ord_vvs.iter().zip(&ord_tys).map(|(v, t)| v.val_at(i, *t)).collect();
+                out_rows.push((projected, order));
             }
         }
     }
-    let p: Vec<char> = pattern.chars().collect();
-    let sc: Vec<char> = s.chars().collect();
-    rec(&p, &sc)
+
+    // finish bounded top-k: sort survivors, window, project only the winners
+    if topk_cap.is_some() {
+        cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
+        let offset = q.offset.unwrap_or(0) as usize;
+        let limit = q.limit.unwrap_or(0) as usize;
+        let rows: Vec<Vec<Val>> = cands
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|c| {
+                let sel = &kept_sel[c.gslot as usize];
+                sel.iter()
+                    .zip(&sel_tys)
+                    .map(|(v, t)| v.val_at(c.row as usize, *t))
+                    .collect()
+            })
+            .collect();
+        return Ok(QueryResult {
+            columns,
+            rows,
+            scanned_groups,
+            total_groups: table.group_count(),
+        });
+    }
+
+    let mut rows: Vec<(Vec<Val>, Vec<Val>)> = if q.is_aggregate {
+        if q.group_by.is_empty() && n_groups == 0 {
+            group_keys.push(Vec::new());
+            n_groups = 1;
+            for a in &mut accs {
+                a.grow(1);
+            }
+        }
+        (0..n_groups)
+            .map(|gid| {
+                let o = Overrides {
+                    group_by: &q.group_by,
+                    key: &group_keys[gid],
+                    aggs: &agg_calls,
+                    accs: &accs,
+                    gid,
+                };
+                let projected: Vec<Val> =
+                    q.select.iter().map(|s| eval_grouped(&s.expr, &o)).collect();
+                let order: Vec<Val> =
+                    q.order_by.iter().map(|(e, _)| eval_grouped(e, &o)).collect();
+                (projected, order)
+            })
+            .collect()
+    } else {
+        out_rows
+    };
+
+    if !q.order_by.is_empty() {
+        rows.sort_by(|a, b| {
+            for (i, (_, dir)) in q.order_by.iter().enumerate() {
+                let ord = a.1[i].cmp_sql(&b.1[i]);
+                let ord = if *dir == SortDir::Desc { ord.reverse() } else { ord };
+                if ord != core::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            core::cmp::Ordering::Equal
+        });
+    }
+
+    let offset = q.offset.unwrap_or(0) as usize;
+    let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+    let rows: Vec<Vec<Val>> = rows.into_iter().skip(offset).take(limit).map(|(p, _)| p).collect();
+
+    Ok(QueryResult { columns, rows, scanned_groups, total_groups: table.group_count() })
 }
