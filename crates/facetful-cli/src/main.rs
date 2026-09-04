@@ -121,8 +121,41 @@ fn query(args: &[String]) {
         }
     };
 
-    if let Some(sql) = one_shot {
-        run_one(&sql);
+    if let Some(arg) = one_shot {
+        if arg == "--bench" {
+            // benchmark mode: file of `# name` + SQL blocks; median of measured runs
+            let qfile = args.get(2).expect("--bench needs a queries file");
+            let text = std::fs::read_to_string(qfile).unwrap();
+            let mut blocks: Vec<(String, String)> = Vec::new();
+            for chunk in text.split('#').skip(1) {
+                let (name, sql) = chunk.split_once('\n').unwrap_or((chunk, ""));
+                let sql = sql.trim();
+                if !sql.is_empty() {
+                    blocks.push((name.trim().to_string(), sql.to_string()));
+                }
+            }
+            for (name, sql) in &blocks {
+                use facetful_engine::sql::run_query;
+                // warmup
+                for _ in 0..3 {
+                    if let Err(d) = run_query(&mut table, sql) {
+                        eprint!("{name}: {}", d.render(sql));
+                        std::process::exit(1);
+                    }
+                }
+                let mut times: Vec<f64> = (0..10)
+                    .map(|_| {
+                        let t0 = std::time::Instant::now();
+                        let _ = run_query(&mut table, sql).unwrap();
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    })
+                    .collect();
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!("{name}\t{:.2}", times[times.len() / 2]);
+            }
+            return;
+        }
+        run_one(&arg);
         return;
     }
 
