@@ -242,3 +242,25 @@ What stage 2 did: typed batch aggregation loops (raw f64/i64 slices with inline 
 
 **The M6 bar — within ~2× of duckdb@1thread on the facet/pivot rows — is met and exceeded**: the two flagship shapes are now *ahead* of it, and everything else sits at 1.6-5.6× against an engine with two decades of optimization. Combined with baseline: 6-27× faster than three days ago, and SQLite is beaten on all nine queries. Wasm: 35% of budget. Remaining named gaps (arith_scan's mod+avg lanes, like_scan's mask counting, topk) are recorded, not urgent — the browser is the product, and these numbers ship there unchanged.
 </sv-prose>
+
+<sv-prose id="p12">
+## Build log 9: the opt-level discovery — final M6 table
+
+A question about SIMD exposed that the shipping profile (`opt-level="z"`) was suppressing LLVM auto-vectorization and unrolling. Switching to `opt-level=3` (+`wasm-opt -O3` in CI instead of `-Oz`): **2-3× runtime for +15 KB gz** — trivially the right trade under priority #1.
+
+| query | facetful | duckdb@1 | verdict |
+|---|---|---|---|
+| facet_count | **4.7 ms** | 14.0 | **3.0× ahead** |
+| group_two_dims (pivot) | **5.7 ms** | 15.0 | **2.6× ahead** |
+| filtered_total | **18.4 ms** | 28.5 | ahead |
+| topk | **9.8 ms** | 11.0 | ahead |
+| group_small | 5.1 | 5.0 | parity |
+| group_high_card | 3.7 | 3.5 | parity |
+| case_pivot | 18.9 | 17.0 | parity |
+| like_scan | 6.9 | 4.0 | 1.7× |
+| arith_scan | 10.5 | 6.0 | 1.75× |
+
+Against the three-day-old interpreter baseline: **16-80× faster**. Wasm: 122.8 KB gz (39 % of budget).
+
+**How the vectorization actually works** (recorded because it was asked precisely): this is *database-style* vectorization — columnar batch kernels in 100 % safe Rust (no `unsafe` in the executor; `unsafe` exists only at the wasm FFI boundary and in the measurement spikes). LLVM auto-vectorizes the vectorizable loops now that opt-3 lets it; the gather/scatter-shaped loops (grouped aggregation, code-table lookups) are inherently scalar and won by dropping per-row allocation/dispatch instead. Hand-written SIMD (`core::arch::wasm32` — mostly safe intrinsics, `unsafe` only for raw loads) remains available headroom for the two straggler scans if they ever matter.
+</sv-prose>
