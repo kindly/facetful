@@ -10,7 +10,9 @@ cargo build --release --target wasm32-unknown-unknown -p facetful-wasm
 WASM=target/wasm32-unknown-unknown/release/facetful_wasm.wasm
 
 if command -v wasm-opt >/dev/null 2>&1; then
-    wasm-opt -Oz --enable-simd "$WASM" -o "$WASM.opt"
+    # -O3, not -Oz: size-first reoptimization would undo the speed the
+    # opt-level=3 build paid 15KB for
+    wasm-opt -O3 --enable-simd "$WASM" -o "$WASM.opt"
     WASM="$WASM.opt"
 else
     echo "note: wasm-opt not found — measuring unoptimized build (CI uses wasm-opt)"

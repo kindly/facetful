@@ -12,9 +12,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-# The wasm size budget lives or dies in this profile.
+# Shipping profile (wasm + CLI). opt-level=3, not "z": measured 2-3x faster
+# (auto-vectorization/unrolling suppressed at "z") for +15KB gz — interaction
+# speed is priority #1. The size budget is enforced by scripts/size-check.sh.
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
