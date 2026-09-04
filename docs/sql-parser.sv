@@ -200,3 +200,25 @@ The row-wise `Val` interpreter is 10-70× off the target; our own facet kernels 
 4. **top-k**: bounded heap instead of materialize-and-sort (807 ms → ~10 ms class).
 Re-run this table after each stage; done when facetful sits within ~2× of duckdb@1thread on the facet/pivot rows.
 </sv-prose>
+
+<sv-prose id="p10">
+## Build log 7: M6 stages 1+4 — the vectorized executor lands
+
+Same harness, same 1M rows, after the rewrite (stage-0 baseline in parentheses):
+
+| query | facetful | (was) | sqlite | duckdb@1 |
+|---|---|---|---|---|
+| facet_count | **13.2 ms** | (167) | 92 | 14.0 |
+| filtered_total | 55.8 | (291) | 83 | 25 |
+| group_small | 23.6 | (162) | 363 | 5 |
+| group_two_dims | 26.5 | (221) | 585 | 15 |
+| group_high_card | 13.7 | (138) | 317 | 3 |
+| topk | 32.3 | (807) | 62 | 11 |
+| arith_scan | 41.9 | (71) | 50 | 6 |
+| like_scan | 27.2 | (292) | 61 | 4 |
+| case_pivot | 75.3 | (402) | 270 | 17 |
+
+**facetful now beats SQLite on every query** and hits duckdb@1thread parity on the flagship facet row. What did it: expressions evaluate once per row group into column vectors; dict-code truth tables make `=`/`IN`/`LIKE` against string literals integer scans (the pattern runs once per dictionary entry — 2,000 times, not 1,000,000); direct-indexed grouping when group-bys are dict columns (gid = arithmetic on codes, no hashing — the facet/pivot case); typed columnar aggregation state; bounded top-k with a cheap first-key reject (807→32 ms, projecting only winners). The differential suite caught one real bug mid-rewrite: the binder still typed `Int/Int` division as Float.
+
+**Remaining gaps vs duckdb@1** (2-7×, all per-lane accessor overhead): `case_pivot` 4.4× (CASE runs through cold lanes — a case-of-dict-column could be a per-code table), `group_small/high_card` ~4.7× (aggregation inner loop matches on the arg enum per row — specializing on concrete f64-slice/validity shapes is the next lever), `arith_scan` 7× (mod kernel + avg via accessors). Candidates for a stage 2 if the browser numbers ask for it; wasm at 34% of budget.
+</sv-prose>
