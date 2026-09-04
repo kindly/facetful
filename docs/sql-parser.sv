@@ -161,3 +161,17 @@ hint: did you mean 'country'?
 
 M3 is done: parser → binder → executor → REPL, 35 tests, SQLite agreement. Next milestone (M4): the wasm/worker/JS productization — `run_query` across the wasm boundary with the agreed transferable result representation, the Parquet→OPFS-cache flow, and the first real size number for the engine with the SQL layer linked in.
 </sv-prose>
+
+<sv-prose id="p8">
+## Build log 5: M4 — SQL in the browser
+
+**The size number this milestone existed to produce: 95.8 KB gzipped** (235.5 KB raw, 31% of budget, before CI's wasm-opt) with the *entire* pipeline linked — lexer, parser with idiom sugar, binder with did-you-mean, executor, diagnostics renderer. For scale: the complete SQL engine costs less than a quarter of SQLite-wasm and ~1% of DuckDB-wasm.
+
+**What crosses the boundary** (round-2 decision, implemented): column-major buffers only — numbers as Float64Array, text as offsets + one UTF-8 blob, nulls as validity bitmaps, all transferred (not cloned) out of the worker; strings materialize lazily on the main thread only when touched. Errors arrive as the same caret-rendered diagnostics the REPL shows. Scan stats ride along, so the demo prints "skipped N/M row groups".
+
+**The JS package** (`js/facetful/`): `Facetful.open()` → dedicated module worker owning the wasm; `db.load(name, buffer)`; `db.query(sql)` → `Result` with `column()`, `columnRaw()` (zero-copy typed arrays), `rows()`. `core.js` is environment-agnostic — the Node smoke test drives the identical marshalling code the browser worker uses.
+
+**Demo**: `/web/demo/` — a SQL box over the 200K image; engine + image cold-load in one number at the top.
+
+Not in M4 (next): `loadParquet` (hyparquet in the worker + the baseline browser compiler writing the OPFS image), OPFS-backed tables (M5), and the vectorized executor work that the interaction-speed priority will demand (M6).
+</sv-prose>
