@@ -470,17 +470,48 @@ fn cmp_vec(op: BinOp, a: VV, b: VV, rows: usize) -> VV {
 
 /// SQL LIKE (%/_ wildcards, ascii-case-insensitive)
 fn like_match(pattern: &str, s: &str) -> bool {
-    fn rec(p: &[char], s: &[char]) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some('%') => (0..=s.len()).any(|k| rec(&p[1..], &s[k..])),
-            Some('_') => !s.is_empty() && rec(&p[1..], &s[1..]),
-            Some(c) => !s.is_empty() && s[0].eq_ignore_ascii_case(c) && rec(&p[1..], &s[1..]),
-        }
-    }
     let p: Vec<char> = pattern.chars().collect();
     let sc: Vec<char> = s.chars().collect();
-    rec(&p, &sc)
+    like_rec(&p, &sc)
+}
+
+fn like_rec(p: &[char], s: &[char]) -> bool {
+    match p.first() {
+        None => s.is_empty(),
+        Some('%') => (0..=s.len()).any(|k| like_rec(&p[1..], &s[k..])),
+        Some('_') => !s.is_empty() && like_rec(&p[1..], &s[1..]),
+        Some(c) => !s.is_empty() && s[0].eq_ignore_ascii_case(c) && like_rec(&p[1..], &s[1..]),
+    }
+}
+
+/// The literal shapes of a LIKE pattern (needle stored lowercase for Contains).
+enum LikeShape {
+    Contains(String),
+    Prefix(String),
+    Suffix(String),
+    Exact(String),
+    General,
+}
+
+fn classify_like(p: &str) -> LikeShape {
+    let inner_has_wildcard = |s: &str| s.contains('%') || s.contains('_');
+    let starts = p.starts_with('%');
+    let ends = p.ends_with('%') && p.len() >= 2;
+    let core: &str = match (starts, ends) {
+        (true, true) if p.len() >= 2 => &p[1..p.len() - 1],
+        (true, false) => &p[1..],
+        (false, true) => &p[..p.len() - 1],
+        _ => p,
+    };
+    if inner_has_wildcard(core) || core.is_empty() {
+        return LikeShape::General;
+    }
+    match (starts, ends) {
+        (true, true) => LikeShape::Contains(core.to_ascii_lowercase()),
+        (true, false) => LikeShape::Suffix(core.to_string()),
+        (false, true) => LikeShape::Prefix(core.to_string()),
+        (false, false) => LikeShape::Exact(core.to_string()),
+    }
 }
 
 fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
@@ -556,6 +587,51 @@ fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
                 // pattern evaluated once per dictionary entry
                 let table: Vec<u8> = dict.iter().map(|s| like_match(p, s) as u8).collect();
                 let out: Vec<u8> = codes.iter().map(|&c| table[c as usize]).collect();
+                return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
+            }
+            // plain-text column vs constant pattern: literal fast paths
+            // (%x% / x% / %x / exact — the shapes people actually write) run at
+            // substring-search speed; the general matcher only sees real wildcards.
+            if let (Data::Text(texts), Data::Const(Val::Text(p))) = (&a.data, &pat.data) {
+                let shape = classify_like(p);
+                let mut out = vec![0u8; rows];
+                match &shape {
+                    LikeShape::Contains(n) => {
+                        for i in 0..rows {
+                            out[i] = texts[i].to_ascii_lowercase().contains(n.as_str()) as u8;
+                        }
+                    }
+                    LikeShape::Prefix(n) => {
+                        for i in 0..rows {
+                            let t = texts[i].as_bytes();
+                            out[i] = (t.len() >= n.len()
+                                && t[..n.len()].eq_ignore_ascii_case(n.as_bytes()))
+                                as u8;
+                        }
+                    }
+                    LikeShape::Suffix(n) => {
+                        for i in 0..rows {
+                            let t = texts[i].as_bytes();
+                            out[i] = (t.len() >= n.len()
+                                && t[t.len() - n.len()..].eq_ignore_ascii_case(n.as_bytes()))
+                                as u8;
+                        }
+                    }
+                    LikeShape::Exact(n) => {
+                        for i in 0..rows {
+                            out[i] =
+                                texts[i].as_bytes().eq_ignore_ascii_case(n.as_bytes()) as u8;
+                        }
+                    }
+                    LikeShape::General => {
+                        // pre-lower the pattern once (the old code re-built it per row)
+                        let pchars: Vec<char> = p.chars().collect();
+                        for i in 0..rows {
+                            let sc: Vec<char> = texts[i].chars().collect();
+                            out[i] = like_rec(&pchars, &sc) as u8;
+                        }
+                    }
+                }
                 return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
             }
             let valid = valid_and(rows, &a, &pat);

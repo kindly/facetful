@@ -176,3 +176,54 @@ fn minmax_pruning_skips_groups_and_keeps_results() {
         v => panic!("expected 2, got {v:?}"),
     }
 }
+
+#[test]
+fn like_fast_paths_match_general_matcher() {
+    // plain-text (non-dict) column exercising every LIKE shape
+    let schema = facetful_engine::format::Schema {
+        columns: vec![
+            ColumnDef { name: "note".into(), ty: ColumnType::Utf8, flags: 0 },
+            ColumnDef { name: "id".into(), ty: ColumnType::Int8, flags: 0 },
+        ],
+    };
+    let notes = ["Solar plant operating", "coal RETIRED early", "wind permit review",
+        "operations resumed", "solar expansion", "gas peaker", "SOLAR", ""];
+    let (mut offs, mut bytes) = (vec![0u32], Vec::new());
+    for n in &notes {
+        bytes.extend_from_slice(n.as_bytes());
+        offs.push(bytes.len() as u32);
+    }
+    let ids: Vec<u8> = (0..notes.len() as i8).map(|i| i as u8).collect();
+    let mut w = Writer::new(schema, vec![], 8, &[None, None]);
+    w.write_group(
+        notes.len() as u32,
+        &[
+            ColumnChunk {
+                data: SegmentData::Utf8 { offsets: &offs, bytes: &bytes },
+                validity: None,
+                null_count: 0,
+            },
+            ColumnChunk { data: SegmentData::Fixed(&ids), validity: None, null_count: 0 },
+        ],
+    );
+    let file = w.finish();
+    let mut t = Table::open(file).unwrap();
+
+    let count = |t: &mut Table<Vec<u8>>, pat: &str| -> i64 {
+        let r = facetful_engine::sql::run_query(
+            t,
+            &format!("select count(*) from t where note like '{pat}'"),
+        )
+        .unwrap();
+        match r.rows[0][0] {
+            Val::Int(n) => n,
+            _ => panic!(),
+        }
+    };
+    assert_eq!(count(&mut t, "%solar%"), 3); // contains, case-insensitive
+    assert_eq!(count(&mut t, "solar%"), 3);  // prefix: Solar plant…, solar expansion, SOLAR
+    assert_eq!(count(&mut t, "%review"), 1); // suffix
+    assert_eq!(count(&mut t, "solar"), 1);   // exact (SOLAR)
+    assert_eq!(count(&mut t, "%oper_ting%"), 1); // general path: underscore wildcard
+    assert_eq!(count(&mut t, "%"), 8);       // degenerate: matches everything incl empty
+}
