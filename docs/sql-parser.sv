@@ -175,3 +175,28 @@ M3 is done: parser → binder → executor → REPL, 35 tests, SQLite agreement.
 
 Not in M4 (next): `loadParquet` (hyparquet in the worker + the baseline browser compiler writing the OPFS image), OPFS-backed tables (M5), and the vectorized executor work that the interaction-speed priority will demand (M6).
 </sv-prose>
+
+<sv-prose id="p9">
+## Build log 6: M6 baseline — native engine-vs-engine (1M rows, medians)
+
+| query | facetful (today) | sqlite 3.53 | duckdb@1thread | duckdb@16 |
+|---|---|---|---|---|
+| facet_count | 167 ms | 93 ms | 14 ms | 3 ms |
+| filtered_total | 291 ms | 84 ms | 25 ms | 5 ms |
+| group_small | 162 ms | 362 ms | 5 ms | 2 ms |
+| group_two_dims | 221 ms | 584 ms | 15 ms | 8 ms |
+| group_high_card | 138 ms | 318 ms | 3 ms | 2 ms |
+| topk | 807 ms | 63 ms | 11 ms | 3 ms |
+| arith_scan | 71 ms | 50 ms | 6 ms | 1 ms |
+| like_scan | 292 ms | 61 ms | 4 ms | 1 ms |
+| case_pivot | 402 ms | 270 ms | 17 ms | 4.5 ms |
+
+(`spikes/native-bench/run.py`, engines time themselves in-process, 3 warmups + median of 10, same CSV-derived data, dialect-intersection SQL. DuckDB@16 shown for context; **duckdb@1thread is the like-for-like target** — our engine is single-threaded by browser design.)
+
+The row-wise `Val` interpreter is 10-70× off the target; our own facet kernels already run this data in ~5 ms, so the ceiling is proven reachable. **The M6 plan, in bench-verified stages:**
+1. **Vectorized expression kernels**: compile `Bound` to per-row-group vector ops (`F64`/`I64`/codes/bool-mask vectors + validity), no per-row `Val` allocation.
+2. **Dictionary-aware predicates**: evaluate string predicates (`=`, `IN`, `LIKE`) once per dictionary entry → a per-code mask → scans compare integers. `like_scan` becomes ~2,000 pattern evaluations + one code scan.
+3. **Aggregation**: direct-indexed group tables when group-by dims are dict codes with a small cardinality product (the facet/pivot case), FxHash open addressing (lang-bench-proven) otherwise.
+4. **top-k**: bounded heap instead of materialize-and-sort (807 ms → ~10 ms class).
+Re-run this table after each stage; done when facetful sits within ~2× of duckdb@1thread on the facet/pivot rows.
+</sv-prose>
