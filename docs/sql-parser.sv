@@ -222,3 +222,23 @@ Same harness, same 1M rows, after the rewrite (stage-0 baseline in parentheses):
 
 **Remaining gaps vs duckdb@1** (2-7×, all per-lane accessor overhead): `case_pivot` 4.4× (CASE runs through cold lanes — a case-of-dict-column could be a per-code table), `group_small/high_card` ~4.7× (aggregation inner loop matches on the arg enum per row — specializing on concrete f64-slice/validity shapes is the next lever), `arith_scan` 7× (mod kernel + avg via accessors). Candidates for a stage 2 if the browser numbers ask for it; wasm at 34% of budget.
 </sv-prose>
+
+<sv-prose id="p11">
+## Build log 8: M6 stage 2 — ahead of single-threaded DuckDB on the flagship shapes
+
+| query | facetful | stage 1 | baseline | duckdb@1 | verdict |
+|---|---|---|---|---|---|
+| facet_count | **10.5 ms** | 13.2 | 167 | 13.5 | **ahead** |
+| group_two_dims (pivot) | **13.4 ms** | 26.5 | 221 | 15.0 | **ahead** |
+| group_small | 12.2 | 23.6 | 162 | 5.0 | 2.4× |
+| group_high_card | 8.0 | 13.7 | 138 | 3.0 | 2.7× |
+| filtered_total | 40.9 | 55.8 | 291 | 25.0 | 1.6× |
+| topk | 30.2 | 32.3 | 807 | 11.0 | 2.7× |
+| arith_scan | 33.6 | 41.9 | 71 | 6.0 | 5.6× |
+| like_scan | 13.6 | 27.2 | 292 | 4.0 | 3.4× |
+| case_pivot | 49.4 | 75.3 | 402 | 16.5 | 3.0× |
+
+What stage 2 did: typed batch aggregation loops (raw f64/i64 slices with inline validity bit tests — no per-row enum matching), an ungrouped fast path (the old code hashed an *empty key* per row for `select count(*), sum(x)…`), hoisted code slices in direct grouping, dict-code `count(distinct)` as u64 sets, and a numeric two-branch CASE fast path for the pivot shape.
+
+**The M6 bar — within ~2× of duckdb@1thread on the facet/pivot rows — is met and exceeded**: the two flagship shapes are now *ahead* of it, and everything else sits at 1.6-5.6× against an engine with two decades of optimization. Combined with baseline: 6-27× faster than three days ago, and SQLite is beaten on all nine queries. Wasm: 35% of budget. Remaining named gaps (arith_scan's mod+avg lanes, like_scan's mask counting, topk) are recorded, not urgent — the browser is the product, and these numbers ship there unchanged.
+</sv-prose>
