@@ -577,6 +577,26 @@ fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
         }
         "if" | "case" => {
             let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+            // numeric two-branch fast path: case when <cond> then <num> else <num> end
+            if matches!(ty, Ty::Int | Ty::Float) && items.len() == 3 {
+                let numeric = |v: &VV| {
+                    matches!(v.data, Data::F64(_) | Data::I64(_))
+                        || matches!(&v.data, Data::Const(c) if c.as_f64().is_some())
+                };
+                if numeric(&items[1]) && numeric(&items[2]) {
+                    let (cond, then_v, else_v) = (&items[0], &items[1], &items[2]);
+                    let mut out = vec![0f64; rows];
+                    let mut valid = vec![0u8; (rows + 7) / 8];
+                    for i in 0..rows {
+                        let src = if cond.bool3_at(i) == Some(true) { then_v } else { else_v };
+                        if src.is_valid(i) {
+                            out[i] = src.f64_at(i);
+                            valid[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    return VV { data: Data::F64(Rc::new(out)), valid: Some(Rc::new(valid)) };
+                }
+            }
             lanes_to_vv(rows, ty, |i| {
                 let mut k = 0;
                 while k + 1 < items.len() {
@@ -811,37 +831,53 @@ fn scalar_fn(name: &str, mut args: Vec<Val>) -> Val {
 
 enum AggAcc {
     Count(Vec<i64>),
-    CountDistinct(Vec<std::collections::HashSet<Val>>),
+    DistinctNum(Vec<std::collections::HashSet<u64>>),
+    DistinctStr(Vec<std::collections::HashSet<VStr>>),
     SumI { v: Vec<i64>, any: Vec<bool> },
     SumF { v: Vec<f64>, any: Vec<bool> },
     Avg { sum: Vec<f64>, n: Vec<i64> },
-    Min(Vec<Val>),
-    Max(Vec<Val>),
+    MinMaxNum { v: Vec<f64>, seen: Vec<bool>, is_min: bool, int: bool },
+    MinMaxStr { v: Vec<Option<VStr>>, is_min: bool },
 }
 
 impl AggAcc {
-    fn new(call: &Bound) -> AggAcc {
+    /// `arg_is_dict`: the argument is a dictionary column (distinct on codes).
+    fn new(call: &Bound, arg_is_dict: bool) -> AggAcc {
         let Bound::Call { func, args, .. } = call else { unreachable!() };
+        let aty = args[0].ty();
         match func.name {
             "count" => AggAcc::Count(Vec::new()),
-            "count_distinct" => AggAcc::CountDistinct(Vec::new()),
+            "count_distinct" => {
+                if arg_is_dict || matches!(aty, Ty::Int | Ty::Float | Ty::Bool) {
+                    AggAcc::DistinctNum(Vec::new())
+                } else {
+                    AggAcc::DistinctStr(Vec::new())
+                }
+            }
             "sum" => {
-                if args[0].ty() == Ty::Int {
+                if aty == Ty::Int {
                     AggAcc::SumI { v: Vec::new(), any: Vec::new() }
                 } else {
                     AggAcc::SumF { v: Vec::new(), any: Vec::new() }
                 }
             }
             "avg" => AggAcc::Avg { sum: Vec::new(), n: Vec::new() },
-            "min" => AggAcc::Min(Vec::new()),
-            "max" => AggAcc::Max(Vec::new()),
+            "min" | "max" => {
+                let is_min = func.name == "min";
+                if aty == Ty::Text {
+                    AggAcc::MinMaxStr { v: Vec::new(), is_min }
+                } else {
+                    AggAcc::MinMaxNum { v: Vec::new(), seen: Vec::new(), is_min, int: aty == Ty::Int }
+                }
+            }
             _ => unreachable!(),
         }
     }
     fn grow(&mut self, n: usize) {
         match self {
             AggAcc::Count(v) => v.resize(n, 0),
-            AggAcc::CountDistinct(v) => v.resize_with(n, Default::default),
+            AggAcc::DistinctNum(v) => v.resize_with(n, Default::default),
+            AggAcc::DistinctStr(v) => v.resize_with(n, Default::default),
             AggAcc::SumI { v, any } => {
                 v.resize(n, 0);
                 any.resize(n, false);
@@ -854,62 +890,190 @@ impl AggAcc {
                 sum.resize(n, 0.0);
                 c.resize(n, 0);
             }
-            AggAcc::Min(v) | AggAcc::Max(v) => v.resize(n, Val::Null),
+            AggAcc::MinMaxNum { v, seen, .. } => {
+                v.resize(n, 0.0);
+                seen.resize(n, false);
+            }
+            AggAcc::MinMaxStr { v, .. } => v.resize(n, None),
         }
     }
-    #[inline]
-    fn update(&mut self, gid: usize, arg: &VV, i: usize) {
-        match self {
-            AggAcc::Count(v) => {
-                if arg.is_valid(i) {
-                    v[gid] += 1;
+
+    /// One pass over the group: specialized loops per (accumulator, arg shape).
+    fn update_batch(&mut self, gids: &[u32], arg: &VV) {
+        let rows = gids.len();
+        macro_rules! for_kept {
+            (|$i:ident, $g:ident| $body:expr) => {
+                for $i in 0..rows {
+                    let $g = gids[$i];
+                    if $g == u32::MAX {
+                        continue;
+                    }
+                    let $g = $g as usize;
+                    $body
+                }
+            };
+        }
+        match (&mut *self, &arg.data) {
+            (AggAcc::Count(c), Data::Const(v)) => {
+                if !v.is_null() {
+                    for_kept!(|i, g| {
+                        let _ = i;
+                        c[g] += 1
+                    });
                 }
             }
-            AggAcc::CountDistinct(v) => {
+            (AggAcc::Count(c), _) => match &arg.valid {
+                None => for_kept!(|i, g| {
+                    let _ = i;
+                    c[g] += 1
+                }),
+                Some(vb) => for_kept!(|i, g| {
+                    c[g] += (vb[i / 8] >> (i % 8) & 1) as i64;
+                }),
+            },
+            (AggAcc::SumF { v, any }, Data::F64(x)) => match &arg.valid {
+                None => for_kept!(|i, g| {
+                    v[g] += x[i];
+                    any[g] = true;
+                }),
+                Some(vb) => for_kept!(|i, g| {
+                    if vb[i / 8] >> (i % 8) & 1 != 0 {
+                        v[g] += x[i];
+                        any[g] = true;
+                    }
+                }),
+            },
+            (AggAcc::SumF { v, any }, Data::I64(x)) => for_kept!(|i, g| {
                 if arg.is_valid(i) {
-                    v[gid].insert(lane_val(arg, i));
+                    v[g] += x[i] as f64;
+                    any[g] = true;
                 }
-            }
-            AggAcc::SumI { v, any } => {
+            }),
+            (AggAcc::SumI { v, any }, Data::I64(x)) => match &arg.valid {
+                None => for_kept!(|i, g| {
+                    v[g] += x[i];
+                    any[g] = true;
+                }),
+                Some(vb) => for_kept!(|i, g| {
+                    if vb[i / 8] >> (i % 8) & 1 != 0 {
+                        v[g] += x[i];
+                        any[g] = true;
+                    }
+                }),
+            },
+            (AggAcc::Avg { sum, n }, Data::F64(x)) => match &arg.valid {
+                None => for_kept!(|i, g| {
+                    sum[g] += x[i];
+                    n[g] += 1;
+                }),
+                Some(vb) => for_kept!(|i, g| {
+                    if vb[i / 8] >> (i % 8) & 1 != 0 {
+                        sum[g] += x[i];
+                        n[g] += 1;
+                    }
+                }),
+            },
+            (AggAcc::Avg { sum, n }, Data::I64(x)) => for_kept!(|i, g| {
                 if arg.is_valid(i) {
-                    v[gid] += arg.i64_at(i);
-                    any[gid] = true;
+                    sum[g] += x[i] as f64;
+                    n[g] += 1;
                 }
+            }),
+            (AggAcc::MinMaxNum { v, seen, is_min, .. }, Data::F64(_) | Data::I64(_)) => {
+                let is_min = *is_min;
+                for_kept!(|i, g| {
+                    if arg.is_valid(i) {
+                        let x = arg.f64_at(i);
+                        if !seen[g] || (is_min && x < v[g]) || (!is_min && x > v[g]) {
+                            v[g] = x;
+                            seen[g] = true;
+                        }
+                    }
+                });
             }
-            AggAcc::SumF { v, any } => {
+            (AggAcc::DistinctNum(sets), Data::Codes { codes, .. }) => for_kept!(|i, g| {
                 if arg.is_valid(i) {
-                    v[gid] += arg.f64_at(i);
-                    any[gid] = true;
+                    sets[g].insert(codes[i] as u64);
                 }
-            }
-            AggAcc::Avg { sum, n } => {
+            }),
+            (AggAcc::DistinctNum(sets), Data::I64(x)) => for_kept!(|i, g| {
                 if arg.is_valid(i) {
-                    sum[gid] += arg.f64_at(i);
-                    n[gid] += 1;
+                    sets[g].insert(x[i] as u64);
                 }
-            }
-            AggAcc::Min(v) => {
+            }),
+            (AggAcc::DistinctNum(sets), Data::F64(x)) => for_kept!(|i, g| {
                 if arg.is_valid(i) {
-                    let x = lane_val(arg, i);
-                    if v[gid].is_null() || x.cmp_sql(&v[gid]).is_lt() {
-                        v[gid] = x;
+                    sets[g].insert(x[i].to_bits());
+                }
+            }),
+            (AggAcc::DistinctStr(sets), _) => for_kept!(|i, g| {
+                if let Some(t) = arg.text_at(i) {
+                    sets[g].insert(t);
+                }
+            }),
+            // generic fallbacks (consts, computed vectors, text min/max)
+            (acc, _) => {
+                for i in 0..rows {
+                    let g = gids[i];
+                    if g == u32::MAX || !arg.is_valid(i) {
+                        continue;
+                    }
+                    let g = g as usize;
+                    match acc {
+                        AggAcc::SumI { v, any } => {
+                            v[g] += arg.i64_at(i);
+                            any[g] = true;
+                        }
+                        AggAcc::SumF { v, any } => {
+                            v[g] += arg.f64_at(i);
+                            any[g] = true;
+                        }
+                        AggAcc::Avg { sum, n } => {
+                            sum[g] += arg.f64_at(i);
+                            n[g] += 1;
+                        }
+                        AggAcc::MinMaxNum { v, seen, is_min, .. } => {
+                            let x = arg.f64_at(i);
+                            if !seen[g] || (*is_min && x < v[g]) || (!*is_min && x > v[g]) {
+                                v[g] = x;
+                                seen[g] = true;
+                            }
+                        }
+                        AggAcc::MinMaxStr { v, is_min } => {
+                            if let Some(t) = arg.text_at(i) {
+                                let better = match &v[g] {
+                                    None => true,
+                                    Some(cur) => {
+                                        if *is_min { t < *cur } else { t > *cur }
+                                    }
+                                };
+                                if better {
+                                    v[g] = Some(t);
+                                }
+                            }
+                        }
+                        AggAcc::DistinctNum(sets) => {
+                            let bits = match lane_val(arg, i) {
+                                Val::Int(x) => x as u64,
+                                Val::Float(x) => x.to_bits(),
+                                Val::Bool(b) => b as u64,
+                                _ => continue,
+                            };
+                            sets[g].insert(bits);
+                        }
+                        AggAcc::Count(c) => c[g] += 1,
+                        AggAcc::DistinctStr(_) => unreachable!(),
                     }
                 }
             }
-            AggAcc::Max(v) => {
-                if arg.is_valid(i) {
-                    let x = lane_val(arg, i);
-                    if v[gid].is_null() || x.cmp_sql(&v[gid]).is_gt() {
-                        v[gid] = x;
-                    }
-                }
-            }
         }
     }
+
     fn finish(&self, gid: usize) -> Val {
         match self {
             AggAcc::Count(v) => Val::Int(v[gid]),
-            AggAcc::CountDistinct(v) => Val::Int(v[gid].len() as i64),
+            AggAcc::DistinctNum(v) => Val::Int(v[gid].len() as i64),
+            AggAcc::DistinctStr(v) => Val::Int(v[gid].len() as i64),
             AggAcc::SumI { v, any } => {
                 if any[gid] { Val::Int(v[gid]) } else { Val::Null }
             }
@@ -919,7 +1083,18 @@ impl AggAcc {
             AggAcc::Avg { sum, n } => {
                 if n[gid] == 0 { Val::Null } else { Val::Float(sum[gid] / n[gid] as f64) }
             }
-            AggAcc::Min(v) | AggAcc::Max(v) => v[gid].clone(),
+            AggAcc::MinMaxNum { v, seen, int, .. } => {
+                if !seen[gid] {
+                    Val::Null
+                } else if *int {
+                    Val::Int(v[gid] as i64)
+                } else {
+                    Val::Float(v[gid])
+                }
+            }
+            AggAcc::MinMaxStr { v, .. } => {
+                v[gid].as_ref().map(|s| Val::Text(s.clone())).unwrap_or(Val::Null)
+            }
         }
     }
 }
@@ -1205,7 +1380,13 @@ pub fn execute<S: ReadAt>(
     let mut direct = if q.is_aggregate { direct_plan(table, &q.group_by) } else { None };
     let mut hash_groups: HashMap<Vec<Val>, usize> = HashMap::new();
     let mut group_keys: Vec<Vec<Val>> = Vec::new();
-    let mut accs: Vec<AggAcc> = agg_calls.iter().map(AggAcc::new).collect();
+    let arg_is_dict = |call: &Bound| -> bool {
+        let Bound::Call { args, .. } = call else { return false };
+        matches!(&args[0], Bound::Column { index, .. }
+            if table.catalog().schema.columns[*index].is_dict())
+    };
+    let mut accs: Vec<AggAcc> =
+        agg_calls.iter().map(|c| AggAcc::new(c, arg_is_dict(c))).collect();
     let mut n_groups = 0usize;
 
     let sel_tys: Vec<Ty> = q.select.iter().map(|s| s.expr.ty()).collect();
@@ -1277,12 +1458,44 @@ pub fn execute<S: ReadAt>(
         let kept = |i: usize| keep.as_ref().map_or(true, |k| k[i] != 0);
 
         if q.is_aggregate {
-            let gids: Vec<u32> = if let Some(d) = &mut direct {
+            let gids: Vec<u32> = if q.group_by.is_empty() {
+                // ungrouped: one group, no hashing at all
+                if n_groups == 0 {
+                    group_keys.push(Vec::new());
+                    n_groups = 1;
+                    for a in &mut accs {
+                        a.grow(1);
+                    }
+                }
+                match &keep {
+                    None => vec![0u32; rows],
+                    Some(k) => {
+                        k.iter().map(|&b| if b != 0 { 0 } else { u32::MAX }).collect()
+                    }
+                }
+            } else if let Some(d) = &mut direct {
                 let code_cols: Vec<(VV, usize)> = d
                     .cols
                     .iter()
                     .zip(&d.cards)
                     .map(|(&c, &card)| (ctx.column(c), card))
+                    .collect();
+                // hoist raw code slices out of the row loop
+                struct FastDim<'a> {
+                    codes: &'a [u16],
+                    valid: Option<&'a [u8]>,
+                    card: usize,
+                }
+                let fast: Vec<FastDim> = code_cols
+                    .iter()
+                    .map(|(vv, card)| match &vv.data {
+                        Data::Codes { codes, .. } => FastDim {
+                            codes,
+                            valid: vv.valid.as_deref().map(|v| v.as_slice()),
+                            card: *card,
+                        },
+                        _ => unreachable!("direct plan only over dict columns"),
+                    })
                     .collect();
                 let mut gids = vec![u32::MAX; rows];
                 for i in 0..rows {
@@ -1290,12 +1503,10 @@ pub fn execute<S: ReadAt>(
                         continue;
                     }
                     let mut composite = 0usize;
-                    for (vv, card) in &code_cols {
-                        let code = match &vv.data {
-                            Data::Codes { codes, .. } if vv.is_valid(i) => codes[i] as usize,
-                            _ => card - 1,
-                        };
-                        composite = composite * card + code;
+                    for fd in &fast {
+                        let ok = fd.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
+                        let code = if ok { fd.codes[i] as usize } else { fd.card - 1 };
+                        composite = composite * fd.card + code;
                     }
                     let dense = &mut d.dense[composite];
                     if *dense < 0 {
@@ -1337,12 +1548,7 @@ pub fn execute<S: ReadAt>(
             for (acc, call) in accs.iter_mut().zip(&agg_calls) {
                 let Bound::Call { args, .. } = call else { unreachable!() };
                 let arg = eval_vec(&args[0], &ctx);
-                for i in 0..rows {
-                    let gid = gids[i];
-                    if gid != u32::MAX {
-                        acc.update(gid as usize, &arg, i);
-                    }
-                }
+                acc.update_batch(&gids, &arg);
             }
         } else if let Some(cap) = topk_cap {
             let sel_vvs: Vec<VV> = q.select.iter().map(|s| eval_vec(&s.expr, &ctx)).collect();
