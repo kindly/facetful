@@ -12,19 +12,58 @@ use facetful_engine::format::FormatError;
 use facetful_engine::{FacetQuery, Table};
 use std::mem;
 
-pub struct OwnedBytes(Vec<u8>);
+// The module's ONE import: a synchronous positional read served by the JS
+// worker over an OPFS sync access handle. Offset travels as f64 (exact to
+// 2^53) to keep BigInt out of the boundary.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn opfs_read(file_id: u32, offset: f64, len: u32, dest: *mut u8) -> i32;
+}
 
-impl ReadAt for OwnedBytes {
+/// Native builds (tests, CLI linkage) never call this; stub keeps them linking.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused)]
+unsafe fn opfs_read(_file_id: u32, _offset: f64, _len: u32, _dest: *mut u8) -> i32 {
+    -1
+}
+
+pub enum Src {
+    Mem(Vec<u8>),
+    Opfs { file_id: u32, len: u64 },
+}
+
+impl ReadAt for Src {
     fn len(&self) -> u64 {
-        self.0.len() as u64
+        match self {
+            Src::Mem(v) => v.len() as u64,
+            Src::Opfs { len, .. } => *len,
+        }
+    }
+    fn read_ref(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        match self {
+            Src::Mem(v) => v.read_ref(offset, len),
+            Src::Opfs { .. } => None,
+        }
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
-        let s: &[u8] = &self.0;
-        s.read_at(offset, buf)
+        match self {
+            Src::Mem(v) => v.as_slice().read_at(offset, buf),
+            Src::Opfs { file_id, .. } => {
+                let n = unsafe {
+                    opfs_read(*file_id, offset as f64, buf.len() as u32, buf.as_mut_ptr())
+                };
+                if n as usize == buf.len() {
+                    Ok(())
+                } else {
+                    Err(FormatError::Io("opfs read failed or short"))
+                }
+            }
+        }
     }
 }
 
-type T = Table<OwnedBytes>;
+type T = Table<Src>;
 
 pub struct FacetOut {
     counts: Vec<Vec<u32>>,
@@ -41,6 +80,13 @@ pub extern "C" fn alloc(n: usize) -> *mut u8 {
     p
 }
 
+/// Free a buffer from `alloc` (the compile path marshals whole columns in,
+/// too much to leak like the small argument scratch buffers).
+#[no_mangle]
+pub extern "C" fn dealloc(p: *mut u8, n: usize) {
+    drop(unsafe { Vec::from_raw_parts(p, 0, n) });
+}
+
 #[no_mangle]
 pub extern "C" fn format_version() -> u32 {
     facetful_engine::format::VERSION as u32
@@ -51,10 +97,41 @@ pub extern "C" fn format_version() -> u32 {
 #[no_mangle]
 pub extern "C" fn table_open(ptr: *mut u8, len: usize) -> usize {
     let bytes = unsafe { Vec::from_raw_parts(ptr, len, len) };
-    match Table::open(OwnedBytes(bytes)) {
+    match Table::open(Src::Mem(bytes)) {
         Ok(t) => Box::into_raw(Box::new(t)) as usize,
         Err(_) => 0,
     }
+}
+
+/// Open a table backed by an OPFS file the JS side registered under `file_id`.
+/// Metadata (header, dictionaries, footer) is read through `opfs_read`; column
+/// segments load on demand into the byte-budgeted LRU cache.
+#[no_mangle]
+pub extern "C" fn table_open_opfs(file_id: u32, file_len: f64, cache_budget: f64) -> usize {
+    match Table::open(Src::Opfs { file_id, len: file_len as u64 }) {
+        Ok(mut t) => {
+            if cache_budget > 0.0 {
+                t.set_cache_budget(cache_budget as usize);
+            }
+            Box::into_raw(Box::new(t)) as usize
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Pre-touch a column's segments (background warming). Returns bytes read.
+#[no_mangle]
+pub extern "C" fn table_warm(t: usize, col: u32) -> f64 {
+    let t = unsafe { &mut *(t as *mut T) };
+    t.warm_column(col as usize).map(|b| b as f64).unwrap_or(-1.0)
+}
+
+/// (cached segments << 32) | cached KiB — cache observability for the JS side.
+#[no_mangle]
+pub extern "C" fn table_cache_stats(t: usize) -> u64 {
+    let t = unsafe { &*(t as *const T) };
+    let (n, bytes) = t.cache_stats();
+    ((n as u64) << 32) | (bytes as u64 / 1024)
 }
 
 #[no_mangle]
@@ -232,13 +309,75 @@ pub enum Outcome {
     Err(String),
 }
 
-fn columnize(r: QueryResult) -> Outcome {
+fn columnize(mut r: QueryResult) -> Outcome {
+    // columnar channel: typed vectors move straight into ColBufs (near-memcpy)
+    if let Some(out_cols) = r.cols.take() {
+        use facetful_engine::sql::binder::Ty;
+        use facetful_engine::sql::exec::OutCol;
+        let rows = r.out_rows;
+        let mut cols = Vec::with_capacity(out_cols.len());
+        for ((oc, name), ty) in out_cols.into_iter().zip(&r.columns).zip(&r.col_types) {
+            let kind_of = |fallback: u32| match ty {
+                Ty::Date => 5,
+                Ty::Timestamp => 6,
+                _ => fallback,
+            };
+            let mut c = ColBuf {
+                kind: 0,
+                name: name.clone(),
+                f64s: Vec::new(),
+                bools: Vec::new(),
+                offsets: Vec::new(),
+                bytes: Vec::new(),
+                validity: Vec::new(),
+            };
+            match oc {
+                OutCol::F64 { v, valid } => {
+                    c.kind = kind_of(2);
+                    c.f64s = v;
+                    c.validity = valid;
+                }
+                OutCol::I64 { v, valid } => {
+                    c.kind = kind_of(1);
+                    c.f64s = v.into_iter().map(|x| x as f64).collect();
+                    c.validity = valid;
+                }
+                OutCol::Bool { v, valid } => {
+                    c.kind = 3;
+                    c.bools = v;
+                    c.validity = valid;
+                }
+                OutCol::Text { offsets, bytes, valid } => {
+                    c.kind = 4;
+                    c.offsets = offsets;
+                    c.bytes = bytes;
+                    c.validity = valid;
+                }
+            }
+            cols.push(c);
+        }
+        return Outcome::Ok { cols, rows, scanned: 0, total: 0 };
+    }
     let rows = r.rows.len();
     let mut cols = Vec::with_capacity(r.columns.len());
     for (ci, name) in r.columns.iter().enumerate() {
-        // pick kind from the first non-null value (all-null -> float)
-        let mut kind = 0u32;
+        // kind from the bound type; date/timestamp cross as f64 days/ms with
+        // their own kinds so the JS side can materialize ISO strings
+        use facetful_engine::sql::binder::Ty;
+        let mut kind = match r.col_types[ci] {
+            Ty::Int => 1,
+            Ty::Float => 2,
+            Ty::Bool => 3,
+            Ty::Text => 4,
+            Ty::Date => 5,
+            Ty::Timestamp => 6,
+            // NULL literal column: type from the first non-null value
+            Ty::Null => 0,
+        };
         for row in &r.rows {
+            if kind != 0 {
+                break;
+            }
             kind = match &row[ci] {
                 Val::Null => continue,
                 Val::Int(_) => 1,
@@ -246,7 +385,6 @@ fn columnize(r: QueryResult) -> Outcome {
                 Val::Bool(_) => 3,
                 Val::Text(_) => 4,
             };
-            break;
         }
         if kind == 0 {
             kind = 2;
@@ -269,7 +407,7 @@ fn columnize(r: QueryResult) -> Outcome {
                 c.validity[ri / 8] |= 1 << (ri % 8);
             }
             match kind {
-                1 | 2 => c.f64s.push(match v {
+                1 | 2 | 5 | 6 => c.f64s.push(match v {
                     Val::Int(i) => *i as f64,
                     Val::Float(f) => *f,
                     _ => 0.0,
@@ -409,4 +547,129 @@ pub extern "C" fn col_validity_ptr(h: usize, i: usize) -> *const u8 {
 #[no_mangle]
 pub extern "C" fn outcome_free(h: usize) {
     drop(unsafe { Box::from_raw(h as *mut Outcome) });
+}
+
+// ---------------- baseline compiler (Parquet transcode path) ----------------
+// JS reads Parquet (hyparquet in the worker), marshals raw typed columns in,
+// and this compiles them into a .facetful image — the exact same code path as
+// the native CLI's convert, so browser-built and CLI-built images can't drift.
+
+use facetful_engine::format::compile::{self, InCol};
+
+pub struct CompileBuilder {
+    names: Vec<String>,
+    cols: Vec<InCol>,
+    rows: usize,
+}
+
+#[no_mangle]
+pub extern "C" fn compile_begin(rows: u32) -> usize {
+    Box::into_raw(Box::new(CompileBuilder {
+        names: Vec::new(),
+        cols: Vec::new(),
+        rows: rows as usize,
+    })) as usize
+}
+
+fn read_str(ptr: *const u8, len: usize) -> String {
+    let s = unsafe { core::slice::from_raw_parts(ptr, len) };
+    String::from_utf8_lossy(s).into_owned()
+}
+
+/// validity: pointer to one byte per row (0 = null), or 0 for no nulls.
+fn read_validity(ptr: *const u8, rows: usize) -> Option<Vec<bool>> {
+    if ptr.is_null() {
+        return None;
+    }
+    let s = unsafe { core::slice::from_raw_parts(ptr, rows) };
+    if s.iter().all(|&b| b != 0) {
+        None
+    } else {
+        Some(s.iter().map(|&b| b != 0).collect())
+    }
+}
+
+/// Numeric column from f64 lanes. `kind`: 0 = float, 1 = int (narrowed to the
+/// smallest type), 2 = date (days since epoch), 3 = timestamp (ms since epoch).
+/// (Int64/timestamp values beyond 2^53 lose precision crossing this f64
+/// boundary — acceptable for the baseline profile; the native CLI has no such
+/// limit.)
+#[no_mangle]
+pub extern "C" fn compile_add_num(
+    b: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    data: *const f64,
+    validity: *const u8,
+    kind: u32,
+) {
+    let b = unsafe { &mut *(b as *mut CompileBuilder) };
+    let lanes = unsafe { core::slice::from_raw_parts(data, b.rows) };
+    b.names.push(read_str(name_ptr, name_len));
+    let valid = read_validity(validity, b.rows);
+    b.cols.push(match kind {
+        1 => InCol::Int { v: lanes.iter().map(|&x| x as i64).collect(), valid },
+        2 => InCol::Date { v: lanes.iter().map(|&x| x as i32).collect(), valid },
+        3 => InCol::Timestamp { v: lanes.iter().map(|&x| x as i64).collect(), valid },
+        _ => InCol::Float { v: lanes.to_vec(), valid },
+    });
+}
+
+/// Text column as offsets (rows+1 u32s) + utf-8 blob; dict-vs-plain decided here.
+#[no_mangle]
+pub extern "C" fn compile_add_text(
+    b: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    offsets: *const u32,
+    bytes: *const u8,
+    bytes_len: usize,
+    validity: *const u8,
+) {
+    let b = unsafe { &mut *(b as *mut CompileBuilder) };
+    let offs = unsafe { core::slice::from_raw_parts(offsets, b.rows + 1) };
+    let blob = unsafe { core::slice::from_raw_parts(bytes, bytes_len) };
+    b.names.push(read_str(name_ptr, name_len));
+    let v = (0..b.rows)
+        .map(|i| {
+            String::from_utf8_lossy(&blob[offs[i] as usize..offs[i + 1] as usize]).into_owned()
+        })
+        .collect();
+    b.cols.push(InCol::Text { v, valid: read_validity(validity, b.rows) });
+}
+
+/// Consume the builder, compile, return an image handle (0 = failure).
+#[no_mangle]
+pub extern "C" fn compile_finish(b: usize, group_target: u32) -> usize {
+    let b = unsafe { Box::from_raw(b as *mut CompileBuilder) };
+    match compile::compile(&b.names, b.cols, group_target) {
+        Ok((image, _)) => Box::into_raw(Box::new(image)) as usize,
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn image_ptr(h: usize) -> *const u8 {
+    unsafe { &*(h as *const Vec<u8>) }.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn image_len(h: usize) -> usize {
+    unsafe { &*(h as *const Vec<u8>) }.len()
+}
+
+/// Open a table directly over a compiled image, consuming the handle
+/// (no copy back out through JS just to load it again).
+#[no_mangle]
+pub extern "C" fn image_open_table(h: usize) -> usize {
+    let image = *unsafe { Box::from_raw(h as *mut Vec<u8>) };
+    match Table::open(Src::Mem(image)) {
+        Ok(t) => Box::into_raw(Box::new(t)) as usize,
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn image_free(h: usize) {
+    drop(unsafe { Box::from_raw(h as *mut Vec<u8>) });
 }

@@ -75,7 +75,6 @@ impl PartialEq for Val {
 impl Eq for Val {}
 impl core::hash::Hash for Val {
     fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
-        use core::hash::Hash;
         match self {
             Val::Null => 0u8.hash(h),
             Val::Bool(b) => (1u8, b).hash(h),
@@ -94,9 +93,82 @@ impl core::hash::Hash for Val {
 
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// bound type per output column (Date/Timestamp make marshalling
+    /// format the underlying days/ms as ISO strings where appropriate)
+    pub col_types: Vec<Ty>,
     pub rows: Vec<Vec<Val>>,
+    /// Columnar channel: the non-aggregate projection paths fill this instead
+    /// of `rows` (typed vectors gather at memcpy-like speed; per-row Vals cost
+    /// ~5x). Consumers that want rows call `ensure_rows()`.
+    pub cols: Option<Vec<OutCol>>,
+    pub out_rows: usize,
     pub scanned_groups: usize,
     pub total_groups: usize,
+}
+
+/// One projected output column plus its validity bitmap (bit set = non-null).
+pub enum OutCol {
+    I64 { v: Vec<i64>, valid: Vec<u8> },
+    F64 { v: Vec<f64>, valid: Vec<u8> },
+    Bool { v: Vec<u8>, valid: Vec<u8> },
+    Text { offsets: Vec<u32>, bytes: Vec<u8>, valid: Vec<u8> },
+}
+
+impl QueryResult {
+    pub fn n_rows(&self) -> usize {
+        if self.cols.is_some() { self.out_rows } else { self.rows.len() }
+    }
+
+    /// Materialize `rows` from the columnar channel (no-op when already rows).
+    pub fn ensure_rows(&mut self) {
+        let Some(cols) = self.cols.take() else { return };
+        let n = self.out_rows;
+        let mut rows: Vec<Vec<Val>> = (0..n).map(|_| Vec::with_capacity(cols.len())).collect();
+        for (ci, c) in cols.iter().enumerate() {
+            let ty = self.col_types[ci];
+            for (i, row) in rows.iter_mut().enumerate() {
+                row.push(outcol_val(c, i, ty));
+            }
+        }
+        self.rows = rows;
+    }
+}
+
+fn outcol_val(c: &OutCol, i: usize, ty: Ty) -> Val {
+    let ok = |valid: &Vec<u8>| valid[i / 8] >> (i % 8) & 1 != 0;
+    match c {
+        OutCol::I64 { v, valid } => {
+            if !ok(valid) {
+                Val::Null
+            } else if ty == Ty::Float {
+                Val::Float(v[i] as f64)
+            } else {
+                Val::Int(v[i])
+            }
+        }
+        OutCol::F64 { v, valid } => {
+            if !ok(valid) {
+                Val::Null
+            } else if ty == Ty::Int {
+                Val::Int(v[i] as i64)
+            } else {
+                Val::Float(v[i])
+            }
+        }
+        OutCol::Bool { v, valid } => {
+            if !ok(valid) { Val::Null } else { Val::Bool(v[i] != 0) }
+        }
+        OutCol::Text { offsets, bytes, valid } => {
+            if !ok(valid) {
+                Val::Null
+            } else {
+                Val::text(
+                    String::from_utf8_lossy(&bytes[offsets[i] as usize..offsets[i + 1] as usize])
+                        .into_owned(),
+                )
+            }
+        }
+    }
 }
 
 // ---------------- vectors ----------------
@@ -198,7 +270,7 @@ impl VV {
             (Data::Text(v), _) => Val::Text(v[i].clone()),
             (Data::I64(v), Ty::Float) => Val::Float(v[i] as f64),
             (Data::I64(v), _) => Val::Int(v[i]),
-            (Data::F64(v), Ty::Int) => Val::Int(v[i] as i64),
+            (Data::F64(v), Ty::Int | Ty::Date | Ty::Timestamp) => Val::Int(v[i] as i64),
             (Data::F64(v), _) => Val::Float(v[i]),
         }
     }
@@ -224,7 +296,14 @@ enum GroupCol {
     I64(Rc<Vec<i64>>),
     F64(Rc<Vec<f64>>),
     Dict { codes: Rc<Vec<u16>>, dict: Rc<Vec<VStr>> },
-    Text(Rc<Vec<VStr>>),
+    /// raw blob feeds the LIKE scan kernel; strs materialize lazily, only
+    /// when something actually evaluates the strings (a like-only filter
+    /// never pays the per-string allocation)
+    Text {
+        strs: std::cell::OnceCell<Rc<Vec<VStr>>>,
+        offsets: Rc<Vec<u32>>,
+        bytes: Rc<Vec<u8>>,
+    },
 }
 
 struct GroupCtx {
@@ -241,7 +320,24 @@ impl GroupCtx {
             GroupCol::Dict { codes, dict } => {
                 Data::Codes { codes: codes.clone(), dict: dict.clone() }
             }
-            GroupCol::Text(v) => Data::Text(v.clone()),
+            GroupCol::Text { strs, offsets, bytes } => Data::Text(
+                strs.get_or_init(|| {
+                    Rc::new(
+                        offsets
+                            .windows(2)
+                            .map(|w| {
+                                Rc::new(
+                                    String::from_utf8_lossy(
+                                        &bytes[w[0] as usize..w[1] as usize],
+                                    )
+                                    .into_owned(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .clone(),
+            ),
         };
         VV { data, valid: valid.clone() }
     }
@@ -273,7 +369,7 @@ fn eval_vec(b: &Bound, ctx: &GroupCtx) -> VV {
                             _ => Val::Null,
                         });
                     }
-                    if *ty == Ty::Int {
+                    if matches!(ty, Ty::Int | Ty::Date | Ty::Timestamp) {
                         let out: Vec<i64> = (0..rows).map(|i| -a.i64_at(i)).collect();
                         VV { data: Data::I64(Rc::new(out)), valid: a.valid.clone() }
                     } else {
@@ -508,9 +604,40 @@ fn classify_like(p: &str) -> LikeShape {
     }
     match (starts, ends) {
         (true, true) => LikeShape::Contains(core.to_ascii_lowercase()),
-        (true, false) => LikeShape::Suffix(core.to_string()),
-        (false, true) => LikeShape::Prefix(core.to_string()),
-        (false, false) => LikeShape::Exact(core.to_string()),
+        (true, false) => LikeShape::Suffix(core.to_ascii_lowercase()),
+        (false, true) => LikeShape::Prefix(core.to_ascii_lowercase()),
+        (false, false) => LikeShape::Exact(core.to_ascii_lowercase()),
+    }
+}
+
+/// Char-based substring matching scalar_fn's SQLite semantics (start is
+/// already 0-based and clamped; None len = to end).
+fn substr_str(s: &str, start: usize, len: Option<usize>) -> String {
+    let (b0, b1) = substr_bounds(s, start, len);
+    s[b0..b1].to_string()
+}
+
+/// Byte bounds of the char-based substring (empty range when out of bounds).
+fn substr_bounds(s: &str, start: usize, len: Option<usize>) -> (usize, usize) {
+    let Some((b0, _)) = s.char_indices().nth(start) else {
+        return (0, 0);
+    };
+    let end = match len {
+        None => s.len(),
+        Some(l) => s[b0..].char_indices().nth(l).map(|(b, _)| b0 + b).unwrap_or(s.len()),
+    };
+    (b0, end)
+}
+
+/// One string against a classified pattern (needles are lowercase).
+fn like_shape_match(shape: &LikeShape, s: &str, full_pattern: &str) -> bool {
+    let b = s.as_bytes();
+    match shape {
+        LikeShape::Contains(n) => crate::text::contains_ci(b, n.as_bytes()),
+        LikeShape::Prefix(n) => crate::text::prefix_ci(b, n.as_bytes()),
+        LikeShape::Suffix(n) => crate::text::suffix_ci(b, n.as_bytes()),
+        LikeShape::Exact(n) => crate::text::eq_ci(b, n.as_bytes()),
+        LikeShape::General => like_match(full_pattern, s),
     }
 }
 
@@ -581,56 +708,53 @@ fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
             VV { data: Data::Bool(Rc::new(out)), valid: Some(Rc::new(valid)) }
         }
         "like" => {
+            // direct plain-text column vs constant contains-pattern: scan the
+            // contiguous byte blob ONCE (SIMD on wasm), walking offsets along
+            // the hits — no per-string calls, no String materialization
+            if let (Bound::Column { index, .. }, Bound::Str(p)) = (&args[0], &args[1]) {
+                if let Some((GroupCol::Text { offsets, bytes, .. }, validity)) =
+                    ctx.cols.get(index)
+                {
+                    if let LikeShape::Contains(n) = classify_like(p) {
+                        let n = n.as_bytes();
+                        let blob = &bytes[..offsets[rows] as usize];
+                        let mut out = vec![0u8; rows];
+                        let mut row = 0usize;
+                        let mut pos = 0usize;
+                        while let Some(hit) = crate::text::find_ci(blob, pos, n) {
+                            while (offsets[row + 1] as usize) <= hit {
+                                row += 1;
+                            }
+                            let end = offsets[row + 1] as usize;
+                            if hit + n.len() <= end {
+                                out[row] = 1;
+                                pos = end; // matched: skip the rest of this string
+                            } else {
+                                pos = hit + 1; // straddles a boundary: not a match
+                            }
+                        }
+                        return VV { data: Data::Bool(Rc::new(out)), valid: validity.clone() };
+                    }
+                }
+            }
             let a = eval_vec(&args[0], ctx);
             let pat = eval_vec(&args[1], ctx);
             if let (Data::Codes { codes, dict }, Data::Const(Val::Text(p))) = (&a.data, &pat.data) {
-                // pattern evaluated once per dictionary entry
-                let table: Vec<u8> = dict.iter().map(|s| like_match(p, s) as u8).collect();
+                // pattern evaluated once per dictionary entry — through the
+                // same no-allocation fast paths as string lanes
+                let shape = classify_like(p);
+                let table: Vec<u8> =
+                    dict.iter().map(|s| like_shape_match(&shape, s, p) as u8).collect();
                 let out: Vec<u8> = codes.iter().map(|&c| table[c as usize]).collect();
                 return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
             }
-            // plain-text column vs constant pattern: literal fast paths
-            // (%x% / x% / %x / exact — the shapes people actually write) run at
-            // substring-search speed; the general matcher only sees real wildcards.
+            // string lanes vs constant pattern: literal fast paths (%x% / x% /
+            // %x / exact); the general matcher only sees real wildcards
             if let (Data::Text(texts), Data::Const(Val::Text(p))) = (&a.data, &pat.data) {
                 let shape = classify_like(p);
                 let mut out = vec![0u8; rows];
-                match &shape {
-                    LikeShape::Contains(n) => {
-                        for i in 0..rows {
-                            out[i] = texts[i].to_ascii_lowercase().contains(n.as_str()) as u8;
-                        }
-                    }
-                    LikeShape::Prefix(n) => {
-                        for i in 0..rows {
-                            let t = texts[i].as_bytes();
-                            out[i] = (t.len() >= n.len()
-                                && t[..n.len()].eq_ignore_ascii_case(n.as_bytes()))
-                                as u8;
-                        }
-                    }
-                    LikeShape::Suffix(n) => {
-                        for i in 0..rows {
-                            let t = texts[i].as_bytes();
-                            out[i] = (t.len() >= n.len()
-                                && t[t.len() - n.len()..].eq_ignore_ascii_case(n.as_bytes()))
-                                as u8;
-                        }
-                    }
-                    LikeShape::Exact(n) => {
-                        for i in 0..rows {
-                            out[i] =
-                                texts[i].as_bytes().eq_ignore_ascii_case(n.as_bytes()) as u8;
-                        }
-                    }
-                    LikeShape::General => {
-                        // pre-lower the pattern once (the old code re-built it per row)
-                        let pchars: Vec<char> = p.chars().collect();
-                        for i in 0..rows {
-                            let sc: Vec<char> = texts[i].chars().collect();
-                            out[i] = like_rec(&pchars, &sc) as u8;
-                        }
-                    }
+                for i in 0..rows {
+                    out[i] = like_shape_match(&shape, &texts[i], p) as u8;
                 }
                 return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
             }
@@ -688,6 +812,176 @@ fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
                 }
             })
         }
+        "substr" => {
+            let a = eval_vec(&args[0], ctx);
+            let start_lit = match &args[1] {
+                Bound::Number(f, _) => Some(*f),
+                _ => None,
+            };
+            // None = no len arg; Some(None) would be non-literal (fall back)
+            let len_lit: Option<Option<f64>> = match args.get(2) {
+                None => Some(None),
+                Some(Bound::Number(f, _)) => Some(Some(*f)),
+                _ => None,
+            };
+            if let (Some(sf), Some(lf)) = (start_lit, len_lit) {
+                let start = (sf as i64 - 1).max(0) as usize;
+                let len = lf.map(|f| f as usize);
+                // per-dictionary-entry, then per-row Rc clones
+                if let Data::Codes { codes, dict } = &a.data {
+                    let table: Vec<VStr> =
+                        dict.iter().map(|s| Rc::new(substr_str(s, start, len))).collect();
+                    let out: Vec<VStr> = codes.iter().map(|&c| table[c as usize].clone()).collect();
+                    return VV { data: Data::Text(Rc::new(out)), valid: a.valid.clone() };
+                }
+                // straight over the string lane: one output allocation per row
+                if let Data::Text(texts) = &a.data {
+                    let out: Vec<VStr> =
+                        texts.iter().map(|s| Rc::new(substr_str(s, start, len))).collect();
+                    return VV { data: Data::Text(Rc::new(out)), valid: a.valid.clone() };
+                }
+            }
+            let items: Vec<VV> =
+                std::iter::once(a).chain(args[1..].iter().map(|e| eval_vec(e, ctx))).collect();
+            lanes_to_vv(rows, ty, |i| {
+                scalar_fn(name, items.iter().map(|v| lane_val(v, i)).collect())
+            })
+        }
+        "int" | "float" => {
+            let want_int = name == "int";
+            // fused cast(substr(col, lit[, lit])): slice + parse straight out of
+            // the column's byte blob — no substring materialization at all
+            if let Bound::Call { func, args: sargs, .. } = &args[0] {
+                if func.name == "substr" {
+                    let start_lit = match sargs.get(1) {
+                        Some(Bound::Number(f, _)) => Some((*f as i64 - 1).max(0) as usize),
+                        _ => None,
+                    };
+                    let len_lit: Option<Option<usize>> = match sargs.get(2) {
+                        None => Some(None),
+                        Some(Bound::Number(f, _)) => Some(Some(*f as usize)),
+                        _ => None,
+                    };
+                    if let (Bound::Column { index, .. }, Some(start), Some(len)) =
+                        (&sargs[0], start_lit, len_lit)
+                    {
+                        if let Some((GroupCol::Text { offsets, bytes, .. }, validity)) =
+                            ctx.cols.get(index)
+                        {
+                            let colvalid = validity.clone();
+                            let cv = |i: usize| {
+                                colvalid.as_deref().map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0)
+                            };
+                            let mut valid = vec![0u8; (rows + 7) / 8];
+                            let mut outf = vec![0f64; rows];
+                            let mut outi = vec![0i64; rows];
+                            for i in 0..rows {
+                                if !cv(i) {
+                                    continue;
+                                }
+                                let cell =
+                                    &bytes[offsets[i] as usize..offsets[i + 1] as usize];
+                                let Ok(cs) = core::str::from_utf8(cell) else { continue };
+                                let (b0, b1) = substr_bounds(cs, start, len);
+                                let piece = cs[b0..b1].trim();
+                                if want_int {
+                                    if let Ok(x) = piece.parse::<i64>() {
+                                        outi[i] = x;
+                                        valid[i / 8] |= 1 << (i % 8);
+                                    }
+                                } else if let Ok(x) = piece.parse::<f64>() {
+                                    outf[i] = x;
+                                    valid[i / 8] |= 1 << (i % 8);
+                                }
+                            }
+                            return if want_int {
+                                VV { data: Data::I64(Rc::new(outi)), valid: Some(Rc::new(valid)) }
+                            } else {
+                                VV { data: Data::F64(Rc::new(outf)), valid: Some(Rc::new(valid)) }
+                            };
+                        }
+                    }
+                }
+            }
+            let a = eval_vec(&args[0], ctx);
+            match &a.data {
+                // parse straight from the string lane — no Val boxing, no Rc churn
+                Data::Text(texts) => {
+                    let mut valid = vec![0u8; (rows + 7) / 8];
+                    if want_int {
+                        let mut out = vec![0i64; rows];
+                        for i in 0..rows {
+                            if !a.is_valid(i) {
+                                continue;
+                            }
+                            if let Ok(x) = texts[i].trim().parse::<i64>() {
+                                out[i] = x;
+                                valid[i / 8] |= 1 << (i % 8);
+                            }
+                        }
+                        VV { data: Data::I64(Rc::new(out)), valid: Some(Rc::new(valid)) }
+                    } else {
+                        let mut out = vec![0f64; rows];
+                        for i in 0..rows {
+                            if !a.is_valid(i) {
+                                continue;
+                            }
+                            if let Ok(x) = texts[i].trim().parse::<f64>() {
+                                out[i] = x;
+                                valid[i / 8] |= 1 << (i % 8);
+                            }
+                        }
+                        VV { data: Data::F64(Rc::new(out)), valid: Some(Rc::new(valid)) }
+                    }
+                }
+                // dictionary column: parse each distinct value once
+                Data::Codes { codes, dict } => {
+                    let table: Vec<Option<f64>> =
+                        dict.iter().map(|s| s.trim().parse::<f64>().ok()).collect();
+                    let mut valid = vec![0u8; (rows + 7) / 8];
+                    let mut outf = vec![0f64; rows];
+                    for i in 0..rows {
+                        if !a.is_valid(i) {
+                            continue;
+                        }
+                        if let Some(x) = table[codes[i] as usize] {
+                            outf[i] = x;
+                            valid[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    if want_int {
+                        let out: Vec<i64> = outf.iter().map(|&x| x as i64).collect();
+                        VV { data: Data::I64(Rc::new(out)), valid: Some(Rc::new(valid)) }
+                    } else {
+                        VV { data: Data::F64(Rc::new(outf)), valid: Some(Rc::new(valid)) }
+                    }
+                }
+                Data::F64(v) if want_int => {
+                    let out: Vec<i64> = v.iter().map(|&x| x as i64).collect();
+                    VV { data: Data::I64(Rc::new(out)), valid: a.valid.clone() }
+                }
+                Data::I64(v) if !want_int => {
+                    let out: Vec<f64> = v.iter().map(|&x| x as f64).collect();
+                    VV { data: Data::F64(Rc::new(out)), valid: a.valid.clone() }
+                }
+                Data::I64(_) if want_int => a,
+                Data::F64(_) if !want_int => a,
+                _ => {
+                    let items = vec![a];
+                    lanes_to_vv(rows, ty, |i| {
+                        scalar_fn(name, items.iter().map(|v| lane_val(v, i)).collect())
+                    })
+                }
+            }
+        }
+        _ if TEMPORAL_FNS.contains(&name) => {
+            let aty = args[temporal_arg_index(name)].ty();
+            let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+            lanes_to_vv(rows, ty, |i| {
+                let vals: Vec<Val> = items.iter().map(|v| lane_val(v, i)).collect();
+                temporal_fn(name, aty, &vals)
+            })
+        }
         // remaining scalars through lanes (cold path)
         _ => {
             let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
@@ -719,7 +1013,7 @@ fn lane_val(v: &VV, i: usize) -> Val {
 fn lanes_to_vv(rows: usize, ty: Ty, f: impl Fn(usize) -> Val) -> VV {
     let mut valid = vec![0u8; (rows + 7) / 8];
     match ty {
-        Ty::Int => {
+        Ty::Int | Ty::Date | Ty::Timestamp => {
             let mut out = vec![0i64; rows];
             for i in 0..rows {
                 match f(i) {
@@ -770,11 +1064,161 @@ fn lanes_to_vv(rows: usize, ty: Ty, f: impl Fn(usize) -> Val) -> VV {
     }
 }
 
+const TEMPORAL_FNS: &[&str] =
+    &["year", "month", "day", "hour", "minute", "second", "date", "timestamp", "strftime"];
+
+/// The argument whose bound type disambiguates days-vs-ms for a temporal call.
+fn temporal_arg_index(name: &str) -> usize {
+    if name == "strftime" { 1 } else { 0 }
+}
+
+use facetful_format::time;
+
+/// Temporal functions need the *bound type* of their argument (Date = days,
+/// Timestamp = ms share Val::Int), so they bypass scalar_fn's untyped Vals.
+fn temporal_fn(name: &str, aty: Ty, args: &[Val]) -> Val {
+    let x = &args[temporal_arg_index(name)];
+    if x.is_null() {
+        return Val::Null;
+    }
+    // the temporal argument as (days, ms) where applicable
+    let ms_of = |v: &Val| match (aty, v) {
+        (Ty::Date, Val::Int(d)) => Some(d * time::MS_PER_DAY),
+        (_, Val::Int(ms)) => Some(*ms),
+        _ => None,
+    };
+    let days_of = |v: &Val| match (aty, v) {
+        (Ty::Timestamp, Val::Int(ms)) => Some(ms.div_euclid(time::MS_PER_DAY)),
+        (_, Val::Int(d)) => Some(*d),
+        _ => None,
+    };
+    match name {
+        "year" | "month" | "day" => {
+            let Some(days) = days_of(x) else { return Val::Null };
+            let (y, m, d) = time::civil_from_days(days);
+            Val::Int(match name {
+                "year" => y,
+                "month" => m as i64,
+                _ => d as i64,
+            })
+        }
+        "hour" | "minute" | "second" => {
+            let Some(ms) = ms_of(x) else { return Val::Null };
+            let t = ms.rem_euclid(time::MS_PER_DAY) / 1000;
+            Val::Int(match name {
+                "hour" => t / 3600,
+                "minute" => t / 60 % 60,
+                _ => t % 60,
+            })
+        }
+        "date" => match x {
+            Val::Text(s) => time::parse_date(s).map(Val::Int).unwrap_or(Val::Null),
+            _ => days_of(x).map(Val::Int).unwrap_or(Val::Null),
+        },
+        "timestamp" => match x {
+            Val::Text(s) => time::parse_timestamp(s).map(Val::Int).unwrap_or(Val::Null),
+            _ => ms_of(x).map(Val::Int).unwrap_or(Val::Null),
+        },
+        "strftime" => {
+            let Val::Text(fmt) = &args[0] else { return Val::Null };
+            let Some(ms) = ms_of(x) else { return Val::Null };
+            let days = ms.div_euclid(time::MS_PER_DAY);
+            let (y, m, d) = time::civil_from_days(days);
+            let t = ms.rem_euclid(time::MS_PER_DAY) / 1000;
+            let mut out = String::new();
+            let mut it = fmt.chars();
+            while let Some(c) = it.next() {
+                if c != '%' {
+                    out.push(c);
+                    continue;
+                }
+                match it.next() {
+                    Some('Y') => out.push_str(&format!("{y:04}")),
+                    Some('m') => out.push_str(&format!("{m:02}")),
+                    Some('d') => out.push_str(&format!("{d:02}")),
+                    Some('H') => out.push_str(&format!("{:02}", t / 3600)),
+                    Some('M') => out.push_str(&format!("{:02}", t / 60 % 60)),
+                    Some('S') => out.push_str(&format!("{:02}", t % 60)),
+                    Some('s') => out.push_str(&(ms.div_euclid(1000)).to_string()),
+                    Some('%') => out.push('%'),
+                    Some(other) => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                    None => out.push('%'),
+                }
+            }
+            Val::text(out)
+        }
+        _ => unreachable!("not a temporal function: {name}"),
+    }
+}
+
 /// scalar function on materialized values — cold path + grouped-context eval
 fn scalar_fn(name: &str, mut args: Vec<Val>) -> Val {
     match name {
         "isnull" => Val::Bool(args[0].is_null()),
-        "coalesce" => args.into_iter().find(|v| !v.is_null()).unwrap_or(Val::Null),
+        "coalesce" | "ifnull" => args.into_iter().find(|v| !v.is_null()).unwrap_or(Val::Null),
+        "nullif" => {
+            if args[0] == args[1] { Val::Null } else { args.swap_remove(0) }
+        }
+        "trim" | "ltrim" | "rtrim" => match (&args[0], args.get(1)) {
+            (Val::Text(s), sel) => {
+                // SQLite semantics: default trims spaces only; 2-arg form trims
+                // any character present in the second argument
+                let set: Vec<char> = match sel {
+                    None => vec![' '],
+                    Some(Val::Text(c)) => c.chars().collect(),
+                    _ => return Val::Null,
+                };
+                let f = |c: char| set.contains(&c);
+                Val::text(match name {
+                    "trim" => s.trim_matches(f),
+                    "ltrim" => s.trim_start_matches(f),
+                    _ => s.trim_end_matches(f),
+                })
+            }
+            _ => Val::Null,
+        },
+        "replace" => match (&args[0], &args[1], &args[2]) {
+            (Val::Text(s), Val::Text(from), Val::Text(to)) => {
+                // empty needle: SQLite returns the input unchanged
+                if from.is_empty() { Val::Text(s.clone()) } else { Val::text(s.replace(&**from, to)) }
+            }
+            _ => Val::Null,
+        },
+        "instr" => match (&args[0], &args[1]) {
+            // 1-based character position of the first occurrence, 0 = absent
+            (Val::Text(s), Val::Text(sub)) => match s.find(&**sub) {
+                Some(byte) => Val::Int(s[..byte].chars().count() as i64 + 1),
+                None => Val::Int(0),
+            },
+            _ => Val::Null,
+        },
+        "sign" => match args[0].as_f64() {
+            Some(f) if f > 0.0 => Val::Int(1),
+            Some(f) if f < 0.0 => Val::Int(-1),
+            Some(_) => Val::Int(0),
+            None => Val::Null,
+        },
+        "sqrt" | "exp" | "ln" | "pow" | "power" => {
+            let (Some(a), b) = (args[0].as_f64(), args.get(1).and_then(|v| v.as_f64())) else {
+                return Val::Null;
+            };
+            let r = match name {
+                "sqrt" => a.sqrt(),
+                "exp" => a.exp(),
+                "ln" => {
+                    if a <= 0.0 { return Val::Null } else { a.ln() }
+                }
+                _ => match b {
+                    Some(b) => a.powf(b),
+                    None => return Val::Null,
+                },
+            };
+            // out-of-domain (sqrt(-1), pow(-1, .5)) is NULL, matching SQLite
+            if r.is_nan() { Val::Null } else { Val::Float(r) }
+        }
         "in" => {
             let needle = args.remove(0);
             if needle.is_null() {
@@ -914,6 +1358,11 @@ enum AggAcc {
     Avg { sum: Vec<f64>, n: Vec<i64> },
     MinMaxNum { v: Vec<f64>, seen: Vec<bool>, is_min: bool, int: bool },
     MinMaxStr { v: Vec<Option<VStr>>, is_min: bool },
+    /// keeps every value; finish() selects — memory is O(group rows)
+    Median(Vec<Vec<f64>>),
+    /// sample stddev via (n, Σx, Σx²)
+    Stddev { n: Vec<i64>, sum: Vec<f64>, sumsq: Vec<f64> },
+    GroupConcat { v: Vec<Option<String>>, sep: String },
 }
 
 impl AggAcc {
@@ -924,26 +1373,41 @@ impl AggAcc {
         match func.name {
             "count" => AggAcc::Count(Vec::new()),
             "count_distinct" => {
-                if arg_is_dict || matches!(aty, Ty::Int | Ty::Float | Ty::Bool) {
+                if arg_is_dict || matches!(aty, Ty::Int | Ty::Float | Ty::Bool | Ty::Date | Ty::Timestamp) {
                     AggAcc::DistinctNum(Vec::new())
                 } else {
                     AggAcc::DistinctStr(Vec::new())
                 }
             }
             "sum" => {
-                if aty == Ty::Int {
+                if matches!(aty, Ty::Int | Ty::Date | Ty::Timestamp) {
                     AggAcc::SumI { v: Vec::new(), any: Vec::new() }
                 } else {
                     AggAcc::SumF { v: Vec::new(), any: Vec::new() }
                 }
             }
             "avg" => AggAcc::Avg { sum: Vec::new(), n: Vec::new() },
+            "median" => AggAcc::Median(Vec::new()),
+            "stddev" => AggAcc::Stddev { n: Vec::new(), sum: Vec::new(), sumsq: Vec::new() },
+            "group_concat" => {
+                // binder guarantees the separator is a text literal
+                let sep = match args.get(1) {
+                    Some(Bound::Str(s)) => s.clone(),
+                    _ => ",".to_string(),
+                };
+                AggAcc::GroupConcat { v: Vec::new(), sep }
+            }
             "min" | "max" => {
                 let is_min = func.name == "min";
                 if aty == Ty::Text {
                     AggAcc::MinMaxStr { v: Vec::new(), is_min }
                 } else {
-                    AggAcc::MinMaxNum { v: Vec::new(), seen: Vec::new(), is_min, int: aty == Ty::Int }
+                    AggAcc::MinMaxNum {
+                        v: Vec::new(),
+                        seen: Vec::new(),
+                        is_min,
+                        int: matches!(aty, Ty::Int | Ty::Date | Ty::Timestamp),
+                    }
                 }
             }
             _ => unreachable!(),
@@ -971,6 +1435,13 @@ impl AggAcc {
                 seen.resize(n, false);
             }
             AggAcc::MinMaxStr { v, .. } => v.resize(n, None),
+            AggAcc::Median(v) => v.resize_with(n, Default::default),
+            AggAcc::Stddev { n: c, sum, sumsq } => {
+                c.resize(n, 0);
+                sum.resize(n, 0.0);
+                sumsq.resize(n, 0.0);
+            }
+            AggAcc::GroupConcat { v, .. } => v.resize(n, None),
         }
     }
 
@@ -1087,6 +1558,37 @@ impl AggAcc {
                     sets[g].insert(t);
                 }
             }),
+            (AggAcc::Median(vs), _) => for_kept!(|i, g| {
+                if arg.is_valid(i) {
+                    vs[g].push(arg.f64_at(i));
+                }
+            }),
+            (AggAcc::Stddev { n, sum, sumsq }, _) => for_kept!(|i, g| {
+                if arg.is_valid(i) {
+                    let x = arg.f64_at(i);
+                    n[g] += 1;
+                    sum[g] += x;
+                    sumsq[g] += x * x;
+                }
+            }),
+            (AggAcc::GroupConcat { v, sep }, _) => for_kept!(|i, g| {
+                if arg.is_valid(i) {
+                    let piece = match lane_val(arg, i) {
+                        Val::Text(s) => s.to_string(),
+                        Val::Int(x) => x.to_string(),
+                        Val::Float(x) => x.to_string(),
+                        Val::Bool(b) => (if b { "1" } else { "0" }).to_string(),
+                        Val::Null => continue,
+                    };
+                    match &mut v[g] {
+                        Some(acc) => {
+                            acc.push_str(sep);
+                            acc.push_str(&piece);
+                        }
+                        None => v[g] = Some(piece),
+                    }
+                }
+            }),
             // generic fallbacks (consts, computed vectors, text min/max)
             (acc, _) => {
                 for i in 0..rows {
@@ -1138,7 +1640,11 @@ impl AggAcc {
                             sets[g].insert(bits);
                         }
                         AggAcc::Count(c) => c[g] += 1,
-                        AggAcc::DistinctStr(_) => unreachable!(),
+                        // these have shape-generic arms above the fallback
+                        AggAcc::DistinctStr(_)
+                        | AggAcc::Median(_)
+                        | AggAcc::Stddev { .. }
+                        | AggAcc::GroupConcat { .. } => unreachable!(),
                     }
                 }
             }
@@ -1171,6 +1677,135 @@ impl AggAcc {
             AggAcc::MinMaxStr { v, .. } => {
                 v[gid].as_ref().map(|s| Val::Text(s.clone())).unwrap_or(Val::Null)
             }
+            AggAcc::Median(vs) => {
+                let src = &vs[gid];
+                if src.is_empty() {
+                    return Val::Null;
+                }
+                let mut v = src.clone();
+                v.sort_unstable_by(f64::total_cmp);
+                let m = v.len() / 2;
+                Val::Float(if v.len() % 2 == 1 { v[m] } else { (v[m - 1] + v[m]) / 2.0 })
+            }
+            AggAcc::Stddev { n, sum, sumsq } => {
+                let c = n[gid];
+                if c < 2 {
+                    return Val::Null;
+                }
+                let mean = sum[gid] / c as f64;
+                let var = (sumsq[gid] - sum[gid] * mean) / (c - 1) as f64;
+                Val::Float(var.max(0.0).sqrt())
+            }
+            AggAcc::GroupConcat { v, .. } => {
+                v[gid].as_ref().map(|s| Val::text(s.clone())).unwrap_or(Val::Null)
+            }
+        }
+    }
+}
+
+/// Gather one select expression column-wise over ordered (gslot, row) refs.
+/// `vvs[gslot]` = evaluated VV per group; `raw[gslot]` = (offsets, bytes,
+/// validity) when the expr is a direct plain-text column (skips VStr lanes).
+enum SelSrc {
+    Vv(Vec<VV>),
+    RawText(Vec<(Rc<Vec<u32>>, Rc<Vec<u8>>, Option<Rc<Vec<u8>>>)>),
+}
+
+fn gather_outcol(src: &SelSrc, refs: &[(u32, u32)], ty: Ty) -> OutCol {
+    let n = refs.len();
+    let mut valid = vec![0u8; n.div_ceil(8)];
+    match src {
+        SelSrc::RawText(groups) => {
+            let mut offsets = Vec::with_capacity(n + 1);
+            offsets.push(0u32);
+            let mut bytes = Vec::with_capacity(n * 16);
+            for (i, &(g, r)) in refs.iter().enumerate() {
+                let (offs, blob, v) = &groups[g as usize];
+                let r = r as usize;
+                if v.as_deref().map_or(true, |vb| vb[r / 8] >> (r % 8) & 1 != 0) {
+                    valid[i / 8] |= 1 << (i % 8);
+                }
+                bytes.extend_from_slice(&blob[offs[r] as usize..offs[r + 1] as usize]);
+                offsets.push(bytes.len() as u32);
+            }
+            OutCol::Text { offsets, bytes, valid }
+        }
+        SelSrc::Vv(vvs) => match ty {
+            Ty::Float => {
+                let mut v = vec![0f64; n];
+                for (i, &(g, r)) in refs.iter().enumerate() {
+                    let vv = &vvs[g as usize];
+                    if vv.is_valid(r as usize) {
+                        v[i] = vv.f64_at(r as usize);
+                        valid[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                OutCol::F64 { v, valid }
+            }
+            Ty::Int | Ty::Date | Ty::Timestamp => {
+                let mut v = vec![0i64; n];
+                for (i, &(g, r)) in refs.iter().enumerate() {
+                    let vv = &vvs[g as usize];
+                    if vv.is_valid(r as usize) {
+                        v[i] = vv.i64_at(r as usize);
+                        valid[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                OutCol::I64 { v, valid }
+            }
+            Ty::Bool => {
+                let mut v = vec![0u8; n];
+                for (i, &(g, r)) in refs.iter().enumerate() {
+                    let vv = &vvs[g as usize];
+                    if let Some(b) = vv.bool3_at(r as usize) {
+                        v[i] = b as u8;
+                        valid[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                OutCol::Bool { v, valid }
+            }
+            _ => {
+                // text-valued expressions (computed or dict): through the lane
+                let mut offsets = Vec::with_capacity(n + 1);
+                offsets.push(0u32);
+                let mut bytes = Vec::new();
+                for (i, &(g, r)) in refs.iter().enumerate() {
+                    let vv = &vvs[g as usize];
+                    if let Some(t) = vv.text_at(r as usize) {
+                        bytes.extend_from_slice(t.as_bytes());
+                        valid[i / 8] |= 1 << (i % 8);
+                    }
+                    offsets.push(bytes.len() as u32);
+                }
+                OutCol::Text { offsets, bytes, valid }
+            }
+        },
+    }
+}
+
+/// Build per-select sources for one group: direct plain-text columns give raw
+/// blob access, everything else evaluates to a VV.
+fn sel_srcs_for_group(
+    q: &super::binder::BoundQuery,
+    ctx: &GroupCtx,
+    srcs: &mut [Option<SelSrc>],
+) {
+    for (si, sel) in q.select.iter().enumerate() {
+        let raw = match &sel.expr {
+            Bound::Column { index, ty: Ty::Text } => match ctx.cols.get(index) {
+                Some((GroupCol::Text { offsets, bytes, .. }, validity)) => {
+                    Some((offsets.clone(), bytes.clone(), validity.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match (&mut srcs[si], raw) {
+            (Some(SelSrc::RawText(v)), Some(r)) => v.push(r),
+            (slot @ None, Some(r)) => *slot = Some(SelSrc::RawText(vec![r])),
+            (Some(SelSrc::Vv(v)), None) => v.push(eval_vec(&sel.expr, ctx)),
+            (slot @ None, None) => *slot = Some(SelSrc::Vv(vec![eval_vec(&sel.expr, ctx)])),
+            _ => unreachable!("select expr shape is stable across groups"),
         }
     }
 }
@@ -1248,7 +1883,11 @@ fn eval_grouped(b: &Bound, o: &Overrides<'_>) -> Val {
         }
         Bound::Call { func, args, .. } => {
             let vals: Vec<Val> = args.iter().map(|a| eval_grouped(a, o)).collect();
-            scalar_fn(func.name, vals)
+            if TEMPORAL_FNS.contains(&func.name) {
+                temporal_fn(func.name, args[temporal_arg_index(func.name)].ty(), &vals)
+            } else {
+                scalar_fn(func.name, vals)
+            }
         }
         Bound::Column { .. } => Val::Null,
     }
@@ -1439,8 +2078,7 @@ pub fn execute<S: ReadAt>(
     let mut dicts: HashMap<usize, Rc<Vec<VStr>>> = HashMap::new();
     for &c in &needed {
         if table.catalog().schema.columns[c].is_dict() {
-            let d = table.dictionary(c)?;
-            dicts.insert(c, Rc::new(d.into_iter().map(Rc::new).collect()));
+            dicts.insert(c, table.dictionary_rc(c)?);
         }
     }
 
@@ -1467,11 +2105,40 @@ pub fn execute<S: ReadAt>(
 
     let sel_tys: Vec<Ty> = q.select.iter().map(|s| s.expr.ty()).collect();
     let ord_tys: Vec<Ty> = q.order_by.iter().map(|(e, _)| e.ty()).collect();
-    let mut out_rows: Vec<(Vec<Val>, Vec<Val>)> = Vec::new();
+    // every non-aggregate path now early-returns columnar; this remains only
+    // as the aggregate path's row buffer seed
+    let out_rows: Vec<(Vec<Val>, Vec<Val>)> = Vec::new();
 
     // Bounded top-k: ORDER BY + LIMIT with a small window — keep only ~2*cap
     // candidates, cheap first-key reject for the vast majority of rows, and
     // project ONLY the winners at the end.
+    // Limit-only bound: no ORDER BY, no aggregation — the scan can stop the
+    // moment offset+limit rows are collected, and each group only needs its
+    // projection lanes materialized up to the last row it can contribute.
+    let scan_cap = if !q.is_aggregate && q.order_by.is_empty() {
+        q.limit.map(|l| l as usize + q.offset.unwrap_or(0) as usize)
+    } else {
+        None
+    };
+    let filter_needed: Vec<usize> = {
+        let mut v = Vec::new();
+        if let Some(f) = &q.filter {
+            collect_columns(f, &mut v);
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    // top-k scans need only the ORDER BY columns; select lanes load later,
+    // for winning groups only (true late materialization)
+    let ord_needed: Vec<usize> = {
+        let mut v = Vec::new();
+        q.order_by.iter().for_each(|(e, _)| collect_columns(e, &mut v));
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+
     let topk_cap = if !q.is_aggregate && !q.order_by.is_empty() {
         q.limit
             .map(|l| (l + q.offset.unwrap_or(0)) as usize)
@@ -1481,12 +2148,11 @@ pub fn execute<S: ReadAt>(
     };
     struct Cand {
         keys: Vec<Val>,
-        gslot: u32,
+        g: u32,
         row: u32,
     }
     let mut cands: Vec<Cand> = Vec::new();
     let mut bound_key: Option<Vec<Val>> = None; // full key of current cutoff
-    let mut kept_sel: Vec<Vec<VV>> = Vec::new(); // per scanned group, for late projection
     let cmp_keys = |a: &Vec<Val>, b: &Vec<Val>, order_by: &[(Bound, SortDir)]| {
         for (i, (_, dir)) in order_by.iter().enumerate() {
             let ord = a[i].cmp_sql(&b[i]);
@@ -1498,6 +2164,17 @@ pub fn execute<S: ReadAt>(
         core::cmp::Ordering::Equal
     };
 
+    // full-table ORDER BY (no usable top-k bound): defer everything — sort
+    // packed keys + row refs, project only afterwards
+    let full_sort = !q.is_aggregate && !q.order_by.is_empty() && topk_cap.is_none();
+    let mut sort_groups: Vec<(Vec<VV>, Vec<u32>)> = Vec::new();
+    let mut sort_srcs: Vec<Option<SelSrc>> = (0..q.select.len()).map(|_| None).collect();
+    // plain projection (no ORDER BY): columnar refs + sources
+    let plain = !q.is_aggregate && q.order_by.is_empty();
+    let mut plain_srcs: Vec<Option<SelSrc>> = (0..q.select.len()).map(|_| None).collect();
+    let mut plain_refs: Vec<(u32, u32)> = Vec::new();
+    let mut plain_gslot = 0u32;
+
     let mut scanned_groups = 0usize;
     for g in 0..table.group_count() {
         if group_prunable(table, g, &constraints) {
@@ -1505,32 +2182,87 @@ pub fn execute<S: ReadAt>(
         }
         scanned_groups += 1;
         let rows = table.group_rows(g);
-        let mut cols = HashMap::new();
-        for &c in &needed {
-            let (cty, is_dict) = {
-                let def = &table.catalog().schema.columns[c];
-                (def.ty, def.is_dict())
-            };
-            let validity = table.validity(g, c)?.map(Rc::new);
-            let col = if is_dict {
-                GroupCol::Dict { codes: Rc::new(table.codes(g, c)?), dict: dicts[&c].clone() }
-            } else {
-                match cty {
-                    ColumnType::Float64 => GroupCol::F64(Rc::new(table.f64s(g, c)?)),
-                    ColumnType::Utf8 => GroupCol::Text(Rc::new(
-                        table.texts(g, c)?.into_iter().map(Rc::new).collect(),
-                    )),
-                    _ => GroupCol::I64(Rc::new(table.i64s(g, c)?)),
+        let load = |table: &mut Table<S>,
+                    cols: &mut HashMap<usize, (GroupCol, Option<Rc<Vec<u8>>>)>,
+                    which: &[usize],
+                    cap: usize|
+         -> Result<(), FormatError> {
+            for &c in which {
+                if cols.contains_key(&c) {
+                    continue;
                 }
-            };
-            cols.insert(c, (col, validity));
-        }
-        let ctx = GroupCtx { cols, rows };
+                let (cty, is_dict) = {
+                    let def = &table.catalog().schema.columns[c];
+                    (def.ty, def.is_dict())
+                };
+                let validity = table.validity(g, c)?.map(Rc::new);
+                let col = if is_dict {
+                    GroupCol::Dict { codes: Rc::new(table.codes(g, c, cap)?), dict: dicts[&c].clone() }
+                } else {
+                    match cty {
+                        ColumnType::Float64 => GroupCol::F64(Rc::new(table.f64s(g, c, cap)?)),
+                        ColumnType::Utf8 => {
+                            let (offs, bytes) = table.texts_raw(g, c, cap)?;
+                            GroupCol::Text {
+                                strs: std::cell::OnceCell::new(),
+                                offsets: Rc::new(offs),
+                                bytes: Rc::new(bytes),
+                            }
+                        }
+                        _ => GroupCol::I64(Rc::new(table.i64s(g, c, cap)?)),
+                    }
+                };
+                cols.insert(c, (col, validity));
+            }
+            Ok(())
+        };
 
+        // phase 1: filter columns only (full group), evaluate the mask
+        let mut cols = HashMap::new();
+        load(table, &mut cols, &filter_needed, usize::MAX)?;
         let keep: Option<Vec<u8>> = q.filter.as_ref().map(|f| {
-            let m = eval_vec(f, &ctx);
+            let fctx = GroupCtx { cols: core::mem::take(&mut cols), rows };
+            let m = eval_vec(f, &fctx);
+            cols = fctx.cols;
             (0..rows).map(|i| (m.bool3_at(i) == Some(true)) as u8).collect()
         });
+        // fully filtered out: nothing else to load or evaluate for this group
+        if keep.as_ref().is_some_and(|k| k.iter().all(|&b| b == 0)) {
+            continue;
+        }
+
+        // phase 2: how deep must projection lanes go? (limit-only: just far
+        // enough to yield the rows still missing)
+        let take_rows = match scan_cap {
+            None => rows,
+            Some(c) => {
+                let rem = c.saturating_sub(out_rows.len());
+                match &keep {
+                    None => rem.min(rows),
+                    Some(k) => {
+                        let mut cnt = 0usize;
+                        let mut cut = rows;
+                        for (i, &b) in k.iter().enumerate() {
+                            if b != 0 {
+                                cnt += 1;
+                                if cnt == rem {
+                                    cut = i + 1;
+                                    break;
+                                }
+                            }
+                        }
+                        cut
+                    }
+                }
+            }
+        };
+        if topk_cap.is_some() {
+            load(table, &mut cols, &ord_needed, usize::MAX)?;
+        } else {
+            load(table, &mut cols, &needed, take_rows)?;
+        }
+        let eval_rows = if scan_cap.is_some() { take_rows } else { rows };
+        let ctx = GroupCtx { cols, rows: eval_rows };
         let kept = |i: usize| keep.as_ref().map_or(true, |k| k[i] != 0);
 
         if q.is_aggregate {
@@ -1627,9 +2359,7 @@ pub fn execute<S: ReadAt>(
                 acc.update_batch(&gids, &arg);
             }
         } else if let Some(cap) = topk_cap {
-            let sel_vvs: Vec<VV> = q.select.iter().map(|s| eval_vec(&s.expr, &ctx)).collect();
             let ord_vvs: Vec<VV> = q.order_by.iter().map(|(e, _)| eval_vec(e, &ctx)).collect();
-            let gslot = kept_sel.len() as u32;
             for i in 0..rows {
                 if !kept(i) {
                     continue;
@@ -1646,50 +2376,227 @@ pub fn execute<S: ReadAt>(
                 }
                 let keys: Vec<Val> =
                     ord_vvs.iter().zip(&ord_tys).map(|(v, t)| v.val_at(i, *t)).collect();
-                cands.push(Cand { keys, gslot, row: i as u32 });
+                cands.push(Cand { keys, g: g as u32, row: i as u32 });
                 if cands.len() >= cap * 2 + 16 {
                     cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
                     cands.truncate(cap);
                     bound_key = cands.last().map(|c| c.keys.clone());
                 }
             }
-            kept_sel.push(sel_vvs);
-        } else {
-            let sel_vvs: Vec<VV> = q.select.iter().map(|s| eval_vec(&s.expr, &ctx)).collect();
+        } else if full_sort {
+            sel_srcs_for_group(q, &ctx, &mut sort_srcs);
             let ord_vvs: Vec<VV> = q.order_by.iter().map(|(e, _)| eval_vec(e, &ctx)).collect();
-            for i in 0..rows {
-                if !kept(i) {
-                    continue;
+            let kept_rows: Vec<u32> =
+                (0..ctx.rows).filter(|&i| kept(i)).map(|i| i as u32).collect();
+            sort_groups.push((ord_vvs, kept_rows));
+        } else {
+            debug_assert!(plain);
+            sel_srcs_for_group(q, &ctx, &mut plain_srcs);
+            plain_refs
+                .extend((0..ctx.rows).filter(|&i| kept(i)).map(|i| (plain_gslot, i as u32)));
+            plain_gslot += 1;
+            if let Some(c) = scan_cap {
+                if plain_refs.len() >= c {
+                    plain_refs.truncate(c);
+                    break;
                 }
-                let projected: Vec<Val> =
-                    sel_vvs.iter().zip(&sel_tys).map(|(v, t)| v.val_at(i, *t)).collect();
-                let order: Vec<Val> =
-                    ord_vvs.iter().zip(&ord_tys).map(|(v, t)| v.val_at(i, *t)).collect();
-                out_rows.push((projected, order));
             }
         }
     }
 
-    // finish bounded top-k: sort survivors, window, project only the winners
-    if topk_cap.is_some() {
-        cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
+    if plain {
         let offset = q.offset.unwrap_or(0) as usize;
-        let limit = q.limit.unwrap_or(0) as usize;
-        let rows: Vec<Vec<Val>> = cands
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|c| {
-                let sel = &kept_sel[c.gslot as usize];
-                sel.iter()
-                    .zip(&sel_tys)
-                    .map(|(v, t)| v.val_at(c.row as usize, *t))
-                    .collect()
+        let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+        let refs: Vec<(u32, u32)> =
+            plain_refs.into_iter().skip(offset).take(limit).collect();
+        let cols: Vec<OutCol> = plain_srcs
+            .iter()
+            .zip(&sel_tys)
+            .map(|(src, ty)| match src {
+                Some(src) => gather_outcol(src, &refs, *ty),
+                None => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty), // zero groups scanned
             })
             .collect();
         return Ok(QueryResult {
             columns,
+            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
+            rows: Vec::new(),
+            out_rows: refs.len(),
+            cols: Some(cols),
+            scanned_groups,
+            total_groups: table.group_count(),
+        });
+    }
+
+    if full_sort {
+        // flatten refs: (group slot, row)
+        let total: usize = sort_groups.iter().map(|(_, k)| k.len()).sum();
+        let mut refs: Vec<(u32, u32)> = Vec::with_capacity(total);
+        for (gslot, (_, kept_rows)) in sort_groups.iter().enumerate() {
+            for &r in kept_rows {
+                refs.push((gslot as u32, r));
+            }
+        }
+        let numeric_keys = q
+            .order_by
+            .iter()
+            .all(|(e, _)| matches!(e.ty(), Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp));
+        let nk = q.order_by.len();
+
+        // order-preserving u64 encoding; validity first so NULLs sort first
+        // ascending (and last after a DESC flip), matching cmp_sql
+        let encode = |vv: &VV, i: usize, ty: Ty, desc: bool| -> (u8, u64) {
+            let (v, k) = if !vv.is_valid(i) {
+                (0u8, 0u64)
+            } else if ty == Ty::Float {
+                let b = vv.f64_at(i).to_bits();
+                (1, if b >> 63 == 1 { !b } else { b | (1u64 << 63) })
+            } else {
+                (1, (vv.i64_at(i) as u64) ^ (1u64 << 63))
+            };
+            if desc { (1 - v, !k) } else { (v, k) }
+        };
+
+        let order_refs: Vec<(u32, u32)> = if numeric_keys && nk == 1 {
+            let (_, dir) = &q.order_by[0];
+            let desc = *dir == SortDir::Desc;
+            let ty = ord_tys[0];
+            let mut keyed: Vec<(u8, u64, u32, u32)> = refs
+                .iter()
+                .map(|&(g, r)| {
+                    let (v, k) = encode(&sort_groups[g as usize].0[0], r as usize, ty, desc);
+                    (v, k, g, r)
+                })
+                .collect();
+            keyed.sort_unstable_by_key(|t| (t.0, t.1));
+            keyed.into_iter().map(|t| (t.2, t.3)).collect()
+        } else if numeric_keys {
+            let mut flat: Vec<(u8, u64)> = Vec::with_capacity(refs.len() * nk);
+            for &(g, r) in &refs {
+                for (ki, (_, dir)) in q.order_by.iter().enumerate() {
+                    flat.push(encode(
+                        &sort_groups[g as usize].0[ki],
+                        r as usize,
+                        ord_tys[ki],
+                        *dir == SortDir::Desc,
+                    ));
+                }
+            }
+            let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
+            perm.sort_unstable_by(|&a, &b| {
+                flat[a as usize * nk..a as usize * nk + nk]
+                    .cmp(&flat[b as usize * nk..b as usize * nk + nk])
+            });
+            perm.into_iter().map(|p| refs[p as usize]).collect()
+        } else {
+            // text keys: materialize the (small) key tuples, sort refs by them
+            let keys: Vec<Vec<Val>> = refs
+                .iter()
+                .map(|&(g, r)| {
+                    sort_groups[g as usize]
+                        .0
+                        .iter()
+                        .zip(&ord_tys)
+                        .map(|(v, t)| v.val_at(r as usize, *t))
+                        .collect()
+                })
+                .collect();
+            let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
+            perm.sort_by(|&a, &b| {
+                cmp_keys(&keys[a as usize], &keys[b as usize], &q.order_by)
+            });
+            perm.into_iter().map(|p| refs[p as usize]).collect()
+        };
+
+        let offset = q.offset.unwrap_or(0) as usize;
+        let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+        let final_refs: Vec<(u32, u32)> =
+            order_refs.into_iter().skip(offset).take(limit).collect();
+        let cols: Vec<OutCol> = sort_srcs
+            .iter()
+            .zip(&sel_tys)
+            .map(|(src, ty)| match src {
+                Some(src) => gather_outcol(src, &final_refs, *ty),
+                None => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty),
+            })
+            .collect();
+        return Ok(QueryResult {
+            columns,
+            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
+            rows: Vec::new(),
+            out_rows: final_refs.len(),
+            cols: Some(cols),
+            scanned_groups,
+            total_groups: table.group_count(),
+        });
+    }
+
+    // finish bounded top-k: sort survivors, window, then load ONLY the
+    // winning groups' select lanes and project the winner rows
+    if topk_cap.is_some() {
+        cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
+        let offset = q.offset.unwrap_or(0) as usize;
+        let limit = q.limit.unwrap_or(0) as usize;
+        let winners: Vec<Cand> = cands.into_iter().skip(offset).take(limit).collect();
+        let mut sel_cache: HashMap<u32, Vec<VV>> = HashMap::new();
+        let mut rows: Vec<Vec<Val>> = Vec::with_capacity(winners.len());
+        for c in &winners {
+            if !sel_cache.contains_key(&c.g) {
+                let g = c.g as usize;
+                let cap = winners
+                    .iter()
+                    .filter(|w| w.g == c.g)
+                    .map(|w| w.row as usize + 1)
+                    .max()
+                    .unwrap();
+                let mut cols = HashMap::new();
+                for &ci in &needed {
+                    let (cty, is_dict) = {
+                        let def = &table.catalog().schema.columns[ci];
+                        (def.ty, def.is_dict())
+                    };
+                    let validity = table.validity(g, ci)?.map(Rc::new);
+                    let col = if is_dict {
+                        GroupCol::Dict {
+                            codes: Rc::new(table.codes(g, ci, cap)?),
+                            dict: dicts[&ci].clone(),
+                        }
+                    } else {
+                        match cty {
+                            ColumnType::Float64 => GroupCol::F64(Rc::new(table.f64s(g, ci, cap)?)),
+                            ColumnType::Utf8 => {
+                                let (offs, bytes) = table.texts_raw(g, ci, cap)?;
+                                GroupCol::Text {
+                                    strs: std::cell::OnceCell::new(),
+                                    offsets: Rc::new(offs),
+                                    bytes: Rc::new(bytes),
+                                }
+                            }
+                            _ => GroupCol::I64(Rc::new(table.i64s(g, ci, cap)?)),
+                        }
+                    };
+                    cols.insert(ci, (col, validity));
+                }
+                let ctx = GroupCtx { cols, rows: cap };
+                let sel_vvs: Vec<VV> =
+                    q.select.iter().map(|s| eval_vec(&s.expr, &ctx)).collect();
+                sel_cache.insert(c.g, sel_vvs);
+            }
+            let sel = &sel_cache[&c.g];
+            rows.push(
+                sel.iter()
+                    .zip(&sel_tys)
+                    .map(|(v, t)| v.val_at(c.row as usize, *t))
+                    .collect(),
+            );
+        }
+        let out_rows = rows.len();
+        return Ok(QueryResult {
+            columns,
+            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
             rows,
+            out_rows,
+            cols: None,
             scanned_groups,
             total_groups: table.group_count(),
         });
@@ -1740,5 +2647,14 @@ pub fn execute<S: ReadAt>(
     let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
     let rows: Vec<Vec<Val>> = rows.into_iter().skip(offset).take(limit).map(|(p, _)| p).collect();
 
-    Ok(QueryResult { columns, rows, scanned_groups, total_groups: table.group_count() })
+    let out_rows = rows.len();
+    Ok(QueryResult {
+        columns,
+        col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
+        rows,
+        out_rows,
+        cols: None,
+        scanned_groups,
+        total_groups: table.group_count(),
+    })
 }

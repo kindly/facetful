@@ -8,12 +8,30 @@
 //! quotes, escaped quotes, CRLF).
 
 use facetful_format as fmt;
-use fmt::write::{ColumnChunk, DictData, SegmentData, Writer};
-use fmt::{ColumnDef, ColumnType, Schema, Stats};
-use std::collections::HashMap;
+use fmt::compile;
+use fmt::Stats;
 use std::process::exit;
 
+// glibc trims the heap back to the OS between queries, so every query
+// re-faults its vector pages — measured 2x on scan-heavy shapes. Pin the
+// thresholds up front, like sqlite/duckdb do with their own buffer managers.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn retain_heap() {
+    extern "C" {
+        fn mallopt(param: core::ffi::c_int, value: core::ffi::c_int) -> core::ffi::c_int;
+    }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    const M_MMAP_THRESHOLD: i32 = -3;
+    unsafe {
+        mallopt(M_TRIM_THRESHOLD, i32::MAX);
+        mallopt(M_MMAP_THRESHOLD, 256 * 1024 * 1024);
+    }
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn retain_heap() {}
+
 fn main() {
+    retain_heap();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("convert") => convert(&args[1..]),
@@ -49,15 +67,18 @@ fn query(args: &[String]) {
         exit(1);
     });
 
-    let render = |v: &Val| -> String {
-        match v {
-            Val::Null => "".into(),
-            Val::Bool(b) => b.to_string(),
-            Val::Int(i) => i.to_string(),
-            Val::Float(f) => {
+    use facetful_engine::sql::binder::Ty;
+    let render = |v: &Val, ty: Ty| -> String {
+        match (v, ty) {
+            (Val::Null, _) => "".into(),
+            (Val::Int(d), Ty::Date) => fmt::time::format_date(*d),
+            (Val::Int(ms), Ty::Timestamp) => fmt::time::format_timestamp(*ms),
+            (Val::Bool(b), _) => b.to_string(),
+            (Val::Int(i), _) => i.to_string(),
+            (Val::Float(f), _) => {
                 if f.fract() == 0.0 { format!("{f:.1}") } else { format!("{f}") }
             }
-            Val::Text(s) => s.to_string(),
+            (Val::Text(s), _) => s.to_string(),
         }
     };
 
@@ -77,7 +98,8 @@ fn query(args: &[String]) {
         let t0 = std::time::Instant::now();
         match run_query(&mut table, sql) {
             Err(d) => eprint!("{}", d.render(sql)),
-            Ok(r) => {
+            Ok(mut r) => {
+                r.ensure_rows();
                 let mut widths: Vec<usize> = r.columns.iter().map(|c| c.len()).collect();
                 let cells: Vec<Vec<String>> = r
                     .rows
@@ -86,7 +108,7 @@ fn query(args: &[String]) {
                         row.iter()
                             .enumerate()
                             .map(|(i, v)| {
-                                let s = render(v);
+                                let s = render(v, r.col_types[i]);
                                 widths[i] = widths[i].max(s.len());
                                 s
                             })
@@ -223,30 +245,10 @@ fn parse_csv(data: &str) -> (Vec<String>, Vec<Vec<String>>) {
 
 // ---------------- inference ----------------
 
-enum Typed {
-    /// Integers plus the narrowest type that fits; valid[i] = false means null
-    /// (empty CSV cell) and the value is a 0 placeholder.
-    Int(Vec<i64>, ColumnType, Option<Vec<bool>>),
-    Float(Vec<f64>, Option<Vec<bool>>),
-    Dict { codes: Vec<u16>, dict: Vec<String> },
-    Text(Vec<String>),
-}
-
-fn narrowest_int(min: i64, max: i64) -> ColumnType {
-    if min >= i8::MIN as i64 && max <= i8::MAX as i64 {
-        ColumnType::Int8
-    } else if min >= i16::MIN as i64 && max <= i16::MAX as i64 {
-        ColumnType::Int16
-    } else if min >= i32::MIN as i64 && max <= i32::MAX as i64 {
-        ColumnType::Int32
-    } else {
-        ColumnType::Int64
-    }
-}
-
-fn infer_column(values: Vec<String>) -> Typed {
-    // Empty cells are nulls for numeric columns; for string columns the empty
-    // string is just a dictionary value (facet UIs show a "(blank)" bucket).
+/// String cells -> a typed input column for the shared baseline compiler.
+/// Empty cells are nulls for numeric columns; for string columns the empty
+/// string is just a value (facet UIs show a "(blank)" bucket).
+fn infer_column(values: Vec<String>) -> compile::InCol {
     let mut all_int = true;
     let mut all_float = true;
     let mut non_empty = 0usize;
@@ -270,57 +272,38 @@ fn infer_column(values: Vec<String>) -> Typed {
         if has_nulls { Some(values.iter().map(|v| !v.is_empty()).collect()) } else { None }
     };
     if all_int && non_empty > 0 {
-        let ints: Vec<i64> =
-            values.iter().map(|v| if v.is_empty() { 0 } else { v.parse().unwrap() }).collect();
-        let present = ints.iter().zip(&values).filter(|(_, v)| !v.is_empty());
-        let min = present.clone().map(|(i, _)| *i).min().unwrap_or(0);
-        let max = present.map(|(i, _)| *i).max().unwrap_or(0);
-        return Typed::Int(ints, narrowest_int(min, max), valids());
+        let v = values.iter().map(|s| if s.is_empty() { 0 } else { s.parse().unwrap() }).collect();
+        return compile::InCol::Int { v, valid: valids() };
     }
     if all_float && non_empty > 0 {
-        let floats: Vec<f64> =
-            values.iter().map(|v| if v.is_empty() { 0.0 } else { v.parse().unwrap() }).collect();
-        return Typed::Float(floats, valids());
+        let v =
+            values.iter().map(|s| if s.is_empty() { 0.0 } else { s.parse().unwrap() }).collect();
+        return compile::InCol::Float { v, valid: valids() };
     }
-    // distinct count for dictionary decision
-    let mut index: HashMap<String, u16> = HashMap::new();
-    let mut dict: Vec<String> = Vec::new();
-    let mut codes: Vec<u16> = Vec::with_capacity(values.len());
-    for v in &values {
-        if let Some(&c) = index.get(v) {
-            codes.push(c);
-        } else {
-            if dict.len() >= u16::MAX as usize {
-                return Typed::Text(values);
-            }
-            let c = dict.len() as u16;
-            dict.push(v.clone());
-            index.insert(v.clone(), c);
-            codes.push(c);
-        }
+    // ISO dates ("YYYY-MM-DD") / datetimes -> real temporal columns
+    if non_empty > 0 && values.iter().all(|s| s.is_empty() || fmt::time::parse_date(s).is_some()) {
+        let v = values
+            .iter()
+            .map(|s| if s.is_empty() { 0 } else { fmt::time::parse_date(s).unwrap() as i32 })
+            .collect();
+        return compile::InCol::Date { v, valid: valids() };
     }
-    if dict.len() * 2 < values.len() {
-        Typed::Dict { codes, dict }
-    } else {
-        Typed::Text(values)
+    if non_empty > 0
+        && values.iter().all(|s| s.is_empty() || fmt::time::parse_timestamp(s).is_some())
+    {
+        let v = values
+            .iter()
+            .map(|s| if s.is_empty() { 0 } else { fmt::time::parse_timestamp(s).unwrap() })
+            .collect();
+        return compile::InCol::Timestamp { v, valid: valids() };
     }
-}
-
-fn utf8_offsets(strings: &[String]) -> (Vec<u32>, Vec<u8>) {
-    let mut offsets = Vec::with_capacity(strings.len() + 1);
-    let mut bytes = Vec::new();
-    offsets.push(0u32);
-    for s in strings {
-        bytes.extend_from_slice(s.as_bytes());
-        offsets.push(bytes.len() as u32);
-    }
-    (offsets, bytes)
+    compile::InCol::Text { v: values, valid: None }
 }
 
 // ---------------- convert ----------------
 
 fn convert(args: &[String]) {
-    let (mut input, mut output, mut group_size) = (None, None, 65536usize);
+    let (mut input, mut output, mut group_size) = (None, None, 65536u32);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -361,145 +344,20 @@ fn convert(args: &[String]) {
         }
     }
 
-    let typed: Vec<Typed> = cols.into_iter().map(infer_column).collect();
-    let schema = Schema {
-        columns: header
-            .iter()
-            .zip(&typed)
-            .map(|(name, t)| {
-                let (ty, flags) = match t {
-                    Typed::Int(_, ty, _) => (*ty, 0),
-                    Typed::Float(_, _) => (ColumnType::Float64, 0),
-                    Typed::Dict { dict, .. } => (
-                        ColumnType::Utf8,
-                        fmt::flags::DICTIONARY
-                            | if dict.len() <= 256 { fmt::flags::CODES_U8 } else { 0 },
-                    ),
-                    Typed::Text(_) => (ColumnType::Utf8, 0),
-                };
-                ColumnDef { name: name.clone(), ty, flags }
-            })
-            .collect(),
-    };
-    for (c, t) in schema.columns.iter().zip(&typed) {
-        let kind = match t {
-            Typed::Int(_, ty, nulls) => format!(
-                "{}{}",
-                format!("{ty:?}").to_lowercase(),
-                if nulls.is_some() { " (nullable)" } else { "" }
-            ),
-            Typed::Float(_, nulls) => {
-                format!("float64{}", if nulls.is_some() { " (nullable)" } else { "" })
-            }
-            Typed::Dict { dict, .. } => format!(
-                "utf8/dict[{}] (u{} codes)",
-                dict.len(),
-                c.code_width() * 8
-            ),
-            Typed::Text(_) => "utf8".into(),
-        };
+    let in_cols: Vec<compile::InCol> = cols.into_iter().map(infer_column).collect();
+    let (bytes, schema) = compile::compile(&header, in_cols, group_size).unwrap_or_else(|e| {
+        eprintln!("compile failed: {e}");
+        exit(1);
+    });
+    for (c, kind) in schema.columns.iter().zip(compile::describe(&schema)) {
         eprintln!("  {}: {kind}", c.name);
     }
-
-    let dicts: Vec<Option<DictData>> = typed
-        .iter()
-        .map(|t| match t {
-            Typed::Dict { dict, .. } => {
-                let (offsets, bytes) = utf8_offsets(dict);
-                Some(DictData { offsets, bytes })
-            }
-            _ => None,
-        })
-        .collect();
-    let mut w = Writer::new(schema.clone(), vec![], group_size as u32, &dicts);
-    let mut start = 0;
-    while start < nrows {
-        let rows_here = group_size.min(nrows - start);
-        let end = start + rows_here;
-        // Build owned per-group buffers first, then borrow for the writer call.
-        let owned: Vec<OwnedChunk> = typed
-            .iter()
-            .zip(&schema.columns)
-            .map(|(t, def)| match t {
-                Typed::Int(v, ty, nulls) => OwnedChunk::Fixed(
-                    match ty {
-                        ColumnType::Int8 => v[start..end].iter().map(|&x| x as i8 as u8).collect(),
-                        ColumnType::Int16 => v[start..end].iter().flat_map(|&x| (x as i16).to_le_bytes()).collect(),
-                        ColumnType::Int32 => v[start..end].iter().flat_map(|&x| (x as i32).to_le_bytes()).collect(),
-                        _ => v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect(),
-                    },
-                    validity_bitmap(nulls, start, end),
-                ),
-                Typed::Float(v, nulls) => OwnedChunk::Fixed(
-                    v[start..end].iter().flat_map(|x| x.to_le_bytes()).collect(),
-                    validity_bitmap(nulls, start, end),
-                ),
-                Typed::Dict { codes, .. } => {
-                    if def.code_width() == 1 {
-                        OwnedChunk::Codes8(codes[start..end].iter().map(|&c| c as u8).collect())
-                    } else {
-                        OwnedChunk::Codes16(codes[start..end].to_vec())
-                    }
-                }
-                Typed::Text(v) => {
-                    let (off, bytes) = utf8_offsets(&v[start..end]);
-                    OwnedChunk::Utf8 { off, bytes }
-                }
-            })
-            .collect();
-        let chunks: Vec<ColumnChunk> = owned
-            .iter()
-            .map(|o| {
-                let (data, validity) = match o {
-                    OwnedChunk::Fixed(b, v) => (SegmentData::Fixed(b), v.as_ref()),
-                    OwnedChunk::Codes8(c) => (SegmentData::Codes8(c), None),
-                    OwnedChunk::Codes16(c) => (SegmentData::Codes16(c), None),
-                    OwnedChunk::Utf8 { off, bytes } => {
-                        (SegmentData::Utf8 { offsets: off, bytes }, None)
-                    }
-                };
-                let null_count = validity
-                    .map(|(_bits, nulls)| *nulls)
-                    .unwrap_or(0);
-                ColumnChunk {
-                    data,
-                    validity: validity.map(|(bits, _)| bits.as_slice()),
-                    null_count,
-                }
-            })
-            .collect();
-        w.write_group(rows_here as u32, &chunks);
-        start = end;
-    }
-    let bytes = w.finish();
     std::fs::write(&output, &bytes).unwrap();
-    eprintln!("{output}: {} bytes ({} row groups)", bytes.len(), nrows.div_ceil(group_size));
-}
-
-enum OwnedChunk {
-    /// data bytes + optional (validity bitmap, null count) for this group slice
-    Fixed(Vec<u8>, Option<(Vec<u8>, u32)>),
-    Codes8(Vec<u8>),
-    Codes16(Vec<u16>),
-    Utf8 { off: Vec<u32>, bytes: Vec<u8> },
-}
-
-/// Bitmap for rows [start, end) of a column's valid flags; None if that slice
-/// has no nulls.
-fn validity_bitmap(valids: &Option<Vec<bool>>, start: usize, end: usize) -> Option<(Vec<u8>, u32)> {
-    let valids = valids.as_ref()?;
-    let slice = &valids[start..end];
-    let nulls = slice.iter().filter(|&&v| !v).count() as u32;
-    if nulls == 0 {
-        return None;
-    }
-    let mut bits = vec![0u8; (slice.len() + 7) / 8];
-    for (i, &v) in slice.iter().enumerate() {
-        if v {
-            bits[i / 8] |= 1 << (i % 8);
-        }
-    }
-    Some((bits, nulls))
+    eprintln!(
+        "{output}: {} bytes ({} row groups)",
+        bytes.len(),
+        (nrows as u32).div_ceil(group_size)
+    );
 }
 
 // ---------------- inspect ----------------

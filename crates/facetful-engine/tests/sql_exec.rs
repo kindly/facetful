@@ -60,7 +60,8 @@ fn table() -> Table<Vec<u8>> {
 
 fn q(sql: &str) -> Vec<Vec<String>> {
     let mut t = table();
-    let r = run_query(&mut t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+    let mut r = run_query(&mut t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+    r.ensure_rows();
     r.rows
         .iter()
         .map(|row| {
@@ -161,7 +162,8 @@ fn minmax_pruning_skips_groups_and_keeps_results() {
     // year lives in [2000, 2004] in BOTH groups (no pruning there), but a
     // year > 9000 filter prunes everything
     let mut t = table();
-    let r = facetful_engine::sql::run_query(&mut t, "select count(*) from t where year > 9000").unwrap();
+    let mut r = facetful_engine::sql::run_query(&mut t, "select count(*) from t where year > 9000").unwrap();
+    r.ensure_rows();
     assert_eq!(r.scanned_groups, 0);
     assert_eq!(r.total_groups, 2);
     match &r.rows[0][0] {
@@ -169,7 +171,8 @@ fn minmax_pruning_skips_groups_and_keeps_results() {
         v => panic!("expected 0, got {v:?}"),
     }
     // equality inside the range scans, and answers match the unpruned truth
-    let r = facetful_engine::sql::run_query(&mut t, "select count(*) from t where year = 2001").unwrap();
+    let mut r = facetful_engine::sql::run_query(&mut t, "select count(*) from t where year = 2001").unwrap();
+    r.ensure_rows();
     assert_eq!(r.scanned_groups, 2);
     match &r.rows[0][0] {
         Val::Int(2) => {}
@@ -210,11 +213,12 @@ fn like_fast_paths_match_general_matcher() {
     let mut t = Table::open(file).unwrap();
 
     let count = |t: &mut Table<Vec<u8>>, pat: &str| -> i64 {
-        let r = facetful_engine::sql::run_query(
+        let mut r = facetful_engine::sql::run_query(
             t,
             &format!("select count(*) from t where note like '{pat}'"),
         )
         .unwrap();
+        r.ensure_rows();
         match r.rows[0][0] {
             Val::Int(n) => n,
             _ => panic!(),
@@ -226,4 +230,215 @@ fn like_fast_paths_match_general_matcher() {
     assert_eq!(count(&mut t, "solar"), 1);   // exact (SOLAR)
     assert_eq!(count(&mut t, "%oper_ting%"), 1); // general path: underscore wildcard
     assert_eq!(count(&mut t, "%"), 8);       // degenerate: matches everything incl empty
+}
+
+#[test]
+fn text_scalar_batch() {
+    let rows = q("select trim('  x  ') as a, ltrim('xxay', 'x') as b, rtrim('ayxx', 'x') as c, \
+                  replace('banana', 'a', 'o') as d, replace('abc', '', 'z') as e, \
+                  instr('hello', 'll') as f, instr('hello', 'z') as g \
+                  from t limit 1");
+    assert_eq!(rows, vec![vec!["x", "ay", "ay", "bonono", "abc", "3", "0"]]);
+}
+
+#[test]
+fn numeric_scalar_batch() {
+    let rows = q("select sign(0 - 5) as a, sign(0) as b, sign(3.2) as c, \
+                  sqrt(9) as d, pow(2, 10) as e, ln(1) as f, exp(0) as g, \
+                  sqrt(0 - 1) as h, ln(0) as i \
+                  from t limit 1");
+    assert_eq!(
+        rows,
+        vec![vec!["-1", "0", "1", "3.0", "1024.0", "0.0", "1.0", "NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn nullif_and_ifnull() {
+    let rows = q("select nullif(1, 1) as a, nullif(2, 3) as b, \
+                  ifnull(capacity, 0.0) as c, nullif(region, 'us') as d \
+                  from t where year = 2004 and capacity is null");
+    assert_eq!(rows, vec![vec!["NULL", "2", "0.0", "NULL"]]);
+}
+
+#[test]
+fn median_and_stddev() {
+    // capacity: [1,2,3,4,6,7,8,9,10] valid; NULL skipped
+    let rows = q("select median(capacity) as m, stddev(capacity) as s from t");
+    assert_eq!(rows, vec![vec!["6.0", "3.2"]]);
+    let rows = q("select region, median(capacity) as m from t group by region order by region");
+    assert_eq!(
+        rows,
+        vec![vec!["asia", "6.5"], vec!["eu", "6.0"], vec!["us", "4.5"]] // even counts average
+    );
+    // n < 2 -> NULL; two equal values -> 0
+    let rows = q("select stddev(capacity) as a from t where capacity = 1");
+    assert_eq!(rows, vec![vec!["NULL"]]);
+    let rows = q("select stddev(year) as a from t where year = 2000");
+    assert_eq!(rows, vec![vec!["0.0"]]);
+}
+
+#[test]
+fn group_concat_orders_and_skips_nulls() {
+    let rows = q("select group_concat(region) as g from t");
+    assert_eq!(rows, vec![vec!["eu,us,eu,asia,us,eu,us,eu,asia,eu"]]);
+    let rows =
+        q("select region, group_concat(year, '-') as g from t group by region order by region");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["asia", "2003-2003"],
+            vec!["eu", "2000-2002-2000-2002-2004"],
+            vec!["us", "2001-2004-2001"],
+        ]
+    );
+    // NULL capacity contributes nothing (row 5 is us/NULL)
+    let rows = q("select group_concat(capacity) as g from t where region = 'us'");
+    assert_eq!(rows, vec![vec!["2,7"]]);
+}
+
+#[test]
+fn group_concat_separator_must_be_literal() {
+    let mut t = table();
+    let Err(err) =
+        facetful_engine::sql::run_query(&mut t, "select group_concat(region, year) from t")
+    else {
+        panic!("expected a bind error");
+    };
+    assert!(err.render("").contains("separator must be a text literal"), "{}", err.render(""));
+}
+
+// ---------------- temporal columns ----------------
+
+/// 6 rows: d (Date, one null), ts (Timestamp), n (int)
+fn temporal_table() -> Table<Vec<u8>> {
+    use facetful_engine::format::compile::{compile, InCol};
+    use facetful_engine::format::time::{days_from_civil, MS_PER_DAY};
+    let d = |y, m, dd| days_from_civil(y, m, dd) as i32;
+    let days = vec![d(2020, 1, 15), d(2020, 3, 1), d(2021, 12, 31), 0, d(2021, 1, 1), d(2020, 1, 15)];
+    let valid = Some(vec![true, true, true, false, true, true]);
+    let ts: Vec<i64> = days
+        .iter()
+        .enumerate()
+        .map(|(i, &dd)| dd as i64 * MS_PER_DAY + (i as i64) * 3_661_000) // +1h1m1s steps
+        .collect();
+    let (bytes, _) = compile(
+        &["d".into(), "ts".into(), "n".into()],
+        vec![
+            InCol::Date { v: days, valid },
+            InCol::Timestamp { v: ts, valid: None },
+            InCol::Int { v: vec![1, 2, 3, 4, 5, 6], valid: None },
+        ],
+        4, // two groups
+    )
+    .unwrap();
+    Table::open(bytes).unwrap()
+}
+
+fn tq(sql: &str) -> Vec<Vec<String>> {
+    let mut t = temporal_table();
+    let mut r = run_query(&mut t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+    r.ensure_rows();
+    r.rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    Val::Null => "NULL".into(),
+                    Val::Bool(b) => b.to_string(),
+                    Val::Int(i) => i.to_string(),
+                    Val::Float(f) => format!("{f:.1}"),
+                    Val::Text(s) => s.to_string(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn temporal_extraction_and_grouping() {
+    let rows = tq("select year(d) as y, count(*) as c from t where d is not null \
+                   group by year(d) order by y");
+    assert_eq!(rows, vec![vec!["2020", "3"], vec!["2021", "2"]]);
+    let rows = tq("select month(d), day(d) from t where n = 2");
+    assert_eq!(rows, vec![vec!["3", "1"]]);
+    // timestamp parts: row n=3 has ts offset 2h2m2s past midnight
+    let rows = tq("select hour(ts), minute(ts), second(ts) from t where n = 3");
+    assert_eq!(rows, vec![vec!["2", "2", "2"]]);
+    // year() works on timestamps too
+    let rows = tq("select count(*) from t where year(ts) = 2020");
+    assert_eq!(rows, vec![vec!["3"]]);
+}
+
+#[test]
+fn temporal_literals_compare_and_prune() {
+    let rows = tq("select n from t where d >= date('2021-01-01') order by n");
+    assert_eq!(rows, vec![vec!["3"], vec!["5"]]);
+    let rows = tq("select n from t where d = date('2020-01-15') order by n");
+    assert_eq!(rows, vec![vec!["1"], vec!["6"]]);
+    // between sugar over dates
+    let rows = tq("select count(*) from t where d between date('2020-01-01') and date('2020-12-31')");
+    assert_eq!(rows, vec![vec!["3"]]);
+    // null date excluded everywhere
+    let rows = tq("select count(d), count(*) from t");
+    assert_eq!(rows, vec![vec!["5", "6"]]);
+}
+
+#[test]
+fn temporal_formatting_and_aggregates() {
+    let rows = tq("select strftime('%Y-%m-%d', d) from t where n = 1");
+    assert_eq!(rows, vec![vec!["2020-01-15"]]);
+    let rows = tq("select strftime('%Y-%m-%d %H:%M:%S', ts) from t where n = 3");
+    assert_eq!(rows, vec![vec!["2021-12-31 02:02:02"]]);
+    // min/max keep temporal typing (Val stays Int; col ty checked below)
+    let mut t = temporal_table();
+    let r = run_query(&mut t, "select min(d) as lo, max(ts) as hi from t").unwrap();
+    use facetful_engine::sql::binder::Ty;
+    assert_eq!(r.col_types, vec![Ty::Date, Ty::Timestamp]);
+    // year over an aggregate (grouped-context temporal dispatch)
+    let rows = tq("select year(min(d)) from t");
+    assert_eq!(rows, vec![vec!["2020"]]);
+    // constructors from raw ints and text
+    let rows = tq("select year(date(18276)), year(timestamp('2021-06-01 12:00')) from t limit 1");
+    assert_eq!(rows, vec![vec!["2020", "2021"]]);
+}
+
+#[test]
+fn temporal_type_errors() {
+    let mut t = temporal_table();
+    for (sql, needle) in [
+        ("select year(n) from t", "needs a date or timestamp"),
+        ("select hour(d) from t", "needs a timestamp"),
+        ("select strftime(d, d) from t", "format string"),
+    ] {
+        let Err(e) = run_query(&mut t, sql) else { panic!("expected error: {sql}") };
+        assert!(e.render(sql).contains(needle), "{sql}: {}", e.render(sql));
+    }
+}
+
+#[test]
+fn select_star_expands_to_all_columns() {
+    let mut t = table();
+    let mut r = run_query(&mut t, "select * from t where year = 2004 order by region").unwrap();
+    r.ensure_rows();
+    assert_eq!(r.columns, vec!["region", "capacity", "year"]);
+    assert_eq!(r.rows.len(), 2);
+    // star combined with expressions, SQLite-style
+    let mut r = run_query(&mut t, "select *, capacity * 2 as dbl from t where capacity = 10").unwrap();
+    r.ensure_rows();
+    assert_eq!(r.columns, vec!["region", "capacity", "year", "dbl"]);
+    match &r.rows[0][3] {
+        Val::Float(f) => assert_eq!(*f, 20.0),
+        v => panic!("expected 20.0, got {v:?}"),
+    }
+    // star still respects GROUP BY validation
+    let Err(err) = run_query(&mut t, "select * from t group by region") else {
+        panic!("expected GROUP BY error");
+    };
+    assert!(err.render("").contains("GROUP BY"), "{}", err.render(""));
+    // and stays illegal outside the select list
+    let Err(err) = run_query(&mut t, "select count(*) from t where *") else {
+        panic!("expected star-position error");
+    };
+    assert!(err.render("").contains("select list"), "{}", err.render(""));
 }

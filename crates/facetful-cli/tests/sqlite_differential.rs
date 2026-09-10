@@ -56,6 +56,23 @@ const QUERIES: &[&str] = &[
     // expression over aggregates
     "select sum(capacity) / count(capacity) as manual_avg, count(*) from t \
      where country = 'country_3'",
+    // text scalar batch: trim family (1- and 2-arg), replace, instr
+    "select trim('  ' || status || '  ') as a, ltrim(country, 'country_') as b, \
+     rtrim(owner, '0123456789') as c, replace(fuel, 'fuel', 'F') as d, \
+     instr(owner, '_') as e from t where id between 40 and 60 order by id",
+    // nullif / ifnull over real NULLs
+    "select count(nullif(status, 'status_1')), round(sum(ifnull(capacity, 0)), 1), \
+     count(*) from t where id < 2000",
+    // math scalar batch (sqlite needs -DSQLITE_ENABLE_MATH_FUNCTIONS; distro CLIs have it)
+    "select id, sign(capacity - 100), round(sqrt(capacity), 4), round(pow(capacity, 0.5), 4), \
+     round(ln(capacity + 1), 4), round(exp(1.0), 4) from t \
+     where capacity is not null and id between 500 and 520 order by id",
+    // select * expansion (schema order) incl. star alongside expressions
+    "select * from t where id < 3 order by id",
+    "select *, id * 2 from t where id between 10 and 12 order by id",
+    // group_concat: default and explicit separator, scan order matches
+    "select country, group_concat(status) as gs, group_concat(fuel, '|') as gf from t \
+     where id < 300 group by country order by country",
 ];
 
 #[test]
@@ -100,7 +117,8 @@ fn facetful_matches_sqlite() {
 
     for sql in QUERIES {
         // facetful
-        let ours = run_query(&mut table, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+        let mut ours = run_query(&mut table, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+        ours.ensure_rows();
         let ours: Vec<Vec<String>> = ours
             .rows
             .iter()

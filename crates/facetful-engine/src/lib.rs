@@ -7,21 +7,38 @@
 //! a per-(group, column) cache; dictionary columns are executed on their codes.
 
 pub use facetful_format as format;
+pub mod text;
 
 pub mod sql;
 
 use format::read::{self, ReadAt};
 use format::{Catalog, ColumnType, FormatError};
+use std::collections::HashMap;
 
 /// One opened `.facetful` table over a synchronous byte source.
+///
+/// Segments load through a cache on first touch. With a `cache_budget` set
+/// (the OPFS case), the cache is a byte-budgeted LRU: eviction is a plain
+/// drop — SELECT-only means there is never anything to write back. Without a
+/// budget (memory sources) nothing evicts. Dictionaries and the catalog are
+/// always resident and never count against the budget.
 pub struct Table<S: ReadAt> {
     src: S,
     cat: Catalog,
-    /// cache[group][column][segment] — loaded on first touch, never invalidated
-    /// (SELECT-only: there is nothing to invalidate).
-    cache: Vec<Vec<[Option<Vec<u8>>; format::MAX_SEGS]>>,
-    /// Decoded dictionaries, cached per column.
+    cache: HashMap<(u32, u32, u8), SegEntry>,
+    cache_bytes: usize,
+    cache_budget: Option<usize>,
+    tick: u64,
+    /// Decoded dictionaries, cached per column (budget-exempt).
     dict_cache: Vec<Option<Vec<String>>>,
+    /// The executor's shared form (Rc per entry), built once per column —
+    /// cloning the plain form per query cost ~10 ms on wide real tables.
+    dict_rc_cache: Vec<Option<std::rc::Rc<Vec<std::rc::Rc<String>>>>>,
+}
+
+struct SegEntry {
+    data: Vec<u8>,
+    last_used: u64,
 }
 
 /// A facet-refresh request: `dims` are dictionary-encoded Utf8 columns,
@@ -47,13 +64,58 @@ pub struct FacetResult {
 impl<S: ReadAt> Table<S> {
     pub fn open(src: S) -> Result<Self, FormatError> {
         let cat = read::open(&src)?;
-        let cache = cat
-            .groups
-            .iter()
-            .map(|_| cat.schema.columns.iter().map(|_| [None, None, None]).collect())
-            .collect();
         let dict_cache = cat.schema.columns.iter().map(|_| None).collect();
-        Ok(Self { src, cat, cache, dict_cache })
+        let dict_rc_cache = cat.schema.columns.iter().map(|_| None).collect();
+        Ok(Self {
+            src,
+            cat,
+            cache: HashMap::new(),
+            cache_bytes: 0,
+            cache_budget: None,
+            tick: 0,
+            dict_cache,
+            dict_rc_cache,
+        })
+    }
+
+    /// Bound the segment cache (bytes). Exceeding it evicts least-recently-used
+    /// segments — a plain drop, nothing to write back.
+    pub fn set_cache_budget(&mut self, bytes: usize) {
+        self.cache_budget = Some(bytes);
+        self.evict_to_budget(0);
+    }
+
+    fn evict_to_budget(&mut self, incoming: usize) {
+        let Some(budget) = self.cache_budget else { return };
+        while self.cache_bytes + incoming > budget && !self.cache.is_empty() {
+            let (&key, _) =
+                self.cache.iter().min_by_key(|(_, e)| e.last_used).expect("non-empty");
+            if let Some(e) = self.cache.remove(&key) {
+                self.cache_bytes -= e.data.len();
+            }
+        }
+    }
+
+    /// (cached segments, cached bytes) — cache observability for tests/JS.
+    pub fn cache_stats(&self) -> (usize, usize) {
+        (self.cache.len(), self.cache_bytes)
+    }
+
+    /// Touch every segment of `col` (all groups) so later queries hit cache.
+    /// Returns bytes read. With a budget, warming beyond it just churns —
+    /// callers warm the hot columns first.
+    pub fn warm_column(&mut self, col: usize) -> Result<u64, FormatError> {
+        let mut total = 0u64;
+        let nsegs = format::seg_count(&self.cat.schema.columns[col]);
+        for g in 0..self.cat.groups.len() {
+            for seg in 0..nsegs {
+                total += self.segment(g, col, seg)?.len() as u64;
+            }
+            if self.cat.groups[g].cols[col].null_count > 0 {
+                total += self.segment(g, col, 2)?.len() as u64;
+            }
+        }
+        Ok(total)
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -61,10 +123,12 @@ impl<S: ReadAt> Table<S> {
     }
 
     /// Integer column of any storage width, widened to i64 (Date/Timestamp too).
-    pub(crate) fn i64s(&mut self, group: usize, col: usize) -> Result<Vec<i64>, FormatError> {
+    /// `n` caps materialization (min'd with the group's rows): limit-only
+    /// queries decode only the rows they can output.
+    pub(crate) fn i64s(&mut self, group: usize, col: usize, n: usize) -> Result<Vec<i64>, FormatError> {
         let ty = self.cat.schema.columns[col].ty;
         let w = ty.fixed_width().ok_or(FormatError::Corrupt("not a fixed-width column"))?;
-        let rows = self.cat.groups[group].row_count as usize;
+        let rows = (self.cat.groups[group].row_count as usize).min(n);
         let seg = self.segment(group, col, 0)?;
         Ok(match w {
             1 => seg[..rows].iter().map(|&b| b as i8 as i64).collect(),
@@ -74,21 +138,23 @@ impl<S: ReadAt> Table<S> {
         })
     }
 
-    /// Plain (non-dict) Utf8 column materialized as strings.
-    pub(crate) fn texts(&mut self, group: usize, col: usize) -> Result<Vec<String>, FormatError> {
-        let rows = self.cat.groups[group].row_count as usize;
-        let offs_seg = self.segment(group, col, 0)?.to_vec();
-        let bytes_seg = self.segment(group, col, 1)?;
+    /// Plain (non-dict) Utf8 column as raw (offsets, bytes) — the zero-copy
+    /// shape the LIKE blob scan wants. Offsets are group-local, offsets[0]=0.
+    pub(crate) fn texts_raw(
+        &mut self,
+        group: usize,
+        col: usize,
+        n: usize,
+    ) -> Result<(Vec<u32>, Vec<u8>), FormatError> {
+        let rows = (self.cat.groups[group].row_count as usize).min(n);
+        let offs_seg = self.segment(group, col, 0)?;
         let offs: Vec<u32> = offs_seg[..(rows + 1) * 4]
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        let mut out = Vec::with_capacity(rows);
-        for i in 0..rows {
-            let (a, b) = (offs[i] as usize, offs[i + 1] as usize);
-            out.push(String::from_utf8_lossy(&bytes_seg[a..b]).into_owned());
-        }
-        Ok(out)
+        let end = offs[rows] as usize;
+        let bytes = self.segment(group, col, 1)?[..end].to_vec();
+        Ok((offs, bytes))
     }
 
     pub fn group_count(&self) -> usize {
@@ -103,16 +169,32 @@ impl<S: ReadAt> Table<S> {
     }
 
     fn segment(&mut self, group: usize, col: usize, seg: usize) -> Result<&[u8], FormatError> {
-        if self.cache[group][col][seg].is_none() {
-            let bytes = read::read_segment(&self.src, &self.cat, group, col, seg)?;
-            self.cache[group][col][seg] = Some(bytes);
+        // In-memory sources are borrowed zero-copy: no cache entry, no 2x
+        // resident cost. Only positional sources (OPFS) fill the LRU below.
+        {
+            let g = &self.cat.groups[group];
+            let len = g.cols[col].seg_lens[seg] as usize;
+            let off = read::segment_offset(&self.cat, g, col, seg);
+            if self.src.read_ref(off, len).is_some() {
+                return Ok(self.src.read_ref(off, len).unwrap());
+            }
         }
-        Ok(self.cache[group][col][seg].as_deref().unwrap())
+        let key = (group as u32, col as u32, seg as u8);
+        self.tick += 1;
+        if !self.cache.contains_key(&key) {
+            let bytes = read::read_segment(&self.src, &self.cat, group, col, seg)?;
+            self.evict_to_budget(bytes.len());
+            self.cache_bytes += bytes.len();
+            self.cache.insert(key, SegEntry { data: bytes, last_used: self.tick });
+        }
+        let e = self.cache.get_mut(&key).unwrap();
+        e.last_used = self.tick;
+        Ok(&e.data)
     }
 
-    pub(crate) fn codes(&mut self, group: usize, col: usize) -> Result<Vec<u16>, FormatError> {
+    pub(crate) fn codes(&mut self, group: usize, col: usize, n: usize) -> Result<Vec<u16>, FormatError> {
         debug_assert!(self.cat.schema.columns[col].is_dict());
-        let rows = self.cat.groups[group].row_count as usize;
+        let rows = (self.cat.groups[group].row_count as usize).min(n);
         let width = self.cat.schema.columns[col].code_width();
         let seg = self.segment(group, col, 0)?;
         Ok(match width {
@@ -132,9 +214,9 @@ impl<S: ReadAt> Table<S> {
         Ok(Some(self.segment(group, col, 2)?.to_vec()))
     }
 
-    pub(crate) fn f64s(&mut self, group: usize, col: usize) -> Result<Vec<f64>, FormatError> {
+    pub(crate) fn f64s(&mut self, group: usize, col: usize, n: usize) -> Result<Vec<f64>, FormatError> {
         debug_assert_eq!(self.cat.schema.columns[col].ty, ColumnType::Float64);
-        let rows = self.cat.groups[group].row_count as usize;
+        let rows = (self.cat.groups[group].row_count as usize).min(n);
         let seg = self.segment(group, col, 0)?;
         Ok(seg[..rows * 8]
             .chunks_exact(8)
@@ -149,6 +231,19 @@ impl<S: ReadAt> Table<S> {
             self.dict_cache[col] = Some(d);
         }
         Ok(self.dict_cache[col].clone().unwrap())
+    }
+
+    /// Executor form: shared outer Rc, one Rc<String> per entry. Built once.
+    pub(crate) fn dictionary_rc(
+        &mut self,
+        col: usize,
+    ) -> Result<std::rc::Rc<Vec<std::rc::Rc<String>>>, FormatError> {
+        if self.dict_rc_cache[col].is_none() {
+            let d = self.dictionary(col)?;
+            self.dict_rc_cache[col] =
+                Some(std::rc::Rc::new(d.into_iter().map(std::rc::Rc::new).collect()));
+        }
+        Ok(self.dict_rc_cache[col].as_ref().unwrap().clone())
     }
 
     /// One facet-interface refresh with correct filters-except-own semantics,
@@ -194,9 +289,9 @@ impl<S: ReadAt> Table<S> {
             let dim_codes: Vec<Vec<u16>> = q
                 .dims
                 .iter()
-                .map(|&c| self.codes(g, c))
+                .map(|&c| self.codes(g, c, usize::MAX))
                 .collect::<Result<_, _>>()?;
-            let measure = self.f64s(g, q.measure)?;
+            let measure = self.f64s(g, q.measure, usize::MAX)?;
             let mvalid = self.validity(g, q.measure)?;
             let is_valid =
                 |row: usize| mvalid.as_ref().map_or(true, |v| v[row / 8] & (1 << (row % 8)) != 0);
@@ -241,7 +336,7 @@ impl<S: ReadAt> Table<S> {
         let mut base = 0usize;
         for g in 0..self.cat.groups.len() {
             let rows = self.cat.groups[g].row_count as usize;
-            let vals = self.f64s(g, by)?;
+            let vals = self.f64s(g, by, usize::MAX)?;
             let valid = self.validity(g, by)?;
             for row in 0..rows {
                 if mask[base + row] != 0
@@ -281,7 +376,7 @@ impl<S: ReadAt> Table<S> {
                 let mut out = Vec::with_capacity(indices.len());
                 for &i in indices {
                     let (g, r) = locate(i);
-                    out.push(self.f64s(g, col)?[r]);
+                    out.push(self.f64s(g, col, usize::MAX)?[r]);
                 }
                 Ok(GatherResult::Float(out))
             }
@@ -290,7 +385,7 @@ impl<S: ReadAt> Table<S> {
                 let mut out = Vec::with_capacity(indices.len());
                 for &i in indices {
                     let (g, r) = locate(i);
-                    let code = self.codes(g, col)?[r] as usize;
+                    let code = self.codes(g, col, usize::MAX)?[r] as usize;
                     out.push(dict.get(code).cloned().unwrap_or_default());
                 }
                 Ok(GatherResult::Text(out))
