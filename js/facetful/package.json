@@ -1,0 +1,49 @@
+{
+  "name": "facetful",
+  "version": "0.1.0",
+  "description": "Tiny columnar SQL engine for browser faceting — Rust/wasm, ~150KB gz, zero dependencies. Open Parquet instantly, facet 1M rows in milliseconds, persist to OPFS.",
+  "license": "MIT",
+  "author": "David Raznick",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./core": "./core.js",
+    "./worker": "./worker.js",
+    "./parquet": "./parquet.js",
+    "./facetful_wasm.wasm": "./facetful_wasm.wasm"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "core.js",
+    "worker.js",
+    "parquet.js",
+    "facetful_wasm.wasm",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "hyparquet": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "hyparquet": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "wasm",
+    "sql",
+    "columnar",
+    "parquet",
+    "opfs",
+    "facets",
+    "analytics",
+    "browser"
+  ],
+  "sideEffects": false
+}

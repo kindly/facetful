@@ -276,10 +276,10 @@ Round 2 approved 2026-08-30, all as suggested: **result shape** = column-major t
 <sv-markup id="d9">
 <div class="alert alert-info w-100">
   <strong>M1 spike benchmark — run it from any tailnet device:</strong>
-  <a href="http://100.102.221.40:8765/web/spike-bench/index.html" target="_blank">http://100.102.221.40:8765/web/spike-bench/index.html</a>
+  <a href="/web/spike-bench/index.html" target="_blank">/web/spike-bench/index.html</a>
   <div class="small text-muted mt-1">200K rows · three lanes (current-style JS objects, crossfilter2, .facetful→wasm), correctness-verified against each other before timing, all in a worker. Press "Run benchmark". Node/V8 preview: facetful 2.45ms vs crossfilter 5.5ms vs JS objects 35.7ms median per interaction. Serving from the repo via <code>python3 -m http.server 8765</code> on the lenovo box.</div>
 </div>
-<iframe src="http://100.102.221.40:8765/web/spike-bench/index.html" style="width:100%;height:34rem;border:1px solid #8884;border-radius:6px" title="facetful spike bench"></iframe>
+<iframe src="/web/spike-bench/index.html" style="width:100%;height:34rem;border:1px solid #8884;border-radius:6px" title="facetful spike bench"></iframe>
 </sv-markup>
 
 <sv-prose id="d10">
@@ -479,4 +479,210 @@ Demoting `.facetful` to internal changes what the format is *for* — the virtue
   3. dictionary rank arrays → `ORDER BY <dim>` without comparing strings.
 - **Engine fix surfaced by this review:** `codes()` currently widens u8 codes into a `Vec<u16>` per query — a per-query decode hiding in a zero-decode engine. The executor should scan u8 segments directly.
 - **Considered and declined:** Arrow IPC as the internal representation — same zero-copy philosophy plus ecosystem interop, but ours is effectively Arrow's layout plus stats/groups, already built at 6% of the size budget. Revisit only if first-class Arrow export becomes a goal.
+</sv-prose>
+
+<sv-prose id="d19">
+## Build log 10 — M5: OPFS spill-over landed (2026-09-04)
+
+The mechanism recorded above is now code, in the shape the doc promised:
+
+- **The wasm gained its first import.** `env.opfs_read(file_id, offset: f64, len, dest_ptr) → bytes_read`, served by the worker over `createSyncAccessHandle` (offset travels as f64 — exact to 2⁵³ — to keep BigInt off the boundary). The engine-side source is a two-variant enum (`Mem` / `Opfs`); `table_open_opfs(file_id, file_len, cache_budget)` reads header + dictionaries + footer through it and defers every column segment.
+- **The segment cache became a bounded LRU** keyed `(row group, column, segment)` with a byte budget; eviction is a plain drop (SELECT-only — nothing to write back). Dictionaries and the catalog stay resident and budget-exempt. A counting-source test proves the budget holds, evictions re-read, and results stay identical.
+- **Zero-copy fix for memory tables**: `ReadAt` grew `read_ref(offset, len) → Option<&[u8]>`; in-memory sources borrow segments straight out of the file bytes — no cache entry, no 2× resident cost. OPFS sources return `None` and use the LRU.
+- **JS API**: `db.storeOpfs(path, buffer)` (explicit persistence — the scrapped write-behind stays scrapped), `db.loadOpfs(name, path, {cacheBytes})` (default budget `min(deviceMemory/4, 1GB)`), `db.warm(cols)` (worker yields between columns so queries interleave), `db.cacheStats()`. The demo page grew a three-button OPFS panel: persist the 1M image → open lazily (metadata only) → cold/warm query timings + cache stats + derived OPFS read throughput.
+
+**The benchmark detour worth recording.** First re-run after the zero-copy change showed scan-heavy queries 2× slower (arith 10→21 ms) — stable, reproducible, and entirely fake. The chase (microbenches exonerated memcpy source and alignment; a nine-block convergence test ruled out cumulative warmup) ended at glibc: **malloc trims the heap back to the OS between queries**, so each query re-faults its lane vectors; the old copy-cache had been *accidentally* pinning the heap high-water mark with resident segment copies. `mallopt(M_TRIM_THRESHOLD/M_MMAP_THRESHOLD)` in the CLI (what sqlite/duckdb effectively do via their own buffer managers) restores everything — and reveals the M6 finals were understating us: **facet_count 3.0 ms** (was 4.7; duckdb@1 14), arith_scan 10.5, rest at parity. Wasm is immune by construction — linear memory never returns pages.
+
+**Still to measure (needs a browser):** the real `opfs_read` round-trip. The demo panel computes it from cold-vs-warm deltas. One deployment note: OPFS requires a **secure context** — `http://localhost:8765` qualifies; the tailnet IP over plain http does not (Chromium: `#unsafely-treat-insecure-origin-as-secure`; or `tailscale serve` for real https).
+
+Engine wasm: 126.8 KB gz — 41% of budget (+1 KB for the source enum + LRU). 37 native tests + node smoke green. Not built (unchanged plan): M7 HTTP-range source; u8 direct scan; kernel fusion for the like/arith stragglers.
+</sv-prose>
+
+<sv-prose id="d20">
+## Build log 11 — function batch: 14 scalars, 3 aggregates (2026-09-05)
+
+Exercise in "how easy is a new function": the registry design held up — a typical scalar was one `FUNCS` line + one `scalar_fn` match arm, and it works everywhere (WHERE, projections, GROUP BY keys, over aggregates) because the cold vector path wraps any scalar automatically, nulls included.
+
+**New scalars** (all SQLite-compatible): `trim`/`ltrim`/`rtrim` (1- and 2-arg — default trims *spaces only*, SQLite semantics), `replace` (empty needle returns input unchanged), `instr` (1-based, character-counted), `nullif`, `ifnull`, `sign`, `sqrt`, `exp`, `ln`, `pow`/`power` (out-of-domain → NULL, matching SQLite). One new signature shape (`NumericToInt` for `sign`).
+
+**New aggregates**, one `AggAcc` variant each: `median` (keeps values per group, selects at finish — memory is O(group rows), fine for the target sizes), `stddev` (sample, n−1, via n/Σx/Σx² — n<2 → NULL), `group_concat(x[, sep])` (separator must be a text literal, enforced at bind with a proper caret diagnostic; element order = scan order, which matches SQLite's insertion order on identically-loaded data — the differential suite proves it).
+
+Costing check against the estimate: the whole batch — 17 registry lines, ~120 lines of exec, 6 test functions, 4 differential rows — was about an hour, and **43 tests + a 19-query SQLite differential** all pass. Size cost: +7 KB gz (133.9 KB, 43% of budget) — median/stddev/group_concat and the text scalars monomorphize through the agg loops, acceptable.
+
+Still absent by decision, not difficulty: date/time functions (blocked on picking the Date/Timestamp encodings — the format has the types, nothing produces or consumes them yet) and the JS UDF trampoline (designed, unbuilt).
+</sv-prose>
+
+<sv-prose id="d21">
+## Build log 12 — loadParquet: the headline path exists (2026-09-06)
+
+*"Open Parquet instantly in a tiny purpose-built faceting engine"* is now a real API, and the browser compiler is not a second implementation:
+
+- **The CLI's convert logic moved into `facetful-format::compile`** — one baseline compiler (type narrowing, dict-vs-plain, u8 codes, validity, group slicing) behind both `facetful convert` and the wasm exports. The refactored CLI produces a **byte-identical** image to the pre-refactor binary on the 200K CSV, so nothing drifted in the move.
+- **Wasm compile ABI**: `compile_begin/add_num/add_text/finish` + image handles; JS marshals raw typed columns in (f64 lanes + validity bytes; offsets + UTF-8 blob for text), the image opens in place with no copy back out. Int64 crosses as f64 (exact to 2⁵³) — a documented baseline-profile limit the native CLI doesn't share. +12 KB gz (145.7 KB, 47% of budget).
+- **Worker pipeline**: hyparquet (lazy `import()`, URL injectable — bare `"hyparquet"` for bundlers) → `parquetToColumns` (a shared, environment-free module) → wasm compiler. Physical parquet types decide int-vs-float (a DOUBLE of integral values stays Float64, matching the CLI); DATE/TIMESTAMP become epoch-ms ints until date functions land; nested columns are a clear error.
+- **The cache flow is the product story**: `db.openParquet(name, buffer)` hashes the source (SHA-256), looks for `facetful-cache/<hash>-v<version>.facetful` in OPFS — hit: zero-decode lazy reopen through the M5 LRU machinery; miss: transcode, open in memory, persist in the background. Non-secure contexts degrade to memory-only transparently. `db.loadParquet` is the transcode-only variant.
+- **Correctness is a differential, per the compiled-image doc**: a new headless test (`node-parquet-diff.mjs`) pushes the real 200K Parquet through the exact worker code path and requires cell-for-cell agreement with the CLI-built image across 7 queries (nulls, dict columns, median/stddev included). Green, alongside the 43 Rust tests and the 19-query SQLite differential.
+
+The demo grew a Parquet panel: open the 1M parquet → first visit reports transcode+persist time; reload and click again → "CACHE HIT" with the reopen milliseconds. That side-by-side is the pitch in one screen. Node transcode of 200K runs ~1s (hyparquet decode dominates); browser numbers await the same click-through as the M5 panel.
+
+Not in scope, unchanged: nested/decimal parquet columns (clear error), streaming group-at-a-time compile (whole columns are resident during transcode — fine at 5M target), fetch-by-URL sugar.
+</sv-prose>
+
+<sv-prose id="d22">
+## Build log 13 — temporal columns: the last SQL gap closes (2026-09-07)
+
+**The encoding decision** (the part that was blocking): `Date` = days since 1970-01-01, i32 on disk; `Timestamp` = milliseconds since epoch, i64, UTC — the exact value JS `Date.getTime()` produces, so the wasm boundary converts nothing. Calendar math is Hinnant's civil-days routines (~30 lines, `facetful-format::time`, proleptic Gregorian, unit-tested through negative days and century leap rules).
+
+**The type-system move**: `Ty::Date`/`Ty::Timestamp` are *ints with meaning* — `numeric()` includes them, so comparison, BETWEEN, GROUP BY, min/max, pruning and top-k all worked the moment the types existed; they coerce to Int/Float one-way. The audit that mattered was the wildcard `match ty` arms (a Date column was about to fall into `lanes_to_vv`'s *text* arm). `min(d)` keeps its temporal type through aggregation, and `QueryResult` now carries `col_types`, which is how date-ness survives to the boundary.
+
+**Functions**: `year/month/day` (Date or Timestamp), `hour/minute/second` (Timestamp), `date()`/`timestamp()` constructors (ISO text, raw ints, or each other — so `where d >= date('2020-01-15')` reads naturally), `strftime` (%Y %m %d %H %M %S %s %%). The one design wrinkle — days-vs-ms share `Val::Int` — is resolved at the *bound-type* level: temporal calls dispatch on their argument's `Ty`, in both the vector path and the grouped-expression path (`year(min(d))` works). Misuse gets caret diagnostics with hints.
+
+**Ingest, all three doors**: CLI infers strict ISO `YYYY-MM-DD` / datetime columns (after int/float, before text — a 3-row CSV with a date column now stores i32 days and prints ISO in the REPL, nulls as blanks); Parquet DATE/TIMESTAMP logical types map to real temporal columns in the browser compiler (days from hyparquet's UTC-midnight Dates, ms otherwise); the compile ABI grew a kind tag (float/int/date/timestamp). Result marshalling: wasm kinds 5/6 → JS materializes `"YYYY-MM-DD"` / `"YYYY-MM-DD HH:MM:SS"` strings in `column()`/`rows()` while `columnRaw()` keeps the raw f64 days/ms lanes for charting.
+
+49 tests green (4 new temporal exec tests incl. type errors; time-module unit tests), node smoke has a temporal round-trip, parquet differential unchanged. Wasm 48% of budget (+1.5KB). Not differential-testable against SQLite (it has no date column type — our `year(d)` vs their `strftime('%Y', text)` isn't the same SQL), so correctness rests on the civil-math unit tests + end-to-end exec tests. Not done, by choice: date arithmetic modifiers (SQLite's `'+1 month'` strings), timezone handling (everything is UTC), pruning through `date()` literals (needs const-folding — noted).
+</sv-prose>
+
+<sv-prose id="d23">
+## First browser numbers: M5 + the parquet path (2026-09-07, David's run, Firefox)
+
+| measurement | number | reading |
+|---|---|---|
+| `opfs_read` throughput | 64 segments / 10.1 MB in ~5 ms ≈ **2.0 GB/s** (~78 µs/segment round-trip) | the import + sync-handle path costs nothing that matters; matches the literature's tens-of-µs claims |
+| OPFS lazy open, 1M rows | **13 ms** (metadata only, 19.2 MB file) | vs ~110 ms whole-image reopen recorded in M2 — ~10x better repeat-visit open |
+| cold vs warm query @1M | 28 ms → 23 ms | lazy-disk penalty on a first-touch query ≈ 5 ms — **OPFS spill-over is viable as a default**, not just an escape hatch |
+| parquet transcode @1M (browser) | 2314 ms, cached to OPFS | once per file; consistent with node's ~1 s @200K (hyparquet decode dominates) |
+| first query after transcode | 32 ms | 1M in-memory wasm, expected range |
+| OPFS write, 19.2 MB | 76 ms | persist cost is trivial next to fetch (1844 ms on the tailnet link) |
+
+| **CACHE HIT reopen** (reload + click) | **43 ms** @1M (fetch 24 ms from HTTP cache; first query 40 ms) | **2314 ms → 43 ms = 54x repeat-visit win, zero transcode** — the product pitch, measured. ~30 ms of the 43 is SHA-256 over the 19 MB source for the cache key (the lazy open alone is 13 ms); keying by (URL, ETag) later would reclaim most of it |
+
+**Chromium (partial, 2026-09-07):** transcode **7063 ms** @1M (3x slower than Firefox's 2314 — identical wasm, so the gap is the JS half: hyparquet decode + TextEncoder loops under V8; once-per-file, not chased). First query 23.7 ms (faster than Firefox's 32). OPFS write 54 ms. Chromium CACHE HIT: **20.9 ms** @1M (7063 → 20.9 = **338x**; first query 30.4 ms). Firefox re-ran at 41 ms (consistent with its 43; a mislabeled paste briefly attributed it to Chrome). Chrome reopens ~2x faster — likely quicker `crypto.subtle` SHA-256 over the 19 MB source plus a faster OPFS open. The verdict across both: **transcode once (2.3–7.1 s, browser-dependent), reopen at 21–43 ms forever, query at 23–40 ms.** Optional remainder: Chromium's OPFS-panel cold/warm line (Firefox already established the ~2 GB/s read path).
+</sv-prose>
+
+<sv-prose id="d24">
+## The real dataset arrives (2026-09-07)
+
+David shared the actual workload — a public energy-infrastructure tracker release (August 2026): **183,125 units × 52 columns** (xlsx → `data/units-2026-08.csv` → `data/units-2026-08.facetful`). The long-awaited validation against reality:
+
+**Inference judged all 52 columns correctly, unassisted.** Facet dimensions (Type, Country, Region, Status, Technology, Location accuracy…) → u8 dict codes; high-cardinality entities (Owners, Operators, Cities, subnational units) → u16 dicts; unique IDs, URLs and plant names correctly *rejected* from dictionary encoding (plain utf8); Start/Retired year → int16; Capacity/Lat/Long → float64. Convert: **1.7 s** for the 67 MB CSV → 50.4 MB image, **9.4 MB gzipped transfer** for the entire 52-column dataset.
+
+**Native interaction speeds on real data** (--bench medians @183K):
+
+| query | ms |
+|---|---|
+| facet counts by Type (+ capacity sums) | 1.1 |
+| filtered facet (Type IN … AND Region) | 1.0 |
+| country top-20 by capacity | 1.5 |
+| Region × Status pivot (CASE sums) | 3.7 |
+| median + stddev capacity by Type | 2.8 |
+| Start-year histogram | 6.6 |
+| detail page (filter + sort + 50 rows of names) | 13.4 |
+| owner LIKE contains (u16 dict, ~60K entries) | 27.1 |
+
+Facet refreshes at **1 ms native** — the map UI's whole interaction loop fits inside a frame with room to spare. Sanity checks against the published summary figures pass (103,940 utility-scale solar units; an owner search finds 248 units across 6 countries).
+
+**What the real data teaches:** (1) the sparse per-technology columns ("… (hydropower only)", "… (oil/gas only)" — 20+ of them, mostly null) are exactly the shape the hstore/map-type discussion anticipated; dict-encoding absorbs them fine at this scale, so the map type stays unbuilt-by-choice. (2) The owner LIKE at 27 ms is the one interaction worth watching — dictionary-aware LIKE already saves it (evaluating ~60K entries once, not 183K rows), and the designed token index would cut it further if it matters in practice. (3) No date columns in this export (years are ints) — temporal machinery unexercised by this dataset.
+
+The demo grew a "load real data" button (fetches the image, retargets the SQL box with a real facet query) — browser numbers to follow from David's clicks.
+</sv-prose>
+
+<sv-prose id="d25">
+## The real dataset in the browser: the fetch-once story on real data (2026-09-07)
+
+Firefox, 183K × 52 real image (50.4 MB): first visit **fetch ~2.5 s + persist+open ~110 ms** (reproduced on a verified-cold run: 2525 + 115 ms; the initially recorded 7.1 s was an outlier — likely a cold tailscale tunnel — so Firefox and Chrome's 1.9 s are close, not 3x apart); every visit after — **reopened from OPFS in ~0 ms** (sub-millisecond timer resolution; no fetch, segments lazy), queries live immediately. Open was 16 ms in both browsers before persistence landed. The uncompressed 50 MB fetch is the only slow part; a compressing file server would ship the 9.4 MB gz instead. Deployment shape confirmed: **users pay one fetch per data release; the map is instant every day after.**
+
+David's clicking also flushed out two real bugs, both fixed: (1) deleting or overwriting an OPFS path failed while a sync-access handle was open on it — the worker now closes its handles for a path before `removeEntry`/rewrite; (2) reopening a path already open in the same session hit our own exclusive lock — the worker now shares one handle across tables on the same path (positional reads are stateless). The demo grew "Forget stored copy" next to load-real-data for genuine cold-run testing.
+</sv-prose>
+
+<sv-prose id="d26">
+## Build log 14 — select * + the limit-only fast path (2026-09-07)
+
+David hit two things on the real 52-column table, both now fixed:
+
+**`select *` didn't exist** — the binder's error message promised star-as-select-list but nothing expanded it. Now a `*` item expands to all columns in schema order (alone or beside expressions, SQLite-style), with GROUP BY validation applied per expanded column — which exposed a latent bug: that validation zipped the *unexpanded* AST list against the bound list, silently checking only the first item. Two new SQLite-differential rows prove expansion order.
+
+**`select * from t limit 1` took ~1 s** — three stacked costs, each fixed:
+1. *No limit-only early exit*: every group's every row was projected into output Vals (183K × 52 ≈ 9.5M values) before LIMIT applied. Now a scan cap (no ORDER BY, no aggregates) stops the scan the moment offset+limit rows exist.
+2. *Eager full-width loading*: all 52 columns' lanes materialized per group before the filter even ran. Now loading is two-phase — filter columns first, mask evaluated, and a group that yields nothing (or a query past its cap) never touches the projection columns. Lane accessors take a row cap, so a limit-1 query materializes one row's worth of strings, not 65K. Bonus: the wide detail-page query dropped 13.4 → 8.8 ms.
+3. *Per-query dictionary rebuild* (the sleeper): `Table::dictionary()` cloned the whole `Vec<String>` and exec re-wrapped every entry in `Rc` — on the real dataset that re-allocated ~20 dictionaries (Owners ≈ 60K strings) *every query*, a flat ~10 ms tax on everything. The Rc form is now built once and cached on the table.
+
+Result: `select * limit 1` warm = **0.05 ms** (was ~10 ms warm / ~1 s cold-in-browser); filtered variant 0.19 ms. Cold one-shot ≈ 26 ms, all of it genuine one-time dictionary decode. No regressions: 50 tests, both differentials, synthetic + the real dataset benches unchanged (facet 1.2 ms, facet_count 3.0 ms). Wasm 49%.
+</sv-prose>
+
+<sv-prose id="d27">
+## Build log 15 — top-k learns true late materialization (2026-09-07)
+
+David: `select * from t order by "Country/area" limit 1` took 305 ms in the browser. Not the sort — the bounded top-k was already O(n) with cheap rejects — but the scan **eagerly evaluated all 52 select columns for every group** (strings included) so it could "late-project" winners at the end. Late projection was deferring only the output rows, not the lane loads.
+
+Now the scan loads **only the ORDER BY (and filter) columns** — for this query, one u8-code lane — and after the winners are known, only the winning groups' select lanes load (capped at each group's deepest winner row) for projection. Native: 305 ms-class → **2.6 ms**; capacity-desc top-10 over all 52 columns 17 ms; the the real dataset detail-page query dropped again, 8.8 → **4.9 ms** (13.4 before the limit-path work started). 50 tests + both differentials green; synthetic bench unchanged; wasm 49%.
+
+The pattern now holds everywhere it can: aggregation touches only aggregate+group columns, limit-only touches projection lanes up to its cap, top-k touches order keys then winners. The remaining known wart in this area: ordering by a dict column compares strings per candidate rather than precomputed dictionary ranks — noted, cheap, not yet needed.
+</sv-prose>
+
+<sv-prose id="d28">
+## M7 reframed: ranges and segment compression are one feature (2026-09-07, discussion with David)
+
+David's skepticism, quantified on his own data, demoted plain HTTP-range reads: the real dataset's facet working set is ~3 MB of the 50 MB image, but ranges fetch raw bytes while whole-file transfer gets gzip (9.4 MB) — so ranges alone win only ~2-3x, on the first visit only, since OPFS persistence eliminates every later fetch. Not worth a milestone for the target workload. His counter-observation completes the picture: **per-segment compression restores the win** — compressed range fetches of just the hot columns, which is Parquet's actual architectural trick and was always the substance of the promotion experiment.
+
+Design position recorded for when a real oversized/many-dataset use case appears — **M7 = ranges + per-segment compression + request coalescing, one package**:
+
+- **Zero-decode survives precisely**: decompression happens at cache-fill, not read — compressed bytes land from the network, inflate once into the LRU, and the executor reads today's aligned layout unchanged. The sync `ReadAt` never sees a codec. Differentiator vs Parquet narrows but holds: we decompress *into* the execution format; Parquet decompresses and then still decodes (bit-unpack, dict rebuild, arrow).
+- **Zero-wasm-bytes codec split**: range fills run on the JS side, so the browser decompresses with native `DecompressionStream('deflate-raw')`; the compressor lives only in the native CLI compiler, where compiled-image doctrine already permits dependencies. The runtime binary does not grow.
+- **Format cost**: per-segment compressed+uncompressed lengths, per-column codec flag — a LAYOUT_ABI bump, routine under rebuild-not-migrate. (The v1 `COMPRESSED` reserved flag anticipated this.)
+
+For the map-class workload the standing answer is: compressed whole-file transfer + OPFS persistence + (optional) compiler-embedded first-paint facet counts — the "cache can contain answers" item, which attacks first-visit latency harder than ranges would.
+</sv-prose>
+
+<sv-prose id="d29">
+## Joins position (recorded 2026-09-10, not yet scheduled)
+
+Assessment from the 2026-09-07 discussion — real `JOIN`/`LEFT JOIN` support, honestly costed against this engine's architecture:
+
+- **Parser** (~1 day): FROM-list with aliases + ON expressions — trivial for the Pratt parser.
+- **Binder** (~1–2 days): `Bound::Column` gains a table slot; qualified names, ambiguity diagnostics, two-schema did-you-mean. Wide but mechanical.
+- **Executor — the decision that matters**: the engine's speed rests on the positional model (row = position in one group of one table; every mask/gid/lane assumes it). **Many-to-one joins preserve it**: per group, hash-probe the dim key once into a `dim_row_id` lane, then gather each referenced dim column into a fact-positional lane — after which the entire existing executor (filters, aggregates, direct grouping, top-k, two-phase loading) runs untouched. Dict dim columns gather as codes + dictionary, so joined attributes facet at native speed; a dict-encoded fact key collapses the probe to once-per-dictionary-entry (the "dictionary join" falls out as a special case, so no separate `lookup()` sugar is needed). LEFT vs INNER = validity bits vs keep-mask; multi-way chains compose.
+- **The restriction that keeps it tractable: unique right-side join keys, enforced with a clear diagnostic.** Non-unique right sides mean row expansion — output cardinality ≠ fact cardinality — which breaks every positional structure and is the road to a general (DuckDB-sized) executor. Declined, permanently or until a real workload demands it.
+- Plumbing: multi-table query ABI across the wasm boundary (~½ day); differential testing extends directly (SQLite has joins; the the real dataset regions sheet is the ready-made second table); ~+10 KB gz.
+- Accepted losses: no min/max pruning from dim-side predicates; dim key-hash cached per table pair.
+
+**Estimate: a focused week for honest restricted SQL joins.** Replaces the earlier tier-2 `lookup()` idea. Compile-time denormalization (`convert --join`) remains the zero-runtime-cost alternative for publish-time flattening.
+</sv-prose>
+
+<sv-prose id="d30">
+## Build log 16 — packaging: facetful becomes an npm package (2026-09-10)
+
+The research phase closed; the first productization step is done. `js/facetful` is now a publishable package:
+
+- **`facetful-0.1.0.tgz`, 164 KB** — nine files: the JS API (`index.js` + full TypeScript definitions), `core.js`/`worker.js`/`parquet.js`, the optimized wasm (49% of budget), README, MIT LICENSE. `exports` map exposes `.`, `./core`, `./worker`, `./parquet`, and the wasm asset; worker and wasm resolve via `import.meta.url`, so a bundler needs no configuration.
+- **hyparquet is an optional peer dependency**, dynamically imported only when a Parquet method is called — non-Parquet users ship zero extra bytes.
+- **`scripts/build-package.sh`** is the release gate in one command: size-budget check (wasm-opt when present) → node protocol smoke → parquet-path differential → `npm pack`. A consumer-style test runs against the *extracted tarball* (not the repo layout) and reproduces real-data results (183,125 rows, correct facet counts), so what's shipped is what's tested.
+- README documents the three ways in (openParquet / load / loadOpfs), the dialect surface, the secure-context caveat, and the 2^53 int64 transcoder limit.
+
+Not yet done, deliberately: actual `npm publish` (name was verified free in the naming round; publish when the Svelte app consumes it and shakes the API), git init / repo rename (`~/projects/browserdb` → facetful), CI. **Next: scaffold the new Svelte app** (name candidates offered: the explorer app, (app name candidates)) — SvelteKit static + facetful + Observable Plot (decided; TanStack Charts assessed 2026-09-10: promising Plot-derived grammar with a Svelte host, but alpha/0.x — revisit at 1.0; the panel→chart compiler stays isolated so the swap is contained; TanStack Table v9's Svelte-runes adapter is the grid-panel candidate).
+</sv-prose>
+
+<sv-prose id="d31">
+## The explorer app: the first consumer, and the deployment pattern (2026-09-10)
+
+The Svelte explorer app (separate repo — SvelteKit static + facetful-from-tarball + Observable Plot) went from scaffold to working dashboard in a day: four sortable/scrollable facet panels, two filter-reactive charts, a top-100 units grid where every column sort is a fresh bounded top-k over the whole filtered set, URL-param filter state, and a data-source footer with reset. Package shakedown found and fixed two real bundler bugs (worker must be a literal `new Worker(new URL(...))` expression; hyparquet import made statically resolvable).
+
+**The transfer question closed with the gzip-sidecar pattern** predicted in the M7 discussion: publish `data.facetful.gz` next to the raw file, fetch it, inflate with native `DecompressionStream('gzip')`, store decompressed in OPFS. Works on any static host (no server-side compression of 50 MB binaries needed). Measured end state on the real 183K×52 dataset: **first visit ≈ 0.2 s fetch (9.4 MB) + inflate + persist; every later visit ≈ 0 ms open, no fetch.**
+
+Measurement post-mortem: David found his NIC's powersave throttling transfers — fixing it (plus gzip) collapsed fetch times and retroactively explains every earlier fetch anomaly (Firefox's 7.1 s "outlier", the apparent FF-vs-Chrome 3x transfer gap). Engine-side numbers were never affected.
+</sv-prose>
+
+<sv-prose id="d32">
+## Build log 17 — three profiling items from the app-side agent (2026-09-10)
+
+The app-side agent profiled three engine shapes; all three fixed, measured on the real dataset 183K native:
+
+| shape | before | after | how |
+|---|---|---|---|
+| full-table ORDER BY (name by capacity) | 65 ms | **9.2 ms** | deferred sort: refs + **packed order-preserving u64 keys** (float-bits trick, validity byte first so NULLs order like `cmp_sql`, DESC = bit-flip), `sort_unstable` on (key, ref) tuples; text keys keep a comparator path; projection happens once, after |
+| `cast(substr(id, 2) as int)` | 47 ms | **4.6 ms** | vectorized `substr` (char-boundary byte slicing; per-dictionary-entry for dict columns) + vectorized `int`/`float` casts over Text/Codes lanes, plus a **fused blob path**: `int(substr(col, lit))` parses digits straight out of the column's offsets+bytes with zero intermediate allocation |
+| 3-float-column projection | 8.7 ms | **2.0 ms** | **columnar output channel**: `QueryResult.cols: Option<Vec<OutCol>>` — the plain and full-sort paths gather typed vectors (direct text columns gather blob slices, never touching `Rc<String>` lanes); wasm `columnize` moves them into ColBufs near-memcpy; row-based consumers call `ensure_rows()` (CLI, tests, differential — 6 sites) |
+
+Side effects, all good: text projection without sort 19 → 2.8 ms; sorted text projection 43 → 7.7 ms; synthetic `like_scan` halved again (6.5 → 3.35 ms — the blob scan reaching it). Zero regressions across both sweeps; 51 tests + both differentials green. Wasm 168.8 KB gz (54% of budget, +5 pts for the new kernels — the fair price for the batch).
+
+New tarball in `dist/` — the app-side agent should reinstall (`rm -rf node_modules/facetful node_modules/.vite && npm i ../browserdb/dist/facetful-0.1.0.tgz`).
 </sv-prose>

@@ -22,9 +22,38 @@ order by total desc
 limit 15</textarea>
 <p>
   <button id="run">Run (ctrl-enter)</button>
+  <label class="muted">on
+    <select id="target">
+      <option value="t">memory (200K)</option>
+    </select>
+  </label>
   <span class="muted" id="meta"></span>
 </p>
 <div id="out"></div>
+<hr>
+<h2 style="font-size:1.1em">Real data (183K rows × 52 cols)</h2>
+<p>
+  <button id="rd-load">Load real data</button>
+  <button id="rd-forget">Forget stored copy</button>
+  <span class="muted" id="rd-status">first visit fetches + persists; after that it reopens from OPFS</span>
+</p>
+<hr>
+<h2 style="font-size:1.1em">Parquet (the headline path)</h2>
+<p>
+  <button id="pq-open">Open 1M Parquet (auto-cache)</button>
+  <button id="pq-forget">Forget cache</button>
+  <span class="muted">first visit transcodes + persists; reload &amp; click again → zero-decode reopen</span>
+</p>
+<pre class="muted" id="pq-log" style="white-space:pre-wrap"></pre>
+<hr>
+<h2 style="font-size:1.1em">OPFS spill-over (M5)</h2>
+<p>
+  <button id="opfs-store">1. Persist 1M image to OPFS</button>
+  <button id="opfs-open">2. Open from OPFS</button>
+  cache <input id="opfs-cache" type="number" value="64" min="1" style="width:4.5em"> MB
+  <button id="opfs-warm" disabled>3. Warm country+capacity</button>
+</p>
+<pre class="muted" id="opfs-log" style="white-space:pre-wrap"></pre>
 <script type="module">
   import { Facetful } from "/js/facetful/index.js";
 
@@ -36,6 +65,7 @@ limit 15</textarea>
     db = await Facetful.open({
       wasmUrl: "/target/wasm32-unknown-unknown/release/facetful_wasm.wasm",
       workerUrl: new URL("/js/facetful/worker.js", location.href),
+      hyparquetUrl: new URL("/web/spike-bench/node_modules/hyparquet/src/index.js", location.href).href,
     });
     const buf = await (await fetch("/spikes/facet-spike/data-200000.facetful")).arrayBuffer();
     const { rows } = await db.load("t", buf);
@@ -51,7 +81,7 @@ limit 15</textarea>
     el("out").innerHTML = "";
     el("meta").textContent = "…";
     try {
-      const r = await db.query(sql);
+      const r = await db.query(sql, { table: el("target").value });
       const pruned = r.stats.totalGroups - r.stats.scannedGroups;
       el("meta").textContent =
         `${r.rowCount.toLocaleString()} row${r.rowCount === 1 ? "" : "s"} · ${r.elapsedMs.toFixed(1)} ms in worker` +
@@ -93,6 +123,138 @@ limit 15</textarea>
   }
 
   el("run").onclick = run;
+
+  // ---- real dataset ------------------------------------------------------
+  // fetch-once: persisted to OPFS on first load, reopened lazily (no fetch)
+  // on every visit after — the M5 spill-over path on real data
+  const DATA_PATH = "facetful/units-2026-08.facetful";
+  el("rd-load").onclick = async () => {
+    try {
+      const t0 = performance.now();
+      let msg;
+      try {
+        const { rows } = await db.loadOpfs("units", DATA_PATH);
+        msg = `${rows.toLocaleString()} rows — reopened from OPFS in ${(performance.now() - t0).toFixed(0)} ms (no fetch, lazy segments)`;
+      } catch {
+        el("rd-status").textContent = "first visit: fetching…";
+        const buf = await (await fetch("/data/units-2026-08.facetful")).arrayBuffer();
+        const fetched = performance.now();
+        try {
+          await db.storeOpfs(DATA_PATH, buf.slice(0));
+          const { rows } = await db.loadOpfs("units", DATA_PATH);
+          msg = `${rows.toLocaleString()} rows — fetch ${(fetched - t0).toFixed(0)} ms, persist+open ${(performance.now() - fetched).toFixed(0)} ms; next click reopens with no fetch`;
+        } catch {
+          const { rows } = await db.load("units", buf); // no OPFS: memory-only
+          msg = `${rows.toLocaleString()} rows — fetch ${(fetched - t0).toFixed(0)} ms, opened in memory (no OPFS here)`;
+        }
+      }
+      el("rd-status").textContent = msg;
+      if (![...el("target").options].some((o) => o.value === "units")) {
+        el("target").add(new Option("Real (183K)", "units"));
+      }
+      el("target").value = "units";
+      el("sql").value = 'select "Type", count(*) as n, round(sum("Capacity (MW)"), 1) as mw\nfrom t\nwhere "Status" = \'operating\'\ngroup by "Type"\norder by mw desc';
+      run();
+    } catch (e) { el("rd-status").textContent = "failed: " + e.message; }
+  };
+
+  el("rd-forget").onclick = async () => {
+    try {
+      await db.removeOpfs(DATA_PATH);
+      el("rd-status").textContent =
+        "stored copy removed — next load fetches fresh (current table is closed)";
+    } catch (e) { el("rd-status").textContent = "forget failed: " + e.message; }
+  };
+
+  // ---- Parquet auto-cache flow -----------------------------------------
+  const plog = (line) => { el("pq-log").textContent += line + "\n"; };
+  let pqHash = null;
+
+  el("pq-open").onclick = async () => {
+    try {
+      plog("fetching 1M parquet…");
+      const t0 = performance.now();
+      const buf = await (await fetch("/spikes/facet-spike/data-1000000.parquet")).arrayBuffer();
+      const fetched = performance.now();
+      pqHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", buf.slice(0)))]
+        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      const r = await db.openParquet("pq", buf);
+      const total = performance.now() - fetched;
+      if (r.source === "cache") {
+        plog(`CACHE HIT: reopened compiled image from OPFS in ${r.openMs.toFixed(1)} ms ` +
+             `(${r.rows.toLocaleString()} rows, zero transcode; fetch was ${(fetched - t0).toFixed(0)} ms)`);
+      } else {
+        plog(`first visit: transcoded in ${r.transcodeMs.toFixed(0)} ms, ` +
+             `${r.cached ? "cached to OPFS" : "NOT cached (no OPFS?)"} — total ${total.toFixed(0)} ms ` +
+             `(${r.rows.toLocaleString()} rows). Reload the page and click again.`);
+      }
+      if (![...el("target").options].some((o) => o.value === "pq")) {
+        el("target").add(new Option("Parquet (1M)", "pq"));
+      }
+      el("target").value = "pq";
+      const q1 = await db.query(el("sql").value, { table: "pq" });
+      plog(`first query on it: ${q1.elapsedMs.toFixed(1)} ms`);
+    } catch (e) { plog("failed: " + e.message); }
+  };
+
+  el("pq-forget").onclick = async () => {
+    if (!pqHash) { plog("open the parquet first (need its hash)"); return; }
+    try {
+      await db.removeOpfs(`facetful-cache/${pqHash}-v1.facetful`);
+      plog("cache entry removed — next open transcodes again");
+    } catch (e) { plog("forget failed: " + e.message); }
+  };
+
+  // ---- OPFS spill-over flow --------------------------------------------
+  const OPFS_PATH = "facetful/demo-1m.facetful";
+  const log = (line) => { el("opfs-log").textContent += line + "\n"; };
+
+  el("opfs-store").onclick = async () => {
+    try {
+      log("fetching 1M image…");
+      const t = performance.now();
+      const buf = await (await fetch("/spikes/facet-spike/data-1000000.facetful")).arrayBuffer();
+      const fetched = performance.now();
+      const { bytes } = await db.storeOpfs(OPFS_PATH, buf);
+      log(`persisted ${(bytes / 1e6).toFixed(1)} MB to OPFS — fetch ${(fetched - t).toFixed(0)} ms, write ${(performance.now() - fetched).toFixed(0)} ms`);
+    } catch (e) { log("store failed: " + e.message); }
+  };
+
+  el("opfs-open").onclick = async () => {
+    try {
+      const cacheBytes = (+el("opfs-cache").value || 64) * 1024 * 1024;
+      const t = performance.now();
+      const { rows, fileLen } = await db.loadOpfs("opfs", OPFS_PATH, { cacheBytes });
+      const opened = performance.now() - t;
+      log(`opened from OPFS in ${opened.toFixed(1)} ms — ${rows.toLocaleString()} rows, ` +
+          `${(fileLen / 1e6).toFixed(1)} MB file, metadata only (cache budget ${(cacheBytes / 1e6).toFixed(0)} MB)`);
+      if (![...el("target").options].some((o) => o.value === "opfs")) {
+        el("target").add(new Option("OPFS (1M, lazy)", "opfs"));
+      }
+      el("target").value = "opfs";
+      el("opfs-warm").disabled = false;
+      // cold vs warm on the same query: the delta is the opfs_read cost
+      const sql = el("sql").value;
+      const cold = await db.query(sql, { table: "opfs" });
+      const s1 = await db.cacheStats({ table: "opfs" });
+      const warm = await db.query(sql, { table: "opfs" });
+      log(`same query cold ${cold.elapsedMs.toFixed(1)} ms → warm ${warm.elapsedMs.toFixed(1)} ms ` +
+          `(cold pulled ${s1.segments} segments / ${(s1.bytes / 1e6).toFixed(1)} MB from disk; ` +
+          `read throughput ≈ ${(s1.bytes / 1e6 / ((cold.elapsedMs - warm.elapsedMs) / 1000)).toFixed(0)} MB/s)`);
+    } catch (e) { log("open failed: " + e.message + " (run step 1 first?)"); }
+  };
+
+  el("opfs-warm").onclick = async () => {
+    try {
+      const t = performance.now();
+      const { bytes } = await db.warm(["country", "capacity"], { table: "opfs" });
+      const ms = performance.now() - t;
+      const s = await db.cacheStats({ table: "opfs" });
+      log(`warmed country+capacity: ${(bytes / 1e6).toFixed(1)} MB in ${ms.toFixed(1)} ms ` +
+          `(${(bytes / 1e6 / (ms / 1000)).toFixed(0)} MB/s) — cache now ${s.segments} segments / ${(s.bytes / 1e6).toFixed(1)} MB`);
+    } catch (e) { log("warm failed: " + e.message); }
+  };
+
   el("sql").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) run();
   });

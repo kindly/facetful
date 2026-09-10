@@ -9,6 +9,12 @@ use crate::*;
 pub trait ReadAt {
     fn len(&self) -> u64;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError>;
+    /// Borrow a range directly when the source is already in memory —
+    /// callers then skip their copy-cache entirely (zero-copy read path).
+    /// Positional sources (OPFS, HTTP) keep the `None` default.
+    fn read_ref(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl ReadAt for Vec<u8> {
@@ -17,6 +23,10 @@ impl ReadAt for Vec<u8> {
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
         self.as_slice().read_at(offset, buf)
+    }
+    fn read_ref(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let start = offset as usize;
+        self.get(start..start.checked_add(len)?)
     }
 }
 
@@ -32,6 +42,10 @@ impl ReadAt for &[u8] {
         }
         buf.copy_from_slice(&self[start..end]);
         Ok(())
+    }
+    fn read_ref(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let start = offset as usize;
+        self.get(start..start.checked_add(len)?)
     }
 }
 

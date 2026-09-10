@@ -9,13 +9,18 @@
 //   [...r.rows()]              // row objects, materialized lazily
 
 export class Facetful {
-  static async open({ wasmUrl, workerUrl } = {}) {
-    const url = workerUrl ?? new URL("./worker.js", import.meta.url);
-    const worker = new Worker(url, { type: "module" });
+  static async open({ wasmUrl, workerUrl, hyparquetUrl } = {}) {
+    // the no-argument form must stay a literal `new Worker(new URL(...))`
+    // expression: bundlers (Vite, webpack) statically analyze exactly that
+    // pattern to compile the worker graph
+    const worker = workerUrl
+      ? new Worker(workerUrl, { type: "module" })
+      : new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     const db = new Facetful(worker);
     await db._call({
       cmd: "init",
       wasmUrl: String(wasmUrl ?? new URL("./facetful_wasm.wasm", import.meta.url)),
+      hyparquetUrl,
     });
     return db;
   }
@@ -48,6 +53,56 @@ export class Facetful {
     return { name, rows };
   }
 
+  /**
+   * Open a Parquet file (ArrayBuffer) — the headline path. The image compiled
+   * from it is cached in OPFS keyed by content hash + format version, so a
+   * repeat visit with the same file reopens zero-decode without transcoding.
+   * Returns { rows, source: "cache" | "transcode", ... timings }.
+   */
+  async openParquet(name, buffer, { cacheBytes } = {}) {
+    return this._call(
+      { cmd: "openParquet", name, buffer, cacheBytes: cacheBytes ?? defaultCacheBudget() },
+      [buffer],
+    );
+  }
+
+  /** Transcode-only variant: Parquet -> in-memory table, no OPFS involved. */
+  async loadParquet(name, buffer) {
+    return this._call({ cmd: "loadParquet", name, buffer }, [buffer]);
+  }
+
+  /** Persist a .facetful image into OPFS at `path` (e.g. "facetful/plants.facetful"). */
+  async storeOpfs(path, buffer) {
+    return this._call({ cmd: "storeOpfs", path, buffer }, [buffer]);
+  }
+
+  /**
+   * Open a table over an OPFS file — the spill-over path. Only metadata is
+   * read up front; column segments load on demand into an LRU cache bounded
+   * by `cacheBytes` (default: min(deviceMemory/4, 1GB)).
+   */
+  async loadOpfs(name, path, { cacheBytes } = {}) {
+    const budget = cacheBytes ?? defaultCacheBudget();
+    const { rows, fileLen } = await this._call({ cmd: "loadOpfs", name, path, cacheBytes: budget });
+    return { name, rows, fileLen, cacheBytes: budget };
+  }
+
+  async removeOpfs(path) {
+    return this._call({ cmd: "removeOpfs", path });
+  }
+
+  /** Pre-touch columns into the cache (background; queries interleave). */
+  async warm(cols, { table } = {}) {
+    const { bytes } = await this._call({ cmd: "warm", cols, table });
+    return { bytes };
+  }
+
+  /** { segments, bytes } currently held by a table's segment cache. */
+  async cacheStats({ table } = {}) {
+    const { segments, bytes } = await this._call({ cmd: "cacheStats", table });
+    return { segments, bytes };
+  }
+
   /** Run SQL. `table` selects a loaded table (defaults to the last loaded). */
   async query(sql, { table } = {}) {
     const { result } = await this._call({ cmd: "query", sql, table });
@@ -57,6 +112,13 @@ export class Facetful {
   close() {
     this._worker.terminate();
   }
+}
+
+// Cache budget when the caller doesn't set one: a quarter of device memory,
+// capped at 1GB. navigator.deviceMemory is Chromium-only; assume 4GB elsewhere.
+function defaultCacheBudget() {
+  const gb = (typeof navigator !== "undefined" && navigator.deviceMemory) || 4;
+  return Math.min((gb / 4) * 1024 ** 3, 1024 ** 3);
 }
 
 const dec = new TextDecoder();
@@ -109,6 +171,10 @@ function cellValue(c, i) {
       return c.values[i];
     case "bool":
       return c.values[i] !== 0;
+    case "date": // days since epoch -> "YYYY-MM-DD"
+      return new Date(c.values[i] * 86400000).toISOString().slice(0, 10);
+    case "timestamp": // ms since epoch -> ISO, UTC
+      return new Date(c.values[i]).toISOString().replace("T", " ").slice(0, 19);
     default:
       return dec.decode(c.bytes.subarray(c.offsets[i], c.offsets[i + 1]));
   }

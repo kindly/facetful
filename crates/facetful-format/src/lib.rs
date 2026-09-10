@@ -14,6 +14,8 @@
 //! the on-disk bytes of a segment ARE the in-memory representation (zero-decode).
 //! No serde anywhere: the codec is hand-rolled little-endian.
 
+pub mod compile;
+pub mod time;
 pub mod read;
 pub mod write;
 

@@ -14,6 +14,10 @@ pub enum Ty {
     Float,
     Text,
     Bool,
+    /// days since 1970-01-01; represented as Int everywhere in execution
+    Date,
+    /// ms since the epoch, UTC; represented as Int in execution
+    Timestamp,
     /// the type of a bare NULL literal — coerces to anything
     Null,
 }
@@ -25,9 +29,9 @@ impl Ty {
             ColumnType::Int8
             | ColumnType::Int16
             | ColumnType::Int32
-            | ColumnType::Int64
-            | ColumnType::Date
-            | ColumnType::Timestamp => Ty::Int,
+            | ColumnType::Int64 => Ty::Int,
+            ColumnType::Date => Ty::Date,
+            ColumnType::Timestamp => Ty::Timestamp,
             ColumnType::Float64 => Ty::Float,
             ColumnType::Utf8 => Ty::Text,
         }
@@ -38,14 +42,24 @@ impl Ty {
             Ty::Float => "float",
             Ty::Text => "text",
             Ty::Bool => "bool",
+            Ty::Date => "date",
+            Ty::Timestamp => "timestamp",
             Ty::Null => "null",
         }
     }
     fn numeric(self) -> bool {
-        matches!(self, Ty::Int | Ty::Float | Ty::Null)
+        // Date/Timestamp are ints with meaning: they compare, group, and
+        // aggregate as their underlying days/ms
+        matches!(self, Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp | Ty::Null)
+    }
+    fn temporal(self) -> bool {
+        matches!(self, Ty::Date | Ty::Timestamp | Ty::Null)
     }
     fn coerces_to(self, other: Ty) -> bool {
-        self == other || self == Ty::Null || (self == Ty::Int && other == Ty::Float)
+        self == other
+            || self == Ty::Null
+            || (self == Ty::Int && other == Ty::Float)
+            || (matches!(self, Ty::Date | Ty::Timestamp) && matches!(other, Ty::Int | Ty::Float))
     }
 }
 
@@ -122,12 +136,16 @@ pub enum Sig {
     NumericToFloat,
     /// all args numeric, returns the widest arg type
     NumericSame,
+    /// all args numeric, returns Int
+    NumericToInt,
     /// first arg text (rest per arity), returns Text
     TextToText,
     /// first arg text, returns Int
     TextToInt,
     /// comparison-style: args must share a comparable type, returns Bool
     ComparableToBool,
+    /// temporal functions: per-name arg rules live in check_sig
+    Temporal(Ty),
     /// all args same type as first, returns that type
     SameAsFirst,
 }
@@ -140,6 +158,9 @@ pub static FUNCS: &[FuncDef] = &[
     FuncDef { name: "avg", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::NumericToFloat },
     FuncDef { name: "min", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::SameAsFirst },
     FuncDef { name: "max", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::SameAsFirst },
+    FuncDef { name: "median", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::NumericToFloat },
+    FuncDef { name: "stddev", kind: FuncKind::Aggregate, arity: (1, Some(1)), sig: Sig::NumericToFloat },
+    FuncDef { name: "group_concat", kind: FuncKind::Aggregate, arity: (1, Some(2)), sig: Sig::Any(Ty::Text) },
     // scalars
     FuncDef { name: "abs", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericSame },
     FuncDef { name: "round", kind: FuncKind::Scalar, arity: (1, Some(2)), sig: Sig::NumericSame },
@@ -151,6 +172,29 @@ pub static FUNCS: &[FuncDef] = &[
     FuncDef { name: "substr", kind: FuncKind::Scalar, arity: (2, Some(3)), sig: Sig::TextToText },
     FuncDef { name: "concat", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::TextToText },
     FuncDef { name: "coalesce", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::SameAsFirst },
+    FuncDef { name: "trim", kind: FuncKind::Scalar, arity: (1, Some(2)), sig: Sig::TextToText },
+    FuncDef { name: "ltrim", kind: FuncKind::Scalar, arity: (1, Some(2)), sig: Sig::TextToText },
+    FuncDef { name: "rtrim", kind: FuncKind::Scalar, arity: (1, Some(2)), sig: Sig::TextToText },
+    FuncDef { name: "replace", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::TextToText },
+    FuncDef { name: "instr", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::TextToInt },
+    FuncDef { name: "nullif", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::SameAsFirst },
+    FuncDef { name: "ifnull", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::SameAsFirst },
+    FuncDef { name: "sign", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericToInt },
+    FuncDef { name: "sqrt", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericToFloat },
+    FuncDef { name: "exp", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericToFloat },
+    FuncDef { name: "ln", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::NumericToFloat },
+    FuncDef { name: "pow", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::NumericToFloat },
+    FuncDef { name: "power", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::NumericToFloat },
+    // temporal (Date = days since epoch, Timestamp = ms since epoch, UTC)
+    FuncDef { name: "year", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Int) },
+    FuncDef { name: "month", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Int) },
+    FuncDef { name: "day", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Int) },
+    FuncDef { name: "hour", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Int) },
+    FuncDef { name: "minute", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Int) },
+    FuncDef { name: "second", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Int) },
+    FuncDef { name: "date", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Date) },
+    FuncDef { name: "timestamp", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Temporal(Ty::Timestamp) },
+    FuncDef { name: "strftime", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::Temporal(Ty::Text) },
     // desugar targets
     FuncDef { name: "between", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::ComparableToBool },
     FuncDef { name: "in", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::ComparableToBool },
@@ -205,16 +249,28 @@ impl<'a> Binder<'a> {
             q.group_by.iter().map(|e| self.bind(e, false)).collect::<Result<_, _>>()?;
 
         let mut select = Vec::new();
+        let mut select_spans = Vec::new(); // parallel to `select` (star expands 1 -> N)
         for (i, item) in q.select.iter().enumerate() {
+            // `*` expands to every table column, in schema order
+            if let Expr::Star(sp) = &item.expr {
+                for c in &self.schema.columns {
+                    let e = Expr::Column(c.name.clone(), *sp);
+                    let b = self.bind(&e, true)?;
+                    select.push(BoundSelect { expr: b, name: c.name.clone(), aggregated: false });
+                    select_spans.push(*sp);
+                }
+                continue;
+            }
             let b = self.bind(&item.expr, true)?;
             let aggregated = contains_aggregate(&b);
             let name = item.alias.clone().unwrap_or_else(|| default_name(&item.expr, i));
             select.push(BoundSelect { expr: b, name, aggregated });
+            select_spans.push(item.expr.span());
         }
 
         let is_aggregate = !q.group_by.is_empty() || select.iter().any(|s| s.aggregated);
         if is_aggregate {
-            for (item, bound) in q.select.iter().zip(&select) {
+            for (bound, span) in select.iter().zip(&select_spans) {
                 // bound comparison — Bound carries no spans, so `country` in the
                 // select list equals `country` in GROUP BY
                 if !bound.aggregated && !group_by.iter().any(|g| g == &bound.expr) {
@@ -223,7 +279,7 @@ impl<'a> Binder<'a> {
                             "'{}' must appear in GROUP BY or be inside an aggregate function",
                             &bound.name
                         ),
-                        item.expr.span(),
+                        *span,
                     ));
                 }
             }
@@ -268,7 +324,7 @@ impl<'a> Binder<'a> {
             Expr::Str(s, _) => Ok(Bound::Str(s.clone())),
             Expr::Null(_) => Ok(Bound::Null),
             Expr::Star(span) => Err(Diagnostic::new(
-                "'*' can only be used as count(*) or as the whole select list",
+                "'*' can only be used in the select list or as count(*)",
                 *span,
             )),
             Expr::Column(name, span) => self.bind_column(name, *span),
@@ -379,6 +435,16 @@ impl<'a> Binder<'a> {
         }
 
         let ty = self.check_sig(func, &bound_args, args, span)?;
+        // the executor evaluates the separator once, at plan time
+        if func.name == "group_concat"
+            && bound_args.len() == 2
+            && !matches!(bound_args[1], Bound::Str(_))
+        {
+            return Err(Diagnostic::new(
+                "group_concat() separator must be a text literal",
+                args[1].span(),
+            ));
+        }
         Ok(Bound::Call { func, args: bound_args, ty })
     }
 
@@ -392,7 +458,7 @@ impl<'a> Binder<'a> {
         let arg_span = |i: usize| exprs.get(i).map(|e| e.span()).unwrap_or(span);
         match func.sig {
             Sig::Any(ret) => Ok(ret),
-            Sig::NumericToFloat | Sig::NumericSame => {
+            Sig::NumericToFloat | Sig::NumericSame | Sig::NumericToInt => {
                 let mut widest = Ty::Int;
                 for (i, b) in bound.iter().enumerate() {
                     if !b.ty().numeric() {
@@ -405,7 +471,11 @@ impl<'a> Binder<'a> {
                         widest = Ty::Float;
                     }
                 }
-                Ok(if func.sig == Sig::NumericToFloat { Ty::Float } else { widest })
+                Ok(match func.sig {
+                    Sig::NumericToFloat => Ty::Float,
+                    Sig::NumericToInt => Ty::Int,
+                    _ => widest,
+                })
             }
             Sig::TextToText | Sig::TextToInt => {
                 if !bound[0].ty().coerces_to(Ty::Text) {
@@ -430,6 +500,66 @@ impl<'a> Binder<'a> {
                     }
                 }
                 Ok(Ty::Bool)
+            }
+            Sig::Temporal(ret) => {
+                match func.name {
+                    // extraction: the argument must carry temporal meaning
+                    "year" | "month" | "day" => {
+                        if !bound[0].ty().temporal() {
+                            return Err(Diagnostic::new(
+                                format!(
+                                    "{}() needs a date or timestamp, this is {}",
+                                    func.name, bound[0].ty().name()
+                                ),
+                                arg_span(0),
+                            )
+                            .with_hint("wrap plain values: date('2020-01-15'), date(days), timestamp(ms)"));
+                        }
+                    }
+                    "hour" | "minute" | "second" => {
+                        if !matches!(bound[0].ty(), Ty::Timestamp | Ty::Null) {
+                            return Err(Diagnostic::new(
+                                format!(
+                                    "{}() needs a timestamp, this is {}",
+                                    func.name, bound[0].ty().name()
+                                ),
+                                arg_span(0),
+                            ));
+                        }
+                    }
+                    // constructors accept text (ISO), their own type, or raw ints
+                    "date" | "timestamp" => {
+                        let t = bound[0].ty();
+                        if !(t.temporal() || t == Ty::Text || t == Ty::Int) {
+                            return Err(Diagnostic::new(
+                                format!("{}() cannot convert {}", func.name, t.name()),
+                                arg_span(0),
+                            ));
+                        }
+                    }
+                    "strftime" => {
+                        if !bound[0].ty().coerces_to(Ty::Text) {
+                            return Err(Diagnostic::new(
+                                format!(
+                                    "strftime() needs a format string first, this is {}",
+                                    bound[0].ty().name()
+                                ),
+                                arg_span(0),
+                            ));
+                        }
+                        if !bound[1].ty().temporal() {
+                            return Err(Diagnostic::new(
+                                format!(
+                                    "strftime() needs a date or timestamp, this is {}",
+                                    bound[1].ty().name()
+                                ),
+                                arg_span(1),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(ret)
             }
             Sig::SameAsFirst => {
                 // if/case: value type comes from the first value position

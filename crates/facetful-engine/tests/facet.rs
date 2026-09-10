@@ -191,3 +191,57 @@ fn null_measure_sums_and_topk() {
         _ => panic!("expected float stats"),
     }
 }
+
+#[test]
+fn bounded_cache_evicts_and_stays_correct() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // counting source: how many read_at calls reach the "disk"
+    struct Counting {
+        bytes: Vec<u8>,
+        reads: Rc<Cell<usize>>,
+    }
+    impl facetful_engine::format::read::ReadAt for Counting {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), facetful_engine::format::FormatError> {
+            self.reads.set(self.reads.get() + 1);
+            self.bytes.as_slice().read_at(offset, buf)
+        }
+    }
+    use facetful_engine::format::read::ReadAt as _;
+
+    let (file, _, _) = build_file();
+    let reads = Rc::new(Cell::new(0));
+    let src = Counting { bytes: file, reads: reads.clone() };
+    let mut t = Table::open(src).unwrap();
+    t.set_cache_budget(64); // tiny: forces eviction between queries
+
+    let q = FacetQuery { dims: vec![0, 1], selected: vec![vec![], vec![]], measure: 2 };
+    let r1 = t.facet_refresh(&q).unwrap();
+    let after_first = reads.get();
+    let r2 = t.facet_refresh(&q).unwrap();
+    assert_eq!(r1.counts, r2.counts);
+    assert_eq!(r1.pass_count, r2.pass_count);
+    // tiny budget -> second query re-reads (evictions happened)
+    assert!(reads.get() > after_first, "expected re-reads under tiny budget");
+    let (_, bytes) = t.cache_stats();
+    assert!(bytes <= 64, "cache stayed within budget, got {bytes}");
+
+    // generous budget -> second query is fully cache-served
+    let (file, _, _) = build_file();
+    let reads = Rc::new(Cell::new(0));
+    let src = Counting { bytes: file, reads: reads.clone() };
+    let mut t = Table::open(src).unwrap();
+    t.set_cache_budget(1 << 20);
+    let _ = t.facet_refresh(&q).unwrap();
+    let after_first = reads.get();
+    let _ = t.facet_refresh(&q).unwrap();
+    assert_eq!(reads.get(), after_first, "warm cache should serve everything");
+
+    // warm() pre-touches: a fresh query then adds no reads for warmed cols
+    let bytes_warmed = t.warm_column(2).unwrap();
+    assert!(bytes_warmed > 0);
+}

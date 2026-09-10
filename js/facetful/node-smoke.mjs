@@ -34,4 +34,66 @@ try {
   if (!(e instanceof QueryError) || !e.message.includes("did you mean 'country'?")) throw e;
   console.log("error path ok:", e.message.split("\n")[0]);
 }
+
+// ---- baseline compiler round-trip: columns in -> image -> queries ----------
+// Mirrors what the worker's parquet path does after hyparquet decode.
+{
+  const enc = new TextEncoder();
+  const strs = ["eu", "us", "eu", "asia", "us", "eu", "eu", "asia"];
+  const offsets = new Uint32Array(strs.length + 1);
+  let total = 0;
+  const parts = strs.map((s) => enc.encode(s));
+  parts.forEach((b, i) => { total += b.byteLength; offsets[i + 1] = total; });
+  const bytes = new Uint8Array(total);
+  parts.forEach((b, i) => bytes.set(b, offsets[i]));
+
+  const img = engine.compileTable(8, [
+    { name: "region", kind: "text", offsets, bytes },
+    {
+      name: "capacity", kind: "num",
+      data: new Float64Array([1.5, 2.5, 0, 4.5, 5.5, 6.5, 7.5, 8.5]),
+      validity: new Uint8Array([1, 1, 0, 1, 1, 1, 1, 1]), // row 2 null
+    },
+    { name: "year", kind: "num", isInt: true, data: new Float64Array([2000, 2001, 2000, 2002, 2001, 2000, 2002, 2001]) },
+  ], { groupTarget: 5 }); // force two row groups
+  const imageBytes = engine.imageBytes(img);
+  if (imageBytes.length < 100 || dec.decode(imageBytes.subarray(0, 4)) !== "FCT1") {
+    throw new Error("compiled image lacks magic");
+  }
+  const t2 = engine.openImage(img);
+  if (t2.rows !== 8) throw new Error("compiled table rows");
+  let rr = engine.query(t2.handle, "select region, count(*) as n, round(sum(capacity),1) as c from t group by region order by n desc");
+  if (text(rr.columns[0], 0) !== "eu" || rr.columns[1].values[0] !== 4 || rr.columns[2].values[0] !== 15.5) {
+    throw new Error("compiled table group-by wrong");
+  }
+  // null survived the compile (row 2 capacity)
+  rr = engine.query(t2.handle, "select count(*) as k from t where capacity is null");
+  if (rr.columns[0].values[0] !== 1) throw new Error("compiled null lost");
+  // int narrowing + pruning stats work on the compiled image
+  rr = engine.query(t2.handle, "select count(*) from t where year > 2100");
+  if (rr.stats.totalGroups !== 2 || rr.stats.scannedGroups !== 0) {
+    throw new Error(`compiled pruning: ${JSON.stringify(rr.stats)}`);
+  }
+  console.log("compile round-trip: OK (image", imageBytes.length, "bytes, 2 groups)");
+
+  // temporal columns through the compile ABI: days/ms in, date/timestamp kinds out
+  const img2 = engine.compileTable(3, [
+    { name: "d", kind: "num", temporal: "date", data: new Float64Array([18276, 18322, 18993]) },
+    { name: "ts", kind: "num", temporal: "timestamp",
+      data: new Float64Array([18276 * 86400000 + 37800000, 18322 * 86400000, 18993 * 86400000]) },
+  ]);
+  const t3 = engine.openImage(img2);
+  let tr = engine.query(t3.handle, "select d, ts, year(d) as y, strftime('%H:%M', ts) as hm from t order by d limit 1");
+  if (tr.columns[0].kind !== "date" || tr.columns[1].kind !== "timestamp") {
+    throw new Error(`temporal kinds: ${tr.columns.map((c) => c.kind)}`);
+  }
+  if (tr.columns[0].values[0] !== 18276 || tr.columns[2].values[0] !== 2020) {
+    throw new Error("temporal values wrong");
+  }
+  if (text(tr.columns[3], 0) !== "10:30") throw new Error("strftime wrong");
+  tr = engine.query(t3.handle, "select count(*) from t where d >= date('2020-03-01')");
+  if (tr.columns[0].values[0] !== 2) throw new Error("date literal compare wrong");
+  console.log("temporal round-trip: OK");
+}
+
 console.log("js protocol smoke: OK");

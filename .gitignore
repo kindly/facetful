@@ -1,6 +1,19 @@
+# build artifacts
 target/
 target-simd/
-node_modules/
 dist/
 *.wasm.gz
-.sideview/
+js/facetful/facetful_wasm.wasm
+
+# dependencies
+node_modules/
+
+# data: real-dataset derivatives are rebuilt from the published xlsx, not tracked
+# (the synthetic spike datasets under spikes/facet-spike stay tracked — history has them)
+/data/
+/spikes/native-bench/work/
+*.xlsx
+
+# tool state
+/.sideview/
+docs/*.sv.lock
