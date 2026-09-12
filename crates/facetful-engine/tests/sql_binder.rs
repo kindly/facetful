@@ -80,3 +80,22 @@ fn aggregate_rules() {
     let m = bind("select sum(sum(capacity)) from t").unwrap_err();
     assert!(m.contains("cannot be nested"), "{m}");
 }
+
+#[test]
+fn group_by_alias_and_position() {
+    let b = bind("select lower(country) as c, count(*) as n from t group by c").unwrap();
+    assert_eq!(b.group_by.len(), 1);
+    assert_eq!(b.group_by[0], b.select[0].expr);
+
+    let b = bind("select lower(country) as c, count(*) as n from t group by 1").unwrap();
+    assert_eq!(b.group_by[0], b.select[0].expr);
+
+    // a name that is both a select alias and a table column binds as the column
+    let b = bind("select status as country, count(*) from t group by country").unwrap_err();
+    assert!(b.contains("'country' must appear in GROUP BY"), "{b}");
+
+    let m = bind("select country, count(*) as n from t group by n").unwrap_err();
+    assert!(m.contains("cannot GROUP BY 'n': it is an aggregate"), "{m}");
+    let m = bind("select country, count(*) from t group by 3").unwrap_err();
+    assert!(m.contains("GROUP BY position 3 is out of range (1..=2)"), "{m}");
+}

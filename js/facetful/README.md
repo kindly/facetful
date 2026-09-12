@@ -77,7 +77,9 @@ count(distinct), median, stddev, group_concat. Scalars: math (abs, round,
 floor, ceil, sqrt, pow, exp, ln, sign), text (lower, upper, length, substr,
 trim/ltrim/rtrim, replace, instr, concat), null handling (coalesce, ifnull,
 nullif), temporal (year, month, day, hour, minute, second, date, timestamp,
-strftime). Quote column names with spaces: `"Capacity (MW)"`.
+strftime). `GROUP BY` and `ORDER BY` accept select aliases or 1-based
+positions. Numbers may use exponents (`1e6`). Quote column names with spaces:
+`"Capacity (MW)"`.
 
 ## Building the wasm from source
 

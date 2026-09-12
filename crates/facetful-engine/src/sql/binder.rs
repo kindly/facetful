@@ -245,9 +245,6 @@ impl<'a> Binder<'a> {
             None => None,
         };
 
-        let group_by: Vec<Bound> =
-            q.group_by.iter().map(|e| self.bind(e, false)).collect::<Result<_, _>>()?;
-
         let mut select = Vec::new();
         let mut select_spans = Vec::new(); // parallel to `select` (star expands 1 -> N)
         for (i, item) in q.select.iter().enumerate() {
@@ -266,6 +263,47 @@ impl<'a> Binder<'a> {
             let name = item.alias.clone().unwrap_or_else(|| default_name(&item.expr, i));
             select.push(BoundSelect { expr: b, name, aggregated });
             select_spans.push(item.expr.span());
+        }
+
+        // GROUP BY may reference select aliases or positions (1-based), like
+        // ORDER BY. A name that is also a table column binds as the column
+        // (input-column-first, as in Postgres); anything else binds as an
+        // expression. Bound after the select list so aliases are known.
+        let mut group_by = Vec::new();
+        for e in &q.group_by {
+            let b = match e {
+                Expr::Column(name, span)
+                    if !self.schema.columns.iter().any(|c| &c.name == name)
+                        && select.iter().any(|s| &s.name == name) =>
+                {
+                    let item = select.iter().find(|s| &s.name == name).unwrap();
+                    if item.aggregated {
+                        return Err(Diagnostic::new(
+                            format!("cannot GROUP BY '{name}': it is an aggregate"),
+                            *span,
+                        ));
+                    }
+                    item.expr.clone()
+                }
+                Expr::Number(n, false, span) if n.fract() == 0.0 => {
+                    let idx = *n as usize;
+                    if idx == 0 || idx > select.len() {
+                        return Err(Diagnostic::new(
+                            format!("GROUP BY position {idx} is out of range (1..={})", select.len()),
+                            *span,
+                        ));
+                    }
+                    if select[idx - 1].aggregated {
+                        return Err(Diagnostic::new(
+                            format!("cannot GROUP BY position {idx}: it is an aggregate"),
+                            *span,
+                        ));
+                    }
+                    select[idx - 1].expr.clone()
+                }
+                e => self.bind(e, false)?,
+            };
+            group_by.push(b);
         }
 
         let is_aggregate = !q.group_by.is_empty() || select.iter().any(|s| s.aggregated);

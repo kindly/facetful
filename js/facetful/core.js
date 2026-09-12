@@ -3,6 +3,13 @@
 
 const KINDS = { 1: "int", 2: "float", 3: "bool", 4: "text", 5: "date", 6: "timestamp" };
 
+// wasm32 pointers and lengths are u32, but exports returning them arrive in JS
+// as signed i32. Once linear memory grows past 2 GB (large parquet compiles do
+// this) every pointer above the halfway mark is negative and the typed-array
+// constructor throws "Start offset ... is outside the bounds of the buffer".
+// Re-interpret as unsigned before building any view over memory.
+const u32 = (n) => n >>> 0;
+
 // The wasm module declares one import: env.opfs_read(fileId, offset, len, destPtr)
 // -> bytes read. The browser worker supplies a real implementation over OPFS
 // sync access handles; environments without OPFS (Node smoke test) get a stub
@@ -13,7 +20,7 @@ export async function instantiate(wasmBytes, opfsRead) {
     opfs_read: (fileId, offset, len, destPtr) => {
       if (!opfsRead || !engine) return -1;
       // the view must be built per call: memory.buffer detaches on growth
-      return opfsRead(fileId, offset, new Uint8Array(engine.mem(), destPtr, len));
+      return opfsRead(fileId, offset, new Uint8Array(engine.mem(), u32(destPtr), u32(len)));
     },
   };
   const { instance } = await WebAssembly.instantiate(wasmBytes, { env });
@@ -24,7 +31,7 @@ export async function instantiate(wasmBytes, opfsRead) {
 export class Engine {
   constructor(exports) {
     this.w = exports;
-    this.scratch = this.w.alloc(4096);
+    this.scratch = u32(this.w.alloc(4096));
     this.enc = new TextEncoder();
     this.dec = new TextDecoder();
   }
@@ -35,7 +42,7 @@ export class Engine {
   /** Open a .facetful image from bytes; returns a table handle. */
   openTable(bytes) {
     const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    const ptr = this.w.alloc(src.byteLength);
+    const ptr = u32(this.w.alloc(src.byteLength));
     new Uint8Array(this.mem(), ptr, src.byteLength).set(src);
     const handle = this.w.table_open(ptr, src.byteLength);
     if (!handle) throw new Error("not a valid .facetful image");
@@ -77,7 +84,7 @@ export class Engine {
    */
   compileTable(rows, columns, { groupTarget = 65536 } = {}) {
     const put = (src) => {
-      const p = this.w.alloc(src.byteLength);
+      const p = u32(this.w.alloc(src.byteLength));
       new Uint8Array(this.mem(), p, src.byteLength).set(
         new Uint8Array(src.buffer, src.byteOffset, src.byteLength),
       );
@@ -111,7 +118,7 @@ export class Engine {
 
   /** Copy a compiled image's bytes out (for OPFS persistence). */
   imageBytes(img) {
-    return new Uint8Array(this.mem(), this.w.image_ptr(img), this.w.image_len(img)).slice();
+    return new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), u32(this.w.image_len(img))).slice();
   }
 
   /** Open a table over a compiled image; consumes the image handle (no copy). */
@@ -124,7 +131,7 @@ export class Engine {
   /** Run SQL; returns { columns, rowCount, stats } with copied-out buffers. */
   query(tableHandle, sql) {
     const sqlBytes = this.enc.encode(sql);
-    const sqlPtr = this.w.alloc(sqlBytes.byteLength);
+    const sqlPtr = u32(this.w.alloc(sqlBytes.byteLength));
     new Uint8Array(this.mem(), sqlPtr, sqlBytes.byteLength).set(sqlBytes);
     const h = this.w.query_run(tableHandle, sqlPtr, sqlBytes.byteLength);
     try {
@@ -141,17 +148,17 @@ export class Engine {
         const nameLen = this.w.col_name(h, i, this.scratch, 4096);
         const name = this.dec.decode(new Uint8Array(this.mem(), this.scratch, nameLen));
         const validity = new Uint8Array(
-          this.mem(), this.w.col_validity_ptr(h, i), Math.ceil(rowCount / 8),
+          this.mem(), u32(this.w.col_validity_ptr(h, i)), Math.ceil(rowCount / 8),
         ).slice();
         const col = { name, kind, validity };
         if (kind === "int" || kind === "float" || kind === "date" || kind === "timestamp") {
-          col.values = new Float64Array(this.mem(), this.w.col_f64_ptr(h, i), rowCount).slice();
+          col.values = new Float64Array(this.mem(), u32(this.w.col_f64_ptr(h, i)), rowCount).slice();
         } else if (kind === "bool") {
-          col.values = new Uint8Array(this.mem(), this.w.col_bools_ptr(h, i), rowCount).slice();
+          col.values = new Uint8Array(this.mem(), u32(this.w.col_bools_ptr(h, i)), rowCount).slice();
         } else {
-          col.offsets = new Uint32Array(this.mem(), this.w.col_offsets_ptr(h, i), rowCount + 1).slice();
+          col.offsets = new Uint32Array(this.mem(), u32(this.w.col_offsets_ptr(h, i)), rowCount + 1).slice();
           col.bytes = new Uint8Array(
-            this.mem(), this.w.col_bytes_ptr(h, i), this.w.col_bytes_len(h, i),
+            this.mem(), u32(this.w.col_bytes_ptr(h, i)), u32(this.w.col_bytes_len(h, i)),
           ).slice();
         }
         columns.push(col);

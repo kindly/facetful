@@ -150,3 +150,18 @@ fn error_position_points_at_offender() {
     let m = err(src);
     assert!(m.contains("line 1, column 25"), "{m}");
 }
+
+#[test]
+fn exponent_number_literals() {
+    let f = |src: &str| match parse_expr(src).unwrap() {
+        Expr::Number(n, is_float, _) => (n, is_float),
+        e => panic!("not a number: {}", shape(&e)),
+    };
+    assert_eq!(f("1e6"), (1_000_000.0, true));
+    assert_eq!(f("2.5E-3"), (0.0025, true));
+    assert_eq!(f("1e+9"), (1e9, true));
+    assert_eq!(f("1000000"), (1_000_000.0, false));
+    // a bare `e` after digits is not an exponent — it stays a separate token
+    let q = parse_query("select 1 e from t").unwrap();
+    assert_eq!(q.select[0].alias.as_deref(), Some("e"));
+}

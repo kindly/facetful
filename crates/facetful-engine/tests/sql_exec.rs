@@ -442,3 +442,12 @@ fn select_star_expands_to_all_columns() {
     };
     assert!(err.render("").contains("select list"), "{}", err.render(""));
 }
+
+#[test]
+fn group_by_alias_and_exponent_literal() {
+    // GROUP BY through a select alias, filter written with an exponent literal
+    let rows = q("select upper(region) as r, count(*) as n from t where capacity < 1e2 group by r order by r");
+    let plain = q("select upper(region) as r, count(*) as n from t where capacity < 100 group by upper(region) order by r");
+    assert_eq!(rows, plain);
+    assert_eq!(rows[0][0], "ASIA");
+}

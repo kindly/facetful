@@ -224,20 +224,34 @@ pub fn lex(src: &str) -> Result<Vec<SpannedTok>, Diagnostic> {
                 while j < b.len() && b[j].is_ascii_digit() {
                     j += 1;
                 }
+                let mut is_float = false;
                 if b.get(j) == Some(&b'.') {
+                    is_float = true;
                     j += 1;
                     while j < b.len() && b[j].is_ascii_digit() {
                         j += 1;
+                    }
+                }
+                // exponent: `1e6`, `2.5E-3`, `1e+9` — only when digits follow,
+                // so `1 else` style adjacency can never be swallowed
+                if matches!(b.get(j), Some(b'e' | b'E')) {
+                    let mut k = j + 1;
+                    if matches!(b.get(k), Some(b'+' | b'-')) {
+                        k += 1;
+                    }
+                    if b.get(k).is_some_and(|c| c.is_ascii_digit()) {
+                        is_float = true;
+                        j = k;
+                        while j < b.len() && b[j].is_ascii_digit() {
+                            j += 1;
+                        }
                     }
                 }
                 let text = &src[i..j];
                 let n: f64 = text.parse().map_err(|_| {
                     Diagnostic::new(format!("'{text}' is not a number"), Span::new(i, j))
                 })?;
-                out.push(SpannedTok {
-                    tok: Tok::Number(n, text.contains('.')),
-                    span: Span::new(i, j),
-                });
+                out.push(SpannedTok { tok: Tok::Number(n, is_float), span: Span::new(i, j) });
                 i = j;
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
