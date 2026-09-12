@@ -45,5 +45,12 @@ jobs:
       - name: release gate (budget + smokes + differential + pack)
         run: ./scripts/build-package.sh
       - name: stage (OIDC; a maintainer approves with 2FA to go live)
-        run: npm stage publish
         working-directory: js/facetful
+        # on failure, surface the OIDC token-exchange response from npm's
+        # debug log — a rejected exchange otherwise falls back to a bare
+        # ENEEDAUTH with no explanation
+        run: |
+          npm stage publish --loglevel verbose || {
+            grep -iE "oidc|exchange|token|401|403" /home/runner/.npm/_logs/*.log | tail -40
+            exit 1
+          }
