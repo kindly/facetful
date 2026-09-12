@@ -451,3 +451,114 @@ fn group_by_alias_and_exponent_literal() {
     assert_eq!(rows, plain);
     assert_eq!(rows[0][0], "ASIA");
 }
+
+// ---------------- mask cache ----------------
+
+/// 10 rows over 2 groups with a plain (non-dict) text column and a null.
+///  notes: "coal plant" | "Gas turbine" | "COAL and gas" | NULL | "wind farm"
+///         "Coastal wind" | "coal" | "solar" | "gas coal" | "hydro"
+///  year: 2000..2004 in each group
+fn notes_table() -> Table<Vec<u8>> {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef { name: "notes".into(), ty: ColumnType::Utf8, flags: 0 },
+            ColumnDef { name: "year".into(), ty: ColumnType::Int16, flags: 0 },
+        ],
+    };
+    let mut w = Writer::new(schema, vec![], 5, &[None, None]);
+    let groups: [(&[&str], Option<(&[u8], u32)>); 2] = [
+        (&["coal plant", "Gas turbine", "COAL and gas", "", "wind farm"], Some((&[0b0001_0111], 1))),
+        (&["Coastal wind", "coal", "solar", "gas coal", "hydro"], None),
+    ];
+    for (strs, validity) in groups {
+        let mut offs = vec![0u32];
+        let mut bytes = Vec::new();
+        for s in strs {
+            bytes.extend_from_slice(s.as_bytes());
+            offs.push(bytes.len() as u32);
+        }
+        let years: Vec<u8> = (2000i16..2005).flat_map(|y| y.to_le_bytes()).collect();
+        w.write_group(
+            5,
+            &[
+                ColumnChunk {
+                    data: SegmentData::Utf8 { offsets: &offs, bytes: &bytes },
+                    validity: validity.map(|(v, _)| v),
+                    null_count: validity.map(|(_, n)| n).unwrap_or(0),
+                },
+                ColumnChunk { data: SegmentData::Fixed(&years), validity: None, null_count: 0 },
+            ],
+        );
+    }
+    Table::open(w.finish()).unwrap()
+}
+
+fn qt(t: &mut Table<Vec<u8>>, sql: &str) -> Vec<Vec<String>> {
+    let mut r = run_query(t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+    r.ensure_rows();
+    r.rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    Val::Null => "NULL".into(),
+                    Val::Bool(b) => b.to_string(),
+                    Val::Int(i) => i.to_string(),
+                    Val::Float(f) => format!("{f:.1}"),
+                    Val::Text(s) => s.to_string(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn mask_cache_hits_on_repeat_and_composes_per_conjunct() {
+    let mut t = notes_table();
+    let sql = "select count(*) from t where notes like '%coal%' and year > 2000";
+    assert_eq!(qt(&mut t, sql), vec![vec!["3"]]); // COAL and gas, coal, gas coal
+    let (hits0, misses0) = (t.masks().hits, t.masks().misses);
+    assert_eq!((hits0, misses0), (0, 4), "2 conjuncts x 2 groups, all misses");
+    assert_eq!(t.masks().stats().0, 2);
+
+    // identical filter: every conjunct/group is a hit, no filter columns touched
+    assert_eq!(qt(&mut t, sql), vec![vec!["3"]]);
+    assert_eq!((t.masks().hits, t.masks().misses), (4, 4));
+
+    // reordered conjuncts + one new: the shared ones hit, only `year < 2004` misses
+    let sql2 = "select count(*) from t where year > 2000 and year < 2004 and notes like '%coal%'";
+    assert_eq!(qt(&mut t, sql2), vec![vec!["3"]]); // coal (2001), COAL and gas (2002), gas coal (2003)
+    assert_eq!((t.masks().hits, t.masks().misses), (8, 6));
+    assert_eq!(t.masks().stats().0, 3);
+}
+
+#[test]
+fn mask_cache_like_narrowing_matches_full_scan() {
+    let mut t = notes_table();
+    // prefix chain as typed: co -> coa -> coal; each narrows through the last.
+    // Compared against a cold table per needle (a plain blob scan).
+    for needle in ["co", "coa", "coal", "COAL"] {
+        let mut fresh = notes_table();
+        let sql = format!("select year from t where notes like '%{needle}%' order by year, notes");
+        assert_eq!(qt(&mut t, &sql), qt(&mut fresh, &sql), "{needle}");
+    }
+    // 'co' scanned; 'coa' and 'coal' narrowed (2 groups each); 'COAL' binds to
+    // the same lowercase needle and hits the cache outright
+    assert_eq!(t.masks().narrowed, 4);
+    assert_eq!(qt(&mut t, "select count(*) from t where notes like '%coal%'"), vec![vec!["4"]]);
+    // null note never matches on either path
+    assert_eq!(qt(&mut t, "select count(*) from t where notes like '%%'"), vec![vec!["9"]]);
+    // NOT LIKE is its own conjunct: nulls excluded, not the complement of a mask
+    assert_eq!(qt(&mut t, "select count(*) from t where notes not like '%coal%'"), vec![vec!["5"]]);
+}
+
+#[test]
+fn mask_cache_survives_eviction() {
+    let mut t = notes_table();
+    t.masks().set_budget(1); // one 1-byte bitmap at a time
+    for _ in 0..2 {
+        assert_eq!(qt(&mut t, "select count(*) from t where notes like '%gas%' and year > 2000"), vec![vec!["3"]]);
+        assert_eq!(qt(&mut t, "select count(*) from t where year > 2000"), vec![vec!["8"]]);
+    }
+    assert!(t.masks().stats().1 <= 1, "budget respected: {:?}", t.masks().stats());
+}

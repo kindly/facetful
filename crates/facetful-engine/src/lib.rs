@@ -7,6 +7,7 @@
 //! a per-(group, column) cache; dictionary columns are executed on their codes.
 
 pub use facetful_format as format;
+pub mod mask_cache;
 pub mod text;
 
 pub mod sql;
@@ -34,6 +35,8 @@ pub struct Table<S: ReadAt> {
     /// The executor's shared form (Rc per entry), built once per column —
     /// cloning the plain form per query cost ~10 ms on wide real tables.
     dict_rc_cache: Vec<Option<std::rc::Rc<Vec<std::rc::Rc<String>>>>>,
+    /// WHERE-conjunct bitmaps (see `mask_cache`); byte-bounded, LRU.
+    masks: mask_cache::MaskCache,
 }
 
 struct SegEntry {
@@ -75,7 +78,13 @@ impl<S: ReadAt> Table<S> {
             tick: 0,
             dict_cache,
             dict_rc_cache,
+            masks: mask_cache::MaskCache::default(),
         })
+    }
+
+    /// The filter-mask cache (per-conjunct WHERE bitmaps).
+    pub fn masks(&mut self) -> &mut mask_cache::MaskCache {
+        &mut self.masks
     }
 
     /// Bound the segment cache (bytes). Exceeding it evicts least-recently-used
@@ -155,6 +164,51 @@ impl<S: ReadAt> Table<S> {
         let end = offs[rows] as usize;
         let bytes = self.segment(group, col, 1)?[..end].to_vec();
         Ok((offs, bytes))
+    }
+
+    /// Run `f` over a plain-text column's raw segments for one group —
+    /// `(offsets as LE u32 bytes, blob, validity bitmap)` — borrowed, no
+    /// copy. For the mask cache's LIKE narrowing, which touches only the
+    /// candidate rows a cached superset admits; copying the blob out (as
+    /// `texts_raw` does) would cost more than the verification itself.
+    /// `Ok(None)` when the segments could not all be held resident at once
+    /// (tiny positional-cache budgets) — callers fall back to the copy path.
+    pub(crate) fn with_text_segments<R>(
+        &mut self,
+        group: usize,
+        col: usize,
+        f: impl FnOnce(&[u8], &[u8], Option<&[u8]>) -> R,
+    ) -> Result<Option<R>, FormatError> {
+        let has_nulls = self.cat.groups[group].cols[col].null_count != 0;
+        // make resident (fills the LRU for positional sources; free in memory)
+        self.segment(group, col, 0)?;
+        self.segment(group, col, 1)?;
+        if has_nulls {
+            self.segment(group, col, 2)?;
+        }
+        let (Some(offs), Some(blob)) = (self.resident(group, col, 0), self.resident(group, col, 1))
+        else {
+            return Ok(None);
+        };
+        let valid = if has_nulls {
+            match self.resident(group, col, 2) {
+                Some(v) => Some(v),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        Ok(Some(f(offs, blob, valid)))
+    }
+
+    /// A segment already in memory (borrowed source, or LRU-resident), if so.
+    fn resident(&self, group: usize, col: usize, seg: usize) -> Option<&[u8]> {
+        let g = &self.cat.groups[group];
+        let len = g.cols[col].seg_lens[seg] as usize;
+        let off = read::segment_offset(&self.cat, g, col, seg);
+        self.src.read_ref(off, len).or_else(|| {
+            self.cache.get(&(group as u32, col as u32, seg as u8)).map(|e| e.data.as_slice())
+        })
     }
 
     pub fn group_count(&self) -> usize {

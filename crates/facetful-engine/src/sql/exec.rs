@@ -11,6 +11,7 @@ use super::ast::{BinOp, SortDir, UnOp};
 use super::binder::{Bound, FuncKind, Ty};
 use crate::format::read::ReadAt;
 use crate::format::{ColumnType, FormatError};
+use crate::mask_cache::LikeKey;
 use crate::Table;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -2021,6 +2022,79 @@ fn group_prunable<S: ReadAt>(table: &Table<S>, g: usize, constraints: &[Range]) 
     false
 }
 
+// ---------------- filter conjuncts (mask cache units) ----------------
+
+/// One top-level AND operand of the WHERE clause, with what the mask cache
+/// needs to key, load and (for contains-LIKE) narrow it.
+struct Conjunct {
+    expr: Bound,
+    /// Canonical key: the bound tree's Debug form — names are resolved to
+    /// column indices, literals are typed, function identity is by def. Two
+    /// spellings of the same predicate bind to the same tree.
+    key: String,
+    cols: Vec<usize>,
+    like: Option<LikeKey>,
+}
+
+fn split_conjuncts(b: &Bound, out: &mut Vec<Bound>) {
+    match b {
+        Bound::Binary { op: BinOp::And, lhs, rhs, .. } => {
+            split_conjuncts(lhs, out);
+            split_conjuncts(rhs, out);
+        }
+        _ => out.push(b.clone()),
+    }
+}
+
+fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) -> Vec<Conjunct> {
+    let mut parts = Vec::new();
+    if let Some(f) = filter {
+        split_conjuncts(f, &mut parts);
+    }
+    parts
+        .into_iter()
+        .map(|expr| {
+            let mut cols = Vec::new();
+            collect_columns(&expr, &mut cols);
+            cols.sort_unstable();
+            cols.dedup();
+            // contains-LIKE over a plain text column: narrowable through a
+            // cached superset (dict columns are already ~free per row)
+            let like = match &expr {
+                Bound::Call { func, args, .. } if func.name == "like" => match (&args[0], &args[1]) {
+                    (Bound::Column { index, .. }, Bound::Str(p))
+                        if !table.catalog().schema.columns[*index].is_dict() =>
+                    {
+                        match classify_like(p) {
+                            LikeShape::Contains(n) => Some(LikeKey { col: *index, needle: n }),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            // LIKE is ASCII-case-insensitive, so `%Coal%` and `%coal%` are one
+            // mask: key those on the folded needle rather than the literal
+            let key = match &like {
+                Some(lk) => format!("like:{}:{}", lk.col, lk.needle),
+                None => format!("{expr:?}"),
+            };
+            Conjunct { key, expr, cols, like }
+        })
+        .collect()
+}
+
+fn pack_bits(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; bytes.len().div_ceil(8)];
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != 0 {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
 // ---------------- grouping plans ----------------
 
 /// Direct-index grouping: all group-bys are dict columns with a small
@@ -2083,6 +2157,18 @@ pub fn execute<S: ReadAt>(
     }
 
     let constraints = q.filter.as_ref().map(collect_ranges).unwrap_or_default();
+    let conjuncts = conjuncts_of(table, q.filter.as_ref());
+    // columns the projection/grouping/ordering need — the filter's own columns
+    // are loaded only when a conjunct misses the mask cache
+    let proj_needed: Vec<usize> = {
+        let mut v = Vec::new();
+        q.select.iter().for_each(|s| collect_columns(&s.expr, &mut v));
+        q.group_by.iter().for_each(|g| collect_columns(g, &mut v));
+        q.order_by.iter().for_each(|(e, _)| collect_columns(e, &mut v));
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
 
     let agg_calls: Vec<Bound> = {
         let mut v = Vec::new();
@@ -2119,15 +2205,6 @@ pub fn execute<S: ReadAt>(
         q.limit.map(|l| l as usize + q.offset.unwrap_or(0) as usize)
     } else {
         None
-    };
-    let filter_needed: Vec<usize> = {
-        let mut v = Vec::new();
-        if let Some(f) = &q.filter {
-            collect_columns(f, &mut v);
-        }
-        v.sort_unstable();
-        v.dedup();
-        v
     };
     // top-k scans need only the ORDER BY columns; select lanes load later,
     // for winning groups only (true late materialization)
@@ -2217,15 +2294,83 @@ pub fn execute<S: ReadAt>(
             Ok(())
         };
 
-        // phase 1: filter columns only (full group), evaluate the mask
+        // phase 1: the WHERE mask, per conjunct — from the mask cache when
+        // present, else evaluated over its columns (full group) and cached
         let mut cols = HashMap::new();
-        load(table, &mut cols, &filter_needed, usize::MAX)?;
-        let keep: Option<Vec<u8>> = q.filter.as_ref().map(|f| {
-            let fctx = GroupCtx { cols: core::mem::take(&mut cols), rows };
-            let m = eval_vec(f, &fctx);
-            cols = fctx.cols;
-            (0..rows).map(|i| (m.bool3_at(i) == Some(true)) as u8).collect()
-        });
+        let keep: Option<Vec<u8>> = if conjuncts.is_empty() {
+            None
+        } else {
+            let mut keep = vec![1u8; rows];
+            let mut pending: Vec<&Conjunct> = Vec::new();
+            for c in &conjuncts {
+                match table.masks().get(&c.key, g) {
+                    Some(bits) => {
+                        for (i, k) in keep.iter_mut().enumerate() {
+                            *k &= bits[i / 8] >> (i % 8) & 1;
+                        }
+                    }
+                    None => pending.push(c),
+                }
+            }
+            if !pending.is_empty() {
+                let n_groups = table.group_count();
+                let store = |table: &mut Table<S>, c: &Conjunct, m: &[u8], keep: &mut [u8]| {
+                    table.masks().put(&c.key, g, n_groups, Rc::new(pack_bits(m)), c.like.clone());
+                    for (k, &b) in keep.iter_mut().zip(m) {
+                        *k &= b;
+                    }
+                };
+                // contains-LIKE extending a cached needle: verify only the rows
+                // the superset admits, straight off the image — no blob scan,
+                // no column copy
+                let mut full: Vec<&Conjunct> = Vec::new();
+                for c in pending {
+                    let narrowed = c.like.as_ref().and_then(|lk| {
+                        let sup = table.masks().like_superset(lk.col, &lk.needle, g)?;
+                        let needle = lk.needle.as_bytes();
+                        table
+                            .with_text_segments(g, lk.col, |offs, blob, valid| {
+                                let off = |i: usize| {
+                                    u32::from_le_bytes(offs[i * 4..i * 4 + 4].try_into().unwrap()) as usize
+                                };
+                                let mut m = vec![0u8; rows];
+                                for (i, mi) in m.iter_mut().enumerate() {
+                                    if sup[i / 8] >> (i % 8) & 1 == 0
+                                        || valid.is_some_and(|v| v[i / 8] >> (i % 8) & 1 == 0)
+                                    {
+                                        continue;
+                                    }
+                                    let s = &blob[off(i)..off(i + 1)];
+                                    *mi = crate::text::contains_ci(s, needle) as u8;
+                                }
+                                m
+                            })
+                            .ok()
+                            .flatten()
+                    });
+                    match narrowed {
+                        Some(m) => store(table, c, &m, &mut keep),
+                        None => full.push(c),
+                    }
+                }
+                if !full.is_empty() {
+                    let mut full_cols: Vec<usize> =
+                        full.iter().flat_map(|c| c.cols.iter().copied()).collect();
+                    full_cols.sort_unstable();
+                    full_cols.dedup();
+                    load(table, &mut cols, &full_cols, usize::MAX)?;
+                    for c in full {
+                        let fctx = GroupCtx { cols: core::mem::take(&mut cols), rows };
+                        let v = eval_vec(&c.expr, &fctx);
+                        cols = fctx.cols;
+                        let m: Vec<u8> =
+                            (0..rows).map(|i| (v.bool3_at(i) == Some(true)) as u8).collect();
+                        store(table, c, &m, &mut keep);
+                    }
+                }
+            }
+            Some(keep)
+        };
         // fully filtered out: nothing else to load or evaluate for this group
         if keep.as_ref().is_some_and(|k| k.iter().all(|&b| b == 0)) {
             continue;
@@ -2259,7 +2404,7 @@ pub fn execute<S: ReadAt>(
         if topk_cap.is_some() {
             load(table, &mut cols, &ord_needed, usize::MAX)?;
         } else {
-            load(table, &mut cols, &needed, take_rows)?;
+            load(table, &mut cols, &proj_needed, take_rows)?;
         }
         let eval_rows = if scan_cap.is_some() { take_rows } else { rows };
         let ctx = GroupCtx { cols, rows: eval_rows };

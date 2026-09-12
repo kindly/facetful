@@ -30,6 +30,11 @@ size; ahead of SQLite on all 9.
   footer; column segments load lazily. Dictionary-encoded strings execute as
   integer scans (predicates like `LIKE`/`IN`/`=` evaluate once per distinct
   value, not once per row).
+- **Filter-mask cache**: each WHERE conjunct's row bitmap is cached per row
+  group (LRU, 16 MB). A burst of facet queries sharing a filter evaluates it
+  once; a `LIKE '%needle%'` that extends a cached needle verifies only the
+  rows the shorter one matched, so search-as-you-type costs a fraction per
+  keystroke instead of a blob scan.
 - **Parquet is the public contract**: `openParquet()` transcodes once in the
   browser (hyparquet + the same Rust compiler the CLI uses), caches the image
   in OPFS keyed by content hash, and reopens it instantly forever after.

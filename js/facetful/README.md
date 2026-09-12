@@ -14,6 +14,9 @@ browser** — facet counts, pivots, top-k, filters — at interaction speed.
   did-you-mean hints.
 - **Larger-than-memory**: tables can live in OPFS and load column segments
   lazily through a byte-budgeted LRU cache.
+- **Filter-mask cache**: WHERE conjuncts are cached as per-row-group bitmaps,
+  so facet bursts sharing a filter evaluate it once, and a `LIKE '%needle%'`
+  extending a cached needle verifies only the rows the shorter one matched.
 - Dates, medians, stddev, group_concat, `select *`, LIKE fast paths — the
   boring things work.
 
