@@ -686,3 +686,33 @@ Side effects, all good: text projection without sort 19 → 2.8 ms; sorted text 
 
 New tarball in `dist/` — the app-side agent should reinstall (`rm -rf node_modules/facetful node_modules/.vite && npm i ../browserdb/dist/facetful-0.1.0.tgz`).
 </sv-prose>
+
+<sv-prose id="d33">
+## Build log 18 — published: github.com/kindly/facetful + facetful@0.1.0 on npm (2026-09-11)
+
+The two "deliberately not yet" items from build log 16 are done:
+
+- **Scrub first**: all work references removed from the tree *and* the unpushed history (dataset renamed `data/units-2026-08`, demo page neutralized, docs generically reworded); author email kept by decision. History rewritten via soft-reset + re-commit before anything left the machine.
+- **GitHub**: pushed to `github.com/kindly/facetful` — **private for now**. Root README rewritten from the stale M0 stub to the shipped-engine state (numbers table, quickstarts, workspace map, status).
+- **npm**: `facetful@0.1.0` published (automation token, 2FA bypass; token file deleted after). Tagged `v0.1.0`. Release recipe from here: bump `js/facetful/package.json` → `./scripts/build-package.sh` (the full gate) → publish → tag.
+- Open loose end: the npm page links to the still-private repo (404 for visitors). Flipping visibility is David's call, not taken autonomously.
+</sv-prose>
+
+<sv-prose id="d34">
+## Filter-mask cache landed; the IN (select …) / star-schema position (2026-09-12)
+
+**The cache** (commit `37d238b`, built in a parallel session): the executor splits WHERE into top-level AND conjuncts and caches each conjunct's pass bitmap per row group on the table (`Table::masks`, byte-bounded LRU, 16 MB default ≈ 25 whole-table masks at 5M rows). A query composes its mask from cached conjuncts with bitwise AND and evaluates only the misses. Bits are set only for TRUE (not NULL), so AND-composition respects three-valued semantics; negations are their own conjunct, never a complement. **LIKE needle narrowing**: a contains-needle extending a cached one on the same plain-text column verifies only the rows the cached superset admits, read through a borrowed segment accessor — no blob scan. Measured (200K × 88-byte notes): cold scan 4.8 ms, narrowed keystroke ~1–2 ms, cached repeat 0.3 ms.
+
+Why it matters, quantified on the real dataset (183K): with a search term active, the WHERE was **~8.6 ms of every ~8.7 ms facet query — ~99%** — and a facet refresh fires 10+ queries sharing that identical WHERE (~105 ms of which ~95 ms was evaluating the same filter repeatedly). Now the filter is paid once per distinct conjunct, ever (tables are immutable — nothing invalidates, only the LRU budget evicts). A separate whole-WHERE cache tier was considered and dropped: composing cached conjunct bitmaps costs microseconds, so the conjunct tier alone captures both the repeat-identical-WHERE case and the one-conjunct-changed case (facet toggle during search, keystroke during facets).
+
+**`IN (select …)` position** (discussion 2026-09-12; recorded, not yet scheduled):
+
+- Today `IN` takes only a parenthesized expression list (evaluated per-distinct on dict columns); a subquery fails cleanly at parse.
+- Why IN-subqueries are slow in general engines: per-outer-row hash/probe (string hash per row; SQLite adds ephemeral-index and per-row interpreter overhead), correlation machinery (proving the subquery *isn't* correlated before running it once), and NULL three-valued logic blocking clean semi-/anti-join rewrites.
+- Why this engine sidesteps it: **no correlation by design** (SELECT-only, no outer references) so the inner query runs exactly once and materializes a set + had-NULL flag; **the dictionary trick** turns membership into once-per-distinct probes → a code→bool bitmap → the row scan is a vectorized integer lookup (est. 1–2 ms on the real data — cheaper than a LIKE blob scan); the same-column self-IN case compares dict codes with zero string work; and the materialized result is just another mask-cacheable conjunct.
+- **Cross-table `IN (select … from other)` is a semi-join, not a join**: no columns from the second table reach the output, so none of the positional-model hazards from the joins assessment (d29) apply. Needs a catalog (multi-table query ABI across the wasm boundary — the same plumbing d29 costed at ~½ day) plus one exec arm. Days, not the joins-week; also de-risks half of restricted joins if that ever lands.
+
+**Star schema fit**: the semi-join covers the *filter* direction — fact rows filtered by dimension predicates, including many-to-many through a bridge/exploded table (note `Owner(s)` is already comma-separated, i.e. many-to-many in disguise). It does not cover **group-by/display of dimension attributes** (membership answers yes/no, not which). Escape hatches, in order: (1) app-side rollup — `group by fk` on the fact table, decode fk→attribute in JS from the small dim table, re-aggregate; (2) the d29 restricted join (unique right key *is* the dimension lookup) when rollup hurts; (3) compile-time denormalization for facet columns known up front — under dict encoding a pre-joined attribute costs one code per row, so the classic storage argument for star schemas mostly evaporates.
+
+**Adopted ranking**: denormalize known facet attributes at build time; add `IN (select …)` + the catalog for cross-table filters; restricted joins only when a real workload demands dimension-attribute group-bys that rollup can't serve.
+</sv-prose>
