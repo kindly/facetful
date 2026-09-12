@@ -1,0 +1,37 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write # npm trusted publishing (OIDC) — no token, no 2FA
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: install wasm-opt
+        run: |
+          curl -sL https://github.com/WebAssembly/binaryen/releases/download/version_119/binaryen-version_119-x86_64-linux.tar.gz | tar xz
+          echo "$PWD/binaryen-version_119/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: npm >= 11.5.1 (required for trusted publishing)
+        run: npm install -g npm@latest && npm --version
+      - name: tag must match package version
+        run: |
+          v=$(node -p "require('./js/facetful/package.json').version")
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != package v$v"; exit 1; }
+      - name: hyparquet (parquet differential dependency)
+        run: npm install --prefix web/spike-bench
+      - name: release gate (budget + smokes + differential + pack)
+        run: ./scripts/build-package.sh
+      - name: publish (OIDC, provenance attached automatically)
+        run: npm publish
+        working-directory: js/facetful
