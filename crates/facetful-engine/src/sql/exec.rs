@@ -2099,36 +2099,80 @@ fn pack_bits(bytes: &[u8]) -> Vec<u8> {
 
 /// Direct-index grouping: all group-bys are dict columns with a small
 /// cardinality product — gid from arithmetic on codes, no hashing.
+/// How one group-by dimension maps to a dense code.
+enum DirectDim {
+    /// dictionary column: the code lane is the dense code
+    Dict,
+    /// integer column with a small global value range: `value - min`
+    Int { min: i64 },
+}
+
 struct DirectGroups {
     cols: Vec<usize>,
+    dims: Vec<DirectDim>,
     cards: Vec<usize>,
     dense: Vec<i32>,
 }
 
-fn direct_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<DirectGroups> {
-    let mut cols = Vec::new();
-    for g in group_by {
-        match g {
-            Bound::Column { index, .. } if table.catalog().schema.columns[*index].is_dict() => {
-                cols.push(*index)
+/// Global (all-groups) integer min/max from the footer stats, if every group
+/// has them.
+fn int_range<S: ReadAt>(table: &Table<S>, col: usize) -> Option<(i64, i64)> {
+    use crate::format::Stats;
+    let mut r: Option<(i64, i64)> = None;
+    for g in &table.catalog().groups {
+        match g.cols[col].stats {
+            Stats::Int { min, max } => {
+                let (lo, hi) = r.unwrap_or((min, max));
+                r = Some((lo.min(min), hi.max(max)));
             }
             _ => return None,
         }
     }
-    if cols.is_empty() {
-        return None;
-    }
+    r
+}
+
+fn direct_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<DirectGroups> {
+    let mut cols = Vec::new();
+    let mut dims = Vec::new();
     let mut cards = Vec::new();
     let mut product: usize = 1;
-    for &c in &cols {
-        let card = table.dictionary(c).ok()?.len() + 1; // extra lane for nulls
+    for g in group_by {
+        let Bound::Column { index, .. } = g else { return None };
+        let (cty, is_dict) = {
+            let def = &table.catalog().schema.columns[*index];
+            (def.ty, def.is_dict())
+        };
+        let int_lane = matches!(
+            cty,
+            ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::Int64
+                | ColumnType::Date
+                | ColumnType::Timestamp
+        ) && !is_dict;
+        let card = if is_dict {
+            dims.push(DirectDim::Dict);
+            table.dictionary(*index).ok()?.len() + 1 // extra lane for nulls
+        } else if let Some((min, max)) = int_lane.then(|| int_range(table, *index)).flatten() {
+            // narrow-range integers (years, small ids, dates) group densely too
+            let range = usize::try_from(max.checked_sub(min)?).ok()?.checked_add(1)?;
+            dims.push(DirectDim::Int { min });
+            range + 1 // extra lane for nulls
+        } else {
+            return None;
+        };
         product = product.checked_mul(card)?;
         if product > (1 << 22) {
             return None;
         }
+        cols.push(*index);
         cards.push(card);
     }
-    Some(DirectGroups { cols, cards, dense: vec![-1; product] })
+    if cols.is_empty() {
+        return None;
+    }
+    Some(DirectGroups { cols, dims, cards, dense: vec![-1; product] })
 }
 
 // ---------------- execute ----------------
@@ -2433,21 +2477,34 @@ pub fn execute<S: ReadAt>(
                     .zip(&d.cards)
                     .map(|(&c, &card)| (ctx.column(c), card))
                     .collect();
-                // hoist raw code slices out of the row loop
+                // hoist raw lanes out of the row loop
+                enum FastLane<'a> {
+                    Codes(&'a [u16]),
+                    Ints { vals: &'a [i64], min: i64 },
+                }
                 struct FastDim<'a> {
-                    codes: &'a [u16],
+                    lane: FastLane<'a>,
                     valid: Option<&'a [u8]>,
                     card: usize,
                 }
                 let fast: Vec<FastDim> = code_cols
                     .iter()
-                    .map(|(vv, card)| match &vv.data {
-                        Data::Codes { codes, .. } => FastDim {
-                            codes,
+                    .zip(&d.dims)
+                    .map(|((vv, card), dim)| {
+                        let lane = match (&vv.data, dim) {
+                            (Data::Codes { codes, .. }, DirectDim::Dict) => {
+                                FastLane::Codes(codes)
+                            }
+                            (Data::I64(vals), DirectDim::Int { min }) => {
+                                FastLane::Ints { vals, min: *min }
+                            }
+                            _ => unreachable!("direct plan only over dict/int columns"),
+                        };
+                        FastDim {
+                            lane,
                             valid: vv.valid.as_deref().map(|v| v.as_slice()),
                             card: *card,
-                        },
-                        _ => unreachable!("direct plan only over dict columns"),
+                        }
                     })
                     .collect();
                 let mut gids = vec![u32::MAX; rows];
@@ -2458,7 +2515,14 @@ pub fn execute<S: ReadAt>(
                     let mut composite = 0usize;
                     for fd in &fast {
                         let ok = fd.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
-                        let code = if ok { fd.codes[i] as usize } else { fd.card - 1 };
+                        let code = if !ok {
+                            fd.card - 1
+                        } else {
+                            match &fd.lane {
+                                FastLane::Codes(codes) => codes[i] as usize,
+                                FastLane::Ints { vals, min } => (vals[i] - min) as usize,
+                            }
+                        };
                         composite = composite * fd.card + code;
                     }
                     let dense = &mut d.dense[composite];
@@ -2683,9 +2747,66 @@ pub fn execute<S: ReadAt>(
         let offset = q.offset.unwrap_or(0) as usize;
         let limit = q.limit.unwrap_or(0) as usize;
         let winners: Vec<Cand> = cands.into_iter().skip(offset).take(limit).collect();
-        let mut sel_cache: HashMap<u32, Vec<VV>> = HashMap::new();
+
+        // Plain-text columns selected directly are gathered per winner row
+        // straight off the borrowed segments — loading the lane would copy
+        // the whole blob up to the deepest winner for a handful of rows.
+        let is_direct_text = |b: &Bound| -> Option<usize> {
+            let Bound::Column { index, .. } = b else { return None };
+            let def = &table.catalog().schema.columns[*index];
+            (def.ty == ColumnType::Utf8 && !def.is_dict()).then_some(*index)
+        };
+        let mut direct_text: Vec<Option<usize>> =
+            q.select.iter().map(|s| is_direct_text(&s.expr)).collect();
+        // gathered[sel_idx][winner_idx]
+        let mut gathered: HashMap<usize, Vec<Val>> = HashMap::new();
+        for (si, ci) in direct_text.clone().into_iter().enumerate() {
+            let Some(ci) = ci else { continue };
+            let mut vals = vec![Val::Null; winners.len()];
+            let mut ok = true;
+            for g in winners.iter().map(|w| w.g).collect::<std::collections::BTreeSet<_>>() {
+                let got = table.with_text_segments(g as usize, ci, |offs, blob, valid| {
+                    for (wi, w) in winners.iter().enumerate() {
+                        if w.g != g {
+                            continue;
+                        }
+                        let i = w.row as usize;
+                        if valid.is_some_and(|v| v[i / 8] >> (i % 8) & 1 == 0) {
+                            continue; // stays Null
+                        }
+                        let at = |n: usize| {
+                            u32::from_le_bytes(offs[n * 4..n * 4 + 4].try_into().unwrap())
+                                as usize
+                        };
+                        let s = core::str::from_utf8(&blob[at(i)..at(i + 1)])
+                            .expect("image text is utf8");
+                        vals[wi] = Val::Text(Rc::new(s.to_string()));
+                    }
+                })?;
+                if got.is_none() {
+                    ok = false; // segments not resident: fall back to the lane path
+                    break;
+                }
+            }
+            if ok {
+                gathered.insert(si, vals);
+            } else {
+                direct_text[si] = None;
+            }
+        }
+        // lanes still needed: any select expr that isn't a gathered direct text
+        let mut lane_cols = Vec::new();
+        for (si, s) in q.select.iter().enumerate() {
+            if direct_text[si].is_none() || !gathered.contains_key(&si) {
+                collect_columns(&s.expr, &mut lane_cols);
+            }
+        }
+        lane_cols.sort_unstable();
+        lane_cols.dedup();
+
+        let mut sel_cache: HashMap<u32, Vec<Option<VV>>> = HashMap::new();
         let mut rows: Vec<Vec<Val>> = Vec::with_capacity(winners.len());
-        for c in &winners {
+        for (wi, c) in winners.iter().enumerate() {
             if !sel_cache.contains_key(&c.g) {
                 let g = c.g as usize;
                 let cap = winners
@@ -2695,7 +2816,7 @@ pub fn execute<S: ReadAt>(
                     .max()
                     .unwrap();
                 let mut cols = HashMap::new();
-                for &ci in &needed {
+                for &ci in &lane_cols {
                     let (cty, is_dict) = {
                         let def = &table.catalog().schema.columns[ci];
                         (def.ty, def.is_dict())
@@ -2723,15 +2844,25 @@ pub fn execute<S: ReadAt>(
                     cols.insert(ci, (col, validity));
                 }
                 let ctx = GroupCtx { cols, rows: cap };
-                let sel_vvs: Vec<VV> =
-                    q.select.iter().map(|s| eval_vec(&s.expr, &ctx)).collect();
+                let sel_vvs: Vec<Option<VV>> = q
+                    .select
+                    .iter()
+                    .enumerate()
+                    .map(|(si, s)| {
+                        (!gathered.contains_key(&si)).then(|| eval_vec(&s.expr, &ctx))
+                    })
+                    .collect();
                 sel_cache.insert(c.g, sel_vvs);
             }
             let sel = &sel_cache[&c.g];
             rows.push(
                 sel.iter()
                     .zip(&sel_tys)
-                    .map(|(v, t)| v.val_at(c.row as usize, *t))
+                    .enumerate()
+                    .map(|(si, (v, t))| match v {
+                        Some(v) => v.val_at(c.row as usize, *t),
+                        None => gathered[&si][wi].clone(),
+                    })
                     .collect(),
             );
         }
