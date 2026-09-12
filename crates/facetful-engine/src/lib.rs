@@ -201,6 +201,43 @@ impl<S: ReadAt> Table<S> {
         Ok(Some(f(offs, blob, valid)))
     }
 
+    /// Run `f` over a fixed-width numeric column's raw value segment (LE, the
+    /// width in bytes is passed along) and validity bitmap for one group —
+    /// borrowed, no copy. For filter fast paths that would otherwise widen a
+    /// narrow int column into a `Vec<i64>` just to compare it to a literal.
+    /// `Ok(None)` when the segments could not be held resident at once (tiny
+    /// positional-cache budgets) — callers fall back to the lane path.
+    pub(crate) fn with_fixed_segments<R>(
+        &mut self,
+        group: usize,
+        col: usize,
+        f: impl FnOnce(&[u8], usize, Option<&[u8]>) -> R,
+    ) -> Result<Option<R>, FormatError> {
+        if self.cat.schema.columns[col].is_dict() {
+            return Ok(None); // seg 0 holds codes, not values
+        }
+        let Some(w) = self.cat.schema.columns[col].ty.fixed_width() else {
+            return Ok(None);
+        };
+        let has_nulls = self.cat.groups[group].cols[col].null_count != 0;
+        self.segment(group, col, 0)?;
+        if has_nulls {
+            self.segment(group, col, 2)?;
+        }
+        let Some(vals) = self.resident(group, col, 0) else {
+            return Ok(None);
+        };
+        let valid = if has_nulls {
+            match self.resident(group, col, 2) {
+                Some(v) => Some(v),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        Ok(Some(f(vals, w, valid)))
+    }
+
     /// A segment already in memory (borrowed source, or LRU-resident), if so.
     fn resident(&self, group: usize, col: usize, seg: usize) -> Option<&[u8]> {
         let g = &self.cat.groups[group];

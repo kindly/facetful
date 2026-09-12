@@ -538,6 +538,73 @@ fn cmp_vec(op: BinOp, a: VV, b: VV, rows: usize) -> VV {
         let out: Vec<u8> = codes.iter().map(|&c| table[c as usize]).collect();
         return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
     }
+    // numeric lane vs literal: specialized loops — the generic per-row
+    // accessor path defeats auto-vectorization (measured ~10x slower)
+    fn fill<T: Copy>(xs: &[T], f: impl Fn(T) -> bool) -> Vec<u8> {
+        xs.iter().map(|&x| f(x) as u8).collect()
+    }
+    fn cmp_i64(op: BinOp, xs: &[i64], lit: i64) -> Vec<u8> {
+        match op {
+            BinOp::Eq => fill(xs, |x| x == lit),
+            BinOp::Ne => fill(xs, |x| x != lit),
+            BinOp::Lt => fill(xs, |x| x < lit),
+            BinOp::Le => fill(xs, |x| x <= lit),
+            BinOp::Gt => fill(xs, |x| x > lit),
+            BinOp::Ge => fill(xs, |x| x >= lit),
+            _ => unreachable!("cmp op"),
+        }
+    }
+    fn cmp_f64(op: BinOp, xs: &[f64], lit: f64) -> Vec<u8> {
+        match op {
+            BinOp::Eq => fill(xs, |x| x.total_cmp(&lit).is_eq()),
+            BinOp::Ne => fill(xs, |x| x.total_cmp(&lit).is_ne()),
+            BinOp::Lt => fill(xs, |x| x.total_cmp(&lit).is_lt()),
+            BinOp::Le => fill(xs, |x| x.total_cmp(&lit).is_le()),
+            BinOp::Gt => fill(xs, |x| x.total_cmp(&lit).is_gt()),
+            BinOp::Ge => fill(xs, |x| x.total_cmp(&lit).is_ge()),
+            _ => unreachable!("cmp op"),
+        }
+    }
+    // literal on the left: mirror (lit < x  ==  x > lit)
+    let (a, b, op) = if matches!(a.data, Data::Const(_)) {
+        let m = match op {
+            BinOp::Lt => BinOp::Gt,
+            BinOp::Le => BinOp::Ge,
+            BinOp::Gt => BinOp::Lt,
+            BinOp::Ge => BinOp::Le,
+            other => other,
+        };
+        (b, a, m)
+    } else {
+        (a, b, op)
+    };
+    if let Data::Const(cv) = &b.data {
+        let out = match (&a.data, cv) {
+            (Data::I64(xs), Val::Int(lit)) => Some(cmp_i64(op, xs, *lit)),
+            (Data::I64(xs), Val::Float(lit)) if lit.fract() == 0.0 && lit.abs() < 9e15 => {
+                Some(cmp_i64(op, xs, *lit as i64))
+            }
+            (Data::I64(xs), Val::Float(lit)) => {
+                let lit = *lit;
+                Some(match op {
+                    BinOp::Eq => fill(xs, |x| (x as f64).total_cmp(&lit).is_eq()),
+                    BinOp::Ne => fill(xs, |x| (x as f64).total_cmp(&lit).is_ne()),
+                    BinOp::Lt => fill(xs, |x| (x as f64).total_cmp(&lit).is_lt()),
+                    BinOp::Le => fill(xs, |x| (x as f64).total_cmp(&lit).is_le()),
+                    BinOp::Gt => fill(xs, |x| (x as f64).total_cmp(&lit).is_gt()),
+                    BinOp::Ge => fill(xs, |x| (x as f64).total_cmp(&lit).is_ge()),
+                    _ => unreachable!("cmp op"),
+                })
+            }
+            (Data::F64(xs), Val::Int(lit)) => Some(cmp_f64(op, xs, *lit as f64)),
+            (Data::F64(xs), Val::Float(lit)) => Some(cmp_f64(op, xs, *lit)),
+            _ => None,
+        };
+        if let Some(out) = out {
+            let valid = valid_and(rows, &a, &b);
+            return VV { data: Data::Bool(Rc::new(out)), valid };
+        }
+    }
     // numeric path
     let numeric = |d: &Data| {
         matches!(d, Data::I64(_) | Data::F64(_))
@@ -1366,6 +1433,14 @@ enum AggAcc {
     GroupConcat { v: Vec<Option<String>>, sep: String },
 }
 
+/// Row source for one aggregation pass: explicit per-row group ids, or (for
+/// ungrouped queries) the raw keep mask with the row count.
+#[derive(Clone, Copy)]
+enum RowsSrc<'a> {
+    Gids(&'a [u32]),
+    Mask { keep: Option<&'a [u8]>, n: usize },
+}
+
 impl AggAcc {
     /// `arg_is_dict`: the argument is a dictionary column (distinct on codes).
     fn new(call: &Bound, arg_is_dict: bool) -> AggAcc {
@@ -1447,23 +1522,52 @@ impl AggAcc {
     }
 
     /// One pass over the group: specialized loops per (accumulator, arg shape).
-    fn update_batch(&mut self, gids: &[u32], arg: &VV) {
-        let rows = gids.len();
+    /// `src` is either per-row group ids or (for ungrouped queries) the raw
+    /// keep mask — the latter never materializes a gids vector.
+    /// (RowsSrc is defined just above `impl AggAcc`.)
+    fn update_batch(&mut self, src: RowsSrc<'_>, arg: &VV) {
         macro_rules! for_kept {
             (|$i:ident, $g:ident| $body:expr) => {
-                for $i in 0..rows {
-                    let $g = gids[$i];
-                    if $g == u32::MAX {
-                        continue;
+                match src {
+                    RowsSrc::Gids(gids) => {
+                        for $i in 0..gids.len() {
+                            let $g = gids[$i];
+                            if $g == u32::MAX {
+                                continue;
+                            }
+                            let $g = $g as usize;
+                            $body
+                        }
                     }
-                    let $g = $g as usize;
-                    $body
+                    RowsSrc::Mask { keep: None, n } => {
+                        for $i in 0..n {
+                            let $g = 0usize;
+                            $body
+                        }
+                    }
+                    RowsSrc::Mask { keep: Some(k), n } => {
+                        for $i in 0..n {
+                            if k[$i] == 0 {
+                                continue;
+                            }
+                            let $g = 0usize;
+                            $body
+                        }
+                    }
                 }
             };
         }
         match (&mut *self, &arg.data) {
             (AggAcc::Count(c), Data::Const(v)) => {
                 if !v.is_null() {
+                    // ungrouped count(*): the mask popcount is the answer
+                    if let RowsSrc::Mask { keep, n } = src {
+                        c[0] += match keep {
+                            None => n as i64,
+                            Some(k) => k.iter().filter(|&&b| b != 0).count() as i64,
+                        };
+                        return;
+                    }
                     for_kept!(|i, g| {
                         let _ = i;
                         c[g] += 1
@@ -1592,12 +1696,10 @@ impl AggAcc {
             }),
             // generic fallbacks (consts, computed vectors, text min/max)
             (acc, _) => {
-                for i in 0..rows {
-                    let g = gids[i];
-                    if g == u32::MAX || !arg.is_valid(i) {
+                for_kept!(|i, g| {
+                    if !arg.is_valid(i) {
                         continue;
                     }
-                    let g = g as usize;
                     match acc {
                         AggAcc::SumI { v, any } => {
                             v[g] += arg.i64_at(i);
@@ -1647,7 +1749,7 @@ impl AggAcc {
                         | AggAcc::Stddev { .. }
                         | AggAcc::GroupConcat { .. } => unreachable!(),
                     }
-                }
+                });
             }
         }
     }
@@ -2036,6 +2138,47 @@ struct Conjunct {
     like: Option<LikeKey>,
 }
 
+/// `col <cmp> integral-literal` (either side) over a stored integer column,
+/// as an inclusive range test plus an invert flag (Ne). The filter fast path
+/// compares straight off the raw narrow segment with this.
+fn int_cmp_lit(b: &Bound) -> Option<(usize, i64, i64, bool)> {
+    let Bound::Binary { op, lhs, rhs, .. } = b else { return None };
+    let (col, lit, op) = match (&**lhs, &**rhs) {
+        (Bound::Column { index, ty }, Bound::Number(n, _))
+            if matches!(ty, Ty::Int | Ty::Date | Ty::Timestamp) && n.fract() == 0.0 =>
+        {
+            (*index, *n, *op)
+        }
+        (Bound::Number(n, _), Bound::Column { index, ty })
+            if matches!(ty, Ty::Int | Ty::Date | Ty::Timestamp) && n.fract() == 0.0 =>
+        {
+            // mirror: lit < x  ==  x > lit
+            let m = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Le => BinOp::Ge,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Ge => BinOp::Le,
+                other => *other,
+            };
+            (*index, *n, m)
+        }
+        _ => return None,
+    };
+    if lit.abs() > 9e15 {
+        return None; // not exactly representable — leave to the general path
+    }
+    let lit = lit as i64;
+    Some(match op {
+        BinOp::Eq => (col, lit, lit, false),
+        BinOp::Ne => (col, lit, lit, true),
+        BinOp::Lt => (col, i64::MIN, lit.checked_sub(1)?, false),
+        BinOp::Le => (col, i64::MIN, lit, false),
+        BinOp::Gt => (col, lit.checked_add(1)?, i64::MAX, false),
+        BinOp::Ge => (col, lit, i64::MAX, false),
+        _ => return None,
+    })
+}
+
 fn split_conjuncts(b: &Bound, out: &mut Vec<Bound>) {
     match b {
         Bound::Binary { op: BinOp::And, lhs, rhs, .. } => {
@@ -2392,7 +2535,65 @@ pub fn execute<S: ReadAt>(
                             .ok()
                             .flatten()
                     });
-                    match narrowed {
+                    if let Some(m) = narrowed {
+                        store(table, c, &m, &mut keep);
+                        continue;
+                    }
+                    // integer comparison straight off the raw narrow segment —
+                    // widening the lane into Vec<i64> costs more than the compare
+                    let int_fast = int_cmp_lit(&c.expr).and_then(|(col, lo, hi, inv)| {
+                        table
+                            .with_fixed_segments(g, col, |vals, w, valid| {
+                                let mut m = vec![0u8; rows];
+                                match w {
+                                    1 => {
+                                        for (i, &b) in vals[..rows].iter().enumerate() {
+                                            let x = b as i8 as i64;
+                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
+                                        }
+                                    }
+                                    2 => {
+                                        for (i, ch) in
+                                            vals[..rows * 2].chunks_exact(2).enumerate()
+                                        {
+                                            let x = i16::from_le_bytes([ch[0], ch[1]]) as i64;
+                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
+                                        }
+                                    }
+                                    4 => {
+                                        for (i, ch) in
+                                            vals[..rows * 4].chunks_exact(4).enumerate()
+                                        {
+                                            let x = i32::from_le_bytes([
+                                                ch[0], ch[1], ch[2], ch[3],
+                                            ])
+                                                as i64;
+                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
+                                        }
+                                    }
+                                    _ => {
+                                        for (i, ch) in
+                                            vals[..rows * 8].chunks_exact(8).enumerate()
+                                        {
+                                            let x = i64::from_le_bytes([
+                                                ch[0], ch[1], ch[2], ch[3], ch[4], ch[5],
+                                                ch[6], ch[7],
+                                            ]);
+                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
+                                        }
+                                    }
+                                }
+                                if let Some(vb) = valid {
+                                    for (i, mi) in m.iter_mut().enumerate() {
+                                        *mi &= vb[i / 8] >> (i % 8) & 1;
+                                    }
+                                }
+                                m
+                            })
+                            .ok()
+                            .flatten()
+                    });
+                    match int_fast {
                         Some(m) => store(table, c, &m, &mut keep),
                         None => full.push(c),
                     }
@@ -2455,8 +2656,8 @@ pub fn execute<S: ReadAt>(
         let kept = |i: usize| keep.as_ref().map_or(true, |k| k[i] != 0);
 
         if q.is_aggregate {
-            let gids: Vec<u32> = if q.group_by.is_empty() {
-                // ungrouped: one group, no hashing at all
+            let gids: Option<Vec<u32>> = if q.group_by.is_empty() {
+                // ungrouped: one group, no gids vector — aggregate off the mask
                 if n_groups == 0 {
                     group_keys.push(Vec::new());
                     n_groups = 1;
@@ -2464,12 +2665,7 @@ pub fn execute<S: ReadAt>(
                         a.grow(1);
                     }
                 }
-                match &keep {
-                    None => vec![0u32; rows],
-                    Some(k) => {
-                        k.iter().map(|&b| if b != 0 { 0 } else { u32::MAX }).collect()
-                    }
-                }
+                None
             } else if let Some(d) = &mut direct {
                 let code_cols: Vec<(VV, usize)> = d
                     .cols
@@ -2507,7 +2703,20 @@ pub fn execute<S: ReadAt>(
                         }
                     })
                     .collect();
-                let mut gids = vec![u32::MAX; rows];
+                // count(*)-only queries fuse the count into this loop —
+                // no gids vector, no second aggregation pass
+                let count_only = accs.iter().all(|a| matches!(a, AggAcc::Count(_)))
+                    && agg_calls.iter().all(|c| {
+                        let Bound::Call { args, .. } = c else { return false };
+                        matches!(args[0], Bound::Number(..) | Bound::Str(_))
+                    });
+                let mut gids =
+                    if count_only { Vec::new() } else { vec![u32::MAX; rows] };
+                // fused counting goes through a plain local buffer (merged
+                // below) — touching the accumulator enum per row is slower
+                // than the gids pass it replaces
+                let mut local_counts: Vec<i64> =
+                    if count_only { vec![0; n_groups] } else { Vec::new() };
                 for i in 0..rows {
                     if !kept(i) {
                         continue;
@@ -2535,10 +2744,26 @@ pub fn execute<S: ReadAt>(
                         for a in &mut accs {
                             a.grow(n_groups);
                         }
+                        if count_only {
+                            local_counts.push(0);
+                        }
                     }
-                    gids[i] = *dense as u32;
+                    if count_only {
+                        local_counts[*dense as usize] += 1;
+                    } else {
+                        gids[i] = *dense as u32;
+                    }
                 }
-                gids
+                if count_only {
+                    for a in &mut accs {
+                        let AggAcc::Count(c) = a else { unreachable!("count_only") };
+                        for (g, &n) in local_counts.iter().enumerate() {
+                            c[g] += n;
+                        }
+                    }
+                    continue; // this group's aggregates are done
+                }
+                Some(gids)
             } else {
                 let key_vvs: Vec<VV> = q.group_by.iter().map(|e| eval_vec(e, &ctx)).collect();
                 let mut gids = vec![u32::MAX; rows];
@@ -2560,12 +2785,16 @@ pub fn execute<S: ReadAt>(
                     }
                     gids[i] = gid as u32;
                 }
-                gids
+                Some(gids)
+            };
+            let src = match &gids {
+                Some(g) => RowsSrc::Gids(g),
+                None => RowsSrc::Mask { keep: keep.as_deref(), n: rows },
             };
             for (acc, call) in accs.iter_mut().zip(&agg_calls) {
                 let Bound::Call { args, .. } = call else { unreachable!() };
                 let arg = eval_vec(&args[0], &ctx);
-                acc.update_batch(&gids, &arg);
+                acc.update_batch(src, &arg);
             }
         } else if let Some(cap) = topk_cap {
             let ord_vvs: Vec<VV> = q.order_by.iter().map(|(e, _)| eval_vec(e, &ctx)).collect();
