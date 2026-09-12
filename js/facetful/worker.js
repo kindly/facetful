@@ -191,6 +191,11 @@ self.onmessage = async (e) => {
         await new Promise((r) => setTimeout(r, 0));
       }
       reply({ ok: true, bytes });
+    } else if (cmd === "setMaskBudget") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error("no table loaded");
+      engine.setMaskBudget(handle, e.data.bytes);
+      reply({ ok: true });
     } else if (cmd === "cacheStats") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");

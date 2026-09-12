@@ -113,6 +113,9 @@ export declare class Facetful {
   /** Current segment-cache occupancy for a table. */
   cacheStats(options?: { table?: string }): Promise<{ segments: number; bytes: number }>;
 
+  /** Filter-mask cache byte budget for a table (default 16 MB); 0 disables it. */
+  setMaskBudget(bytes: number, options?: { table?: string }): Promise<void>;
+
   /**
    * Run SQL (SELECT-only; the table is always `t`). `table` picks a loaded
    * table by name, defaulting to the most recently loaded. Rejects with an

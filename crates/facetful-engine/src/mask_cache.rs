@@ -83,6 +83,12 @@ impl MaskCache {
         (self.entries.len(), self.bytes)
     }
 
+    /// Drop every cached mask (benchmarking cold paths; budget unchanged).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
     fn touch(&mut self) -> u64 {
         self.tick += 1;
         self.tick
@@ -112,6 +118,9 @@ impl MaskCache {
         bits: Rc<Vec<u8>>,
         like: Option<LikeKey>,
     ) {
+        if bits.len() > self.budget {
+            return; // can never fit — budget 0 disables the cache entirely
+        }
         self.evict_to_budget(bits.len());
         let tick = self.touch();
         let e = self.entries.entry(key.to_string()).or_insert_with(|| Entry {
@@ -184,6 +193,14 @@ mod tests {
         assert_eq!(*c.get("a", 1).unwrap(), vec![0b101]);
         assert_eq!(c.stats(), (1, 1));
         assert_eq!((c.hits, c.misses), (1, 2));
+    }
+
+    #[test]
+    fn zero_budget_disables() {
+        let mut c = MaskCache::new(0);
+        c.put("a", 0, 1, bits(1), None);
+        assert!(c.get("a", 0).is_none(), "budget 0 must never cache");
+        assert_eq!(c.stats(), (0, 0));
     }
 
     #[test]

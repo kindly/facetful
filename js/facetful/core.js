@@ -67,6 +67,11 @@ export class Engine {
     return this.w.table_warm(tableHandle, colIdx);
   }
 
+  /** Filter-mask cache byte budget for a table; 0 disables it. */
+  setMaskBudget(tableHandle, bytes) {
+    this.w.table_set_mask_budget(tableHandle, bytes);
+  }
+
   /** { segments, bytes } currently cached. */
   cacheStats(tableHandle) {
     const packed = this.w.table_cache_stats(tableHandle);

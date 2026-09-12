@@ -116,14 +116,17 @@ fn facetful_matches_sqlite() {
     let mut table = Table::open(bytes).unwrap();
 
     for sql in QUERIES {
-        // facetful
-        let mut ours = run_query(&mut table, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
-        ours.ensure_rows();
-        let ours: Vec<Vec<String>> = ours
-            .rows
-            .iter()
-            .map(|row| row.iter().map(render_val).collect())
-            .collect();
+        // facetful — twice: cold, then with the filter-mask cache primed by
+        // the first run. Both must agree with SQLite (cache-correctness).
+        table.masks().clear();
+        let run = |table: &mut _| -> Vec<Vec<String>> {
+            let mut r = run_query(table, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+            r.ensure_rows();
+            r.rows.iter().map(|row| row.iter().map(render_val).collect()).collect()
+        };
+        let ours = run(&mut table);
+        let cached = run(&mut table);
+        assert_eq!(ours, cached, "mask-cached rerun differs on: {sql}");
 
         // sqlite
         let out = Command::new("sqlite3")

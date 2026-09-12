@@ -54,8 +54,23 @@ fn query(args: &[String]) {
     use facetful_engine::Table;
     use std::io::{BufRead, Write};
 
+    // --mask-cache <bytes> may appear anywhere; 0 disables the filter cache
+    let mut args: Vec<String> = args.to_vec();
+    let mut mask_budget: Option<usize> = None;
+    if let Some(i) = args.iter().position(|a| a == "--mask-cache") {
+        let v = args.get(i + 1).unwrap_or_else(|| {
+            eprintln!("--mask-cache needs a byte count (0 disables)");
+            exit(2);
+        });
+        mask_budget = Some(v.parse().unwrap_or_else(|_| {
+            eprintln!("--mask-cache: '{v}' is not a byte count");
+            exit(2);
+        }));
+        args.drain(i..=i + 1);
+    }
+
     let Some(path) = args.first() else {
-        eprintln!("usage: facetful query file.facetful [\"select …\"]");
+        eprintln!("usage: facetful query file.facetful [\"select …\"] [--mask-cache <bytes>]");
         exit(2);
     };
     let bytes = std::fs::read(path).unwrap_or_else(|e| {
@@ -66,6 +81,9 @@ fn query(args: &[String]) {
         eprintln!("{path}: {e}");
         exit(1);
     });
+    if let Some(b) = mask_budget {
+        table.masks().set_budget(b);
+    }
 
     use facetful_engine::sql::binder::Ty;
     let render = |v: &Val, ty: Ty| -> String {
@@ -156,24 +174,44 @@ fn query(args: &[String]) {
                     blocks.push((name.trim().to_string(), sql.to_string()));
                 }
             }
+            println!("# query\tcold_ms\twarm_ms");
             for (name, sql) in &blocks {
                 use facetful_engine::sql::run_query;
-                // warmup
+                // warmup: lazy segment loads, dict caches, mask cache
                 for _ in 0..3 {
                     if let Err(d) = run_query(&mut table, sql) {
                         eprint!("{name}: {}", d.render(sql));
                         std::process::exit(1);
                     }
                 }
-                let mut times: Vec<f64> = (0..10)
-                    .map(|_| {
-                        let t0 = std::time::Instant::now();
-                        let _ = run_query(&mut table, sql).unwrap();
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    })
-                    .collect();
-                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                println!("{name}\t{:.2}", times[times.len() / 2]);
+                let median = |mut ts: Vec<f64>| {
+                    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    ts[ts.len() / 2]
+                };
+                // warm: mask cache primed by the warmups (facet-refresh shape)
+                let warm = median(
+                    (0..10)
+                        .map(|_| {
+                            let t0 = std::time::Instant::now();
+                            let _ = run_query(&mut table, sql).unwrap();
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        })
+                        .collect(),
+                );
+                // cold: every run re-evaluates its WHERE (first-interaction shape);
+                // segments/dicts stay warm — this isolates filter-evaluation cost
+                let cold = median(
+                    (0..10)
+                        .map(|_| {
+                            table.masks().clear();
+                            let t0 = std::time::Instant::now();
+                            let _ = run_query(&mut table, sql).unwrap();
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        })
+                        .collect(),
+                );
+                table.masks().clear(); // don't hand the next query a primed cache
+                println!("{name}\t{cold:.2}\t{warm:.2}");
             }
             return;
         }

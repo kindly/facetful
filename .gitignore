@@ -17,3 +17,5 @@ node_modules/
 # tool state
 /.sideview/
 docs/*.sv.lock
+bench/results.tsv
+bench/baseline.tsv

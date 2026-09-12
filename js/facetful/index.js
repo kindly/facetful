@@ -103,6 +103,11 @@ export class Facetful {
     return { segments, bytes };
   }
 
+  /** Filter-mask cache byte budget for a table (default 16 MB); 0 disables it. */
+  async setMaskBudget(bytes, { table } = {}) {
+    await this._call({ cmd: "setMaskBudget", bytes, table });
+  }
+
   /** Run SQL. `table` selects a loaded table (defaults to the last loaded). */
   async query(sql, { table } = {}) {
     const { result } = await this._call({ cmd: "query", sql, table });

@@ -126,6 +126,13 @@ pub extern "C" fn table_warm(t: usize, col: u32) -> f64 {
     t.warm_column(col as usize).map(|b| b as f64).unwrap_or(-1.0)
 }
 
+/// Filter-mask cache byte budget for this table; 0 disables the cache.
+#[no_mangle]
+pub extern "C" fn table_set_mask_budget(t: usize, bytes: f64) {
+    let t = unsafe { &mut *(t as *mut T) };
+    t.masks().set_budget(bytes as usize);
+}
+
 /// (cached segments << 32) | cached KiB — cache observability for the JS side.
 #[no_mangle]
 pub extern "C" fn table_cache_stats(t: usize) -> u64 {
