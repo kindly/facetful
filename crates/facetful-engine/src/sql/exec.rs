@@ -2545,42 +2545,45 @@ pub fn execute<S: ReadAt>(
                         table
                             .with_fixed_segments(g, col, |vals, w, valid| {
                                 let mut m = vec![0u8; rows];
+                                // Bounds are clamped to the stored width so the
+                                // compare runs at that width — verified in the
+                                // wasm disassembly: i64 bounds forced an
+                                // extend-to-i64x2 chain (2 lanes/op); clamped
+                                // i16 bounds compare as i16x8 (8 lanes/op).
+                                macro_rules! sweep {
+                                    ($t:ty, $w:expr, |$i:ident, $ch:ident| $x:expr) => {{
+                                        if lo > <$t>::MAX as i64 || hi < <$t>::MIN as i64 {
+                                            m.fill(inv as u8); // empty range
+                                        } else {
+                                            let lo = lo.max(<$t>::MIN as i64) as $t;
+                                            let hi = hi.min(<$t>::MAX as i64) as $t;
+                                            for ($i, $ch) in
+                                                vals[..rows * $w].chunks_exact($w).enumerate()
+                                            {
+                                                let x: $t = $x;
+                                                m[$i] =
+                                                    ((x >= lo && x <= hi) != inv) as u8;
+                                            }
+                                        }
+                                    }};
+                                }
                                 match w {
-                                    1 => {
-                                        for (i, &b) in vals[..rows].iter().enumerate() {
-                                            let x = b as i8 as i64;
-                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
-                                        }
-                                    }
+                                    1 => sweep!(i8, 1, |i, ch| ch[0] as i8),
                                     2 => {
-                                        for (i, ch) in
-                                            vals[..rows * 2].chunks_exact(2).enumerate()
-                                        {
-                                            let x = i16::from_le_bytes([ch[0], ch[1]]) as i64;
-                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
-                                        }
+                                        sweep!(i16, 2, |i, ch| i16::from_le_bytes([
+                                            ch[0], ch[1]
+                                        ]))
                                     }
                                     4 => {
-                                        for (i, ch) in
-                                            vals[..rows * 4].chunks_exact(4).enumerate()
-                                        {
-                                            let x = i32::from_le_bytes([
-                                                ch[0], ch[1], ch[2], ch[3],
-                                            ])
-                                                as i64;
-                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
-                                        }
+                                        sweep!(i32, 4, |i, ch| i32::from_le_bytes([
+                                            ch[0], ch[1], ch[2], ch[3]
+                                        ]))
                                     }
                                     _ => {
-                                        for (i, ch) in
-                                            vals[..rows * 8].chunks_exact(8).enumerate()
-                                        {
-                                            let x = i64::from_le_bytes([
-                                                ch[0], ch[1], ch[2], ch[3], ch[4], ch[5],
-                                                ch[6], ch[7],
-                                            ]);
-                                            m[i] = ((x >= lo && x <= hi) != inv) as u8;
-                                        }
+                                        sweep!(i64, 8, |i, ch| i64::from_le_bytes([
+                                            ch[0], ch[1], ch[2], ch[3], ch[4], ch[5],
+                                            ch[6], ch[7]
+                                        ]))
                                     }
                                 }
                                 if let Some(vb) = valid {
