@@ -2230,9 +2230,23 @@ fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) -> Vec<Conj
 
 fn pack_bits(bytes: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; bytes.len().div_ceil(8)];
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut chunks = bytes.chunks_exact(8);
+    for (o, ch) in out.iter_mut().zip(&mut chunks) {
+        // branchless byte-at-a-time pack — the bit-indexed loop was a
+        // read-modify-write with a data-dependent branch per row
+        *o = (ch[0] != 0) as u8
+            | ((ch[1] != 0) as u8) << 1
+            | ((ch[2] != 0) as u8) << 2
+            | ((ch[3] != 0) as u8) << 3
+            | ((ch[4] != 0) as u8) << 4
+            | ((ch[5] != 0) as u8) << 5
+            | ((ch[6] != 0) as u8) << 6
+            | ((ch[7] != 0) as u8) << 7;
+    }
+    for (i, &b) in chunks.remainder().iter().enumerate() {
         if b != 0 {
-            out[i / 8] |= 1 << (i % 8);
+            let n = bytes.len() / 8 * 8 + i;
+            out[n / 8] |= 1 << (n % 8);
         }
     }
     out
