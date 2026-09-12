@@ -716,3 +716,20 @@ Why it matters, quantified on the real dataset (183K): with a search term active
 
 **Adopted ranking**: denormalize known facet attributes at build time; add `IN (select …)` + the catalog for cross-table filters; restricted joins only when a real workload demands dimension-attribute group-bys that rollup can't serve.
 </sv-prose>
+
+<sv-prose id="d35">
+## Build log 19 — bench harness, rival sweep, and the two losses fixed (2026-09-12)
+
+**Benchmarking became regression-tested.** The mask cache silently made the old `--bench` numbers warm-only (warmups prime every WHERE mask), so: `--bench` now reports **cold and warm medians** per query; `bench/queries.sql` is the canonical 14-shape suite (every shape we ever optimized); `scripts/bench.sh` compares runs against a machine-local baseline (fail at 1.5× + 0.3 ms absolute). The mask-cache budget is configurable end to end (`--mask-cache <bytes>`, JS `setMaskBudget`, wasm export; **budget 0 = disabled**, `put` refuses entries that can never fit). The SQLite differential now runs every query cold *and* mask-cached and requires both to agree.
+
+**Rival sweep on the real dataset** (183K × 52, Ryzen 7 5800H; `spikes/native-bench/run-real.py` + wasm lanes under the same Node V8; duckdb got ILIKE/bigint tweaks): facetful-wasm beat DuckDB-WASM on **all 14 queries** — typically 3–10× cold, up to ~175× warm (`like_2col_facet` 0.5 vs 84 ms) — at ~1/40th the download and 963 ms less per-session load. SQLite native: 26–148 ms, not in contention. Multicore verdict: 16 threads bought DuckDB only 1.4–1.7× on the expensive scans and nothing on the fast shapes (pivot got *worse*) — 183K rows can't amortize morsel parallelism, so wasm's single-thread constraint costs little exactly where facetful lives.
+
+**The two native-DuckDB losses, fixed** (commit `2b9ab9a`):
+
+| shape | before | after | duckdb@16 | how |
+|---|---|---|---|---|
+| year_hist (group by int year) | 6.7 ms | **0.9 ms** | 1.0 | direct dense grouping extended to integer/date columns with small global min–max range (footer stats); `value − min` is the code, null lane as in dict dims |
+| topk (top-100 by capacity, text cols) | 12.0 ms | **1.4 ms** | 5.0 | winner phase sliced whole text lanes up to the deepest winner (~the entire 6.5 MB name blob for 100 rows); direct plain-text selects now gather per winner row off the borrowed segments |
+
+facetful now leads every canonical shape against every rival lane, native and wasm. 61 tests + both differentials green; wasm 179 KB gz (58%).
+</sv-prose>
