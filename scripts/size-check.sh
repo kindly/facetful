@@ -11,8 +11,10 @@ WASM=target/wasm32-unknown-unknown/release/facetful_wasm.wasm
 
 if command -v wasm-opt >/dev/null 2>&1; then
     # -O3, not -Oz: size-first reoptimization would undo the speed the
-    # opt-level=3 build paid 15KB for
-    wasm-opt -O3 --enable-simd "$WASM" -o "$WASM.opt"
+    # opt-level=3 build paid 15KB for. Feature flags must cover what rustc
+    # emits (bulk memory + trunc_sat since LLVM 20 defaults).
+    wasm-opt -O3 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int \
+        "$WASM" -o "$WASM.opt"
     WASM="$WASM.opt"
 else
     echo "note: wasm-opt not found — measuring unoptimized build (CI uses wasm-opt)"
