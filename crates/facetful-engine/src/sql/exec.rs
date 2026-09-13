@@ -837,8 +837,16 @@ fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
             }
             VV { data: Data::Bool(Rc::new(out)), valid }
         }
-        "coalesce" => {
-            let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+        "coalesce" | "ifnull" => {
+            let first = eval_vec(&args[0], ctx);
+            // A nullable column can still be all-present in this row group.
+            // Keep its native vector (including dictionary codes) in that case.
+            if first.valid.is_none() && !matches!(first.data, Data::Const(Val::Null)) {
+                return first;
+            }
+            let items: Vec<VV> = std::iter::once(first)
+                .chain(args[1..].iter().map(|a| eval_vec(a, ctx)))
+                .collect();
             lanes_to_vv(rows, ty, |i| {
                 items.iter().find(|v| v.is_valid(i)).map(|v| lane_val(v, i)).unwrap_or(Val::Null)
             })
@@ -1419,6 +1427,8 @@ fn scalar_fn(name: &str, mut args: Vec<Val>) -> Val {
 
 enum AggAcc {
     Count(Vec<i64>),
+    /// One bitmap per SQL group; dictionary codes are file-global.
+    DistinctCodes { bits: Vec<Vec<u64>>, words: usize },
     DistinctNum(Vec<std::collections::HashSet<u64>>),
     DistinctStr(Vec<std::collections::HashSet<VStr>>),
     SumI { v: Vec<i64>, any: Vec<bool> },
@@ -1442,14 +1452,16 @@ enum RowsSrc<'a> {
 }
 
 impl AggAcc {
-    /// `arg_is_dict`: the argument is a dictionary column (distinct on codes).
-    fn new(call: &Bound, arg_is_dict: bool) -> AggAcc {
+    /// `dict_len`: cardinality when the argument is a direct dictionary column.
+    fn new(call: &Bound, dict_len: Option<usize>) -> AggAcc {
         let Bound::Call { func, args, .. } = call else { unreachable!() };
         let aty = args[0].ty();
         match func.name {
             "count" => AggAcc::Count(Vec::new()),
             "count_distinct" => {
-                if arg_is_dict || matches!(aty, Ty::Int | Ty::Float | Ty::Bool | Ty::Date | Ty::Timestamp) {
+                if let Some(len) = dict_len {
+                    AggAcc::DistinctCodes { bits: Vec::new(), words: (len + 63) / 64 }
+                } else if matches!(aty, Ty::Int | Ty::Float | Ty::Bool | Ty::Date | Ty::Timestamp) {
                     AggAcc::DistinctNum(Vec::new())
                 } else {
                     AggAcc::DistinctStr(Vec::new())
@@ -1490,8 +1502,28 @@ impl AggAcc {
         }
     }
     fn grow(&mut self, n: usize) {
+        // Dense bitmaps win for few groups, but a large dictionary crossed
+        // with many tiny groups would waste memory. Cap them at 8 MiB per
+        // aggregate, then retain only observed codes in the sparse fallback.
+        if let AggAcc::DistinctCodes { bits, words } = self {
+            if n > (1 << 20) / (*words).max(1) {
+                let sets = bits.iter().map(|bitmap| {
+                    let mut set = std::collections::HashSet::new();
+                    for (word_index, &word) in bitmap.iter().enumerate() {
+                        let mut remaining = word;
+                        while remaining != 0 {
+                            set.insert((word_index * 64 + remaining.trailing_zeros() as usize) as u64);
+                            remaining &= remaining - 1;
+                        }
+                    }
+                    set
+                }).collect();
+                *self = AggAcc::DistinctNum(sets);
+            }
+        }
         match self {
             AggAcc::Count(v) => v.resize(n, 0),
+            AggAcc::DistinctCodes { bits, words } => bits.resize_with(n, || vec![0; *words]),
             AggAcc::DistinctNum(v) => v.resize_with(n, Default::default),
             AggAcc::DistinctStr(v) => v.resize_with(n, Default::default),
             AggAcc::SumI { v, any } => {
@@ -1643,8 +1675,25 @@ impl AggAcc {
                     }
                 });
             }
-            (AggAcc::DistinctNum(sets), Data::Codes { codes, .. }) => for_kept!(|i, g| {
-                if arg.is_valid(i) {
+            (AggAcc::DistinctCodes { bits, .. }, Data::Codes { codes, dict }) => match &arg.valid {
+                None => for_kept!(|i, g| {
+                    let code = codes[i] as usize;
+                    // Invalid codes are NULL, including codes in bitmap padding.
+                    if code < dict.len() {
+                        bits[g][code / 64] |= 1u64 << (code % 64);
+                    }
+                }),
+                Some(vb) => for_kept!(|i, g| {
+                    if vb[i / 8] >> (i % 8) & 1 != 0 {
+                        let code = codes[i] as usize;
+                        if code < dict.len() {
+                            bits[g][code / 64] |= 1u64 << (code % 64);
+                        }
+                    }
+                }),
+            },
+            (AggAcc::DistinctNum(sets), Data::Codes { codes, dict }) => for_kept!(|i, g| {
+                if arg.is_valid(i) && (codes[i] as usize) < dict.len() {
                     sets[g].insert(codes[i] as u64);
                 }
             }),
@@ -1744,7 +1793,8 @@ impl AggAcc {
                         }
                         AggAcc::Count(c) => c[g] += 1,
                         // these have shape-generic arms above the fallback
-                        AggAcc::DistinctStr(_)
+                        AggAcc::DistinctCodes { .. }
+                        | AggAcc::DistinctStr(_)
                         | AggAcc::Median(_)
                         | AggAcc::Stddev { .. }
                         | AggAcc::GroupConcat { .. } => unreachable!(),
@@ -1757,6 +1807,9 @@ impl AggAcc {
     fn finish(&self, gid: usize) -> Val {
         match self {
             AggAcc::Count(v) => Val::Int(v[gid]),
+            AggAcc::DistinctCodes { bits, .. } => {
+                Val::Int(bits[gid].iter().map(|word| word.count_ones() as i64).sum())
+            }
             AggAcc::DistinctNum(v) => Val::Int(v[gid].len() as i64),
             AggAcc::DistinctStr(v) => Val::Int(v[gid].len() as i64),
             AggAcc::SumI { v, any } => {
@@ -2332,12 +2385,113 @@ fn direct_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<Di
     Some(DirectGroups { cols, dims, cards, dense: vec![-1; product] })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distinct_bitmap_memory_cap_preserves_codes_on_sparse_fallback() {
+        let mut acc = AggAcc::DistinctCodes { bits: Vec::new(), words: 1024 };
+        acc.grow(2);
+        // Only cardinality matters here; this accumulator never decodes text.
+        let dict = Rc::new(vec![Rc::new(String::new()); 65535]);
+        let codes = |values| VV::all_valid(Data::Codes {
+            codes: Rc::new(values),
+            dict: dict.clone(),
+        });
+        acc.update_batch(RowsSrc::Gids(&[0, 0, 1, 1]), &codes(vec![63, 63, 65534, 65535]));
+        // Crossing the cap must preserve existing groups and allow new ones.
+        acc.grow(1025);
+        assert!(matches!(acc, AggAcc::DistinctNum(_)));
+        acc.update_batch(RowsSrc::Gids(&[0, 0, 1, 1024, 1024]), &codes(vec![63, 64, 65534, 0, 65535]));
+        assert_eq!(acc.finish(0), Val::Int(2));
+        assert_eq!(acc.finish(1), Val::Int(1));
+        assert_eq!(acc.finish(2), Val::Int(0));
+        assert_eq!(acc.finish(1024), Val::Int(1));
+    }
+}
+
 // ---------------- execute ----------------
+
+/// Fold before column collection and planning, so predicates, grouping and
+/// aggregate arguments can use the same fast paths as a bare column. Schema
+/// flags alone are insufficient: every row group's null count must be zero.
+fn fold_nonnull<'a>(expr: &'a Bound, cat: &crate::format::Catalog) -> std::borrow::Cow<'a, Bound> {
+    use std::borrow::Cow;
+    let mut out = Cow::Borrowed(expr);
+    match expr {
+        Bound::Call { args, .. } => {
+            for (i, arg) in args.iter().enumerate() {
+                if let Cow::Owned(folded) = fold_nonnull(arg, cat) {
+                    let Bound::Call { args, .. } = out.to_mut() else { unreachable!() };
+                    args[i] = folded;
+                }
+            }
+        }
+        Bound::Unary { expr, .. } => {
+            if let Cow::Owned(folded) = fold_nonnull(expr, cat) {
+                let Bound::Unary { expr, .. } = out.to_mut() else { unreachable!() };
+                **expr = folded;
+            }
+        }
+        Bound::Binary { lhs, rhs, .. } => {
+            let left = fold_nonnull(lhs, cat);
+            let right = fold_nonnull(rhs, cat);
+            if matches!(left, Cow::Owned(_)) || matches!(right, Cow::Owned(_)) {
+                let Bound::Binary { lhs, rhs, .. } = out.to_mut() else { unreachable!() };
+                **lhs = left.into_owned();
+                **rhs = right.into_owned();
+            }
+        }
+        _ => {}
+    }
+    if let Bound::Call { func, args, ty } = out.as_ref() {
+        if matches!(func.name, "coalesce" | "ifnull") {
+            if let Bound::Column { index, ty: col_ty } = &args[0] {
+                if ty == col_ty && cat.groups.iter().all(|g| g.cols[*index].null_count == 0) {
+                    return Cow::Owned(args[0].clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn fold_query<'a>(
+    q: &'a super::binder::BoundQuery,
+    cat: &crate::format::Catalog,
+) -> std::borrow::Cow<'a, super::binder::BoundQuery> {
+    use std::borrow::Cow;
+    let mut out = Cow::Borrowed(q);
+    for (i, s) in q.select.iter().enumerate() {
+        if let Cow::Owned(expr) = fold_nonnull(&s.expr, cat) {
+            out.to_mut().select[i].expr = expr;
+        }
+    }
+    if let Some(f) = &q.filter {
+        if let Cow::Owned(expr) = fold_nonnull(f, cat) {
+            out.to_mut().filter = Some(expr);
+        }
+    }
+    for (i, g) in q.group_by.iter().enumerate() {
+        if let Cow::Owned(expr) = fold_nonnull(g, cat) {
+            out.to_mut().group_by[i] = expr;
+        }
+    }
+    for (i, (e, _)) in q.order_by.iter().enumerate() {
+        if let Cow::Owned(expr) = fold_nonnull(e, cat) {
+            out.to_mut().order_by[i].0 = expr;
+        }
+    }
+    out
+}
 
 pub fn execute<S: ReadAt>(
     table: &mut Table<S>,
     q: &super::binder::BoundQuery,
 ) -> Result<QueryResult, FormatError> {
+    let folded = fold_query(q, table.catalog());
+    let q = folded.as_ref();
     let columns: Vec<String> = q.select.iter().map(|s| s.name.clone()).collect();
 
     let mut needed = Vec::new();
@@ -2381,13 +2535,13 @@ pub fn execute<S: ReadAt>(
     let mut direct = if q.is_aggregate { direct_plan(table, &q.group_by) } else { None };
     let mut hash_groups: HashMap<Vec<Val>, usize> = HashMap::new();
     let mut group_keys: Vec<Vec<Val>> = Vec::new();
-    let arg_is_dict = |call: &Bound| -> bool {
-        let Bound::Call { args, .. } = call else { return false };
-        matches!(&args[0], Bound::Column { index, .. }
-            if table.catalog().schema.columns[*index].is_dict())
+    let arg_dict_len = |call: &Bound| -> Option<usize> {
+        let Bound::Call { args, .. } = call else { return None };
+        let Bound::Column { index, .. } = &args[0] else { return None };
+        dicts.get(index).map(|dict| dict.len())
     };
     let mut accs: Vec<AggAcc> =
-        agg_calls.iter().map(|c| AggAcc::new(c, arg_is_dict(c))).collect();
+        agg_calls.iter().map(|c| AggAcc::new(c, arg_dict_len(c))).collect();
     let mut n_groups = 0usize;
 
     let sel_tys: Vec<Ty> = q.select.iter().map(|s| s.expr.ty()).collect();

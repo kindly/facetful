@@ -131,6 +131,115 @@ fn count_distinct_and_case() {
 }
 
 #[test]
+fn nonnull_coalesce_preserves_column_planning() {
+    let mut t = table();
+    // Folding must happen before pruning, not just inside vector evaluation.
+    let r = run_query(&mut t, "select count(*) from t where coalesce(year, 0) > 9000").unwrap();
+    assert_eq!(r.scanned_groups, 0);
+    assert_eq!(r.rows, vec![vec![Val::Int(0)]]);
+    for (wrapped, bare) in [
+        ("select coalesce(region, 'other') from t order by coalesce(region, 'other') limit 3",
+         "select region from t order by region limit 3"),
+        ("select coalesce(region, 'other'), count(distinct coalesce(year, 0)) from t group by coalesce(region, 'other') order by coalesce(region, 'other')",
+         "select region, count(distinct year) from t group by region order by region"),
+        ("select count(distinct coalesce(coalesce(region, 'other'), 'last')) from t where coalesce(year, 0) + 1 > 2002",
+         "select count(distinct region) from t where year + 1 > 2002"),
+        ("select -ifnull(year, 0), ifnull(region, 'other') from t limit 3",
+         "select -year, region from t limit 3"),
+    ] {
+        assert_eq!(qt(&mut t, wrapped), qt(&mut t, bare), "{wrapped}");
+    }
+    // One chunk has nulls and the other doesn't: only the latter can bypass
+    // lane evaluation. Both fallback functions must still replace the null.
+    assert_eq!(q("select sum(coalesce(capacity, 5)), sum(ifnull(capacity, 5)) from t"),
+               vec![vec!["55.0", "55.0"]]);
+    assert_eq!(q("select coalesce(null, 'fallback') from t limit 1"),
+               vec![vec!["fallback"]]);
+}
+
+#[test]
+fn dictionary_distinct_bitmaps_across_groups_filters_and_nulls() {
+    for wide in [false, true] {
+        let cardinality = if wide { 65536 } else { 256 };
+        let top = (cardinality - 1) as u16;
+        let mut offsets = vec![0];
+        let mut bytes = Vec::new();
+        for i in 0..cardinality {
+            bytes.extend_from_slice(format!("value_{i}").as_bytes());
+            offsets.push(bytes.len() as u32);
+        }
+        let schema = Schema { columns: vec![
+            ColumnDef { name: "label".into(), ty: ColumnType::Utf8,
+                        flags: flags::DICTIONARY | if wide { 0 } else { flags::CODES_U8 } },
+            ColumnDef { name: "bucket".into(), ty: ColumnType::Int8, flags: 0 },
+        ] };
+        let dicts = vec![Some(DictData { offsets, bytes }), None];
+        let mut w = Writer::new(schema, vec![], 9, &dicts);
+        let groups = [
+            ([0, 63, 64, 127, 128, top, top, 0, 0], None),
+            ([top, 0, 64, 1, 1, 63, 2, 2, top], Some([0b0011_1111, 1])),
+        ];
+        let buckets = [0u8, 0, 1, 1, 0, 1, 1, 0, 2];
+        for (codes, valid) in &groups {
+            let narrow: Vec<u8> = codes.iter().map(|&c| c as u8).collect();
+            w.write_group(9, &[
+                ColumnChunk {
+                    data: if wide { SegmentData::Codes16(codes) } else { SegmentData::Codes8(&narrow) },
+                    validity: valid.as_ref().map(|v| v.as_slice()),
+                    null_count: if valid.is_some() { 2 } else { 0 },
+                },
+                ColumnChunk { data: SegmentData::Fixed(&buckets), validity: None, null_count: 0 },
+            ]);
+        }
+        let mut t = Table::open(w.finish()).unwrap();
+        assert_eq!(qt(&mut t, "select count(distinct label) from t"), vec![vec!["7"]]);
+        assert_eq!(qt(&mut t, "select count(distinct label) from t where bucket = 0"), vec![vec!["5"]]);
+        assert_eq!(qt(&mut t, "select count(distinct label) from t where label is null"), vec![vec!["0"]]);
+        assert_eq!(qt(&mut t, "select count(distinct label) from t where bucket > 9"), vec![vec!["0"]]);
+        assert_eq!(qt(&mut t, "select bucket, count(distinct label) from t group by bucket order by bucket"),
+                   vec![vec!["0", "5"], vec!["1", "5"], vec!["2", "2"]]);
+        // Nulls occur only in the second chunk; metadata folding must retain
+        // the fallback, even though the first chunk returns dictionary codes.
+        assert_eq!(qt(&mut t, "select count(distinct coalesce(label, 'missing')) from t"), vec![vec!["8"]]);
+        // Computed text still deduplicates values, never codes from a source
+        // dictionary whose entries the expression could collapse together.
+        assert_eq!(qt(&mut t, "select count(distinct substr(label, 1, 5)) from t"), vec![vec!["1"]]);
+    }
+}
+
+#[test]
+fn dictionary_distinct_ignores_out_of_range_codes() {
+    for wide in [false, true] {
+        for nullable in [false, true] {
+            let schema = Schema { columns: vec![
+                ColumnDef { name: "label".into(), ty: ColumnType::Utf8,
+                            flags: flags::DICTIONARY | if wide { 0 } else { flags::CODES_U8 } },
+                ColumnDef { name: "bucket".into(), ty: ColumnType::Int8, flags: 0 },
+            ] };
+            let dicts = vec![Some(DictData { offsets: vec![0, 1, 2, 3], bytes: b"abc".to_vec() }), None];
+            let mut w = Writer::new(schema, vec![], 8, &dicts);
+            // 90/200 exceed the bitmap allocation; 3/63 fall in its padding.
+            let codes = [0u16, 1, 90, 200, 3, 63, 2, 0];
+            let narrow: Vec<u8> = codes.iter().map(|&c| c as u8).collect();
+            w.write_group(8, &[
+                ColumnChunk {
+                    data: if wide { SegmentData::Codes16(&codes) } else { SegmentData::Codes8(&narrow) },
+                    validity: if nullable { Some(&[0b1011_1111]) } else { None },
+                    null_count: if nullable { 1 } else { 0 },
+                },
+                ColumnChunk { data: SegmentData::Fixed(&[0, 0, 1, 1, 1, 1, 0, 0]), validity: None, null_count: 0 },
+            ]);
+            let mut t = Table::open(w.finish()).unwrap();
+            let expected = if nullable { "2" } else { "3" };
+            assert_eq!(qt(&mut t, "select count(distinct label) from t"), vec![vec![expected]]);
+            assert_eq!(qt(&mut t, "select count(distinct label) from t where bucket = 1"), vec![vec!["0"]]);
+            assert_eq!(qt(&mut t, "select bucket, count(distinct label) from t group by bucket order by bucket"),
+                       vec![vec!["0", expected], vec!["1", "0"]]);
+        }
+    }
+}
+
+#[test]
 fn scalar_functions_and_expressions() {
     let rows = q("select upper(region) || '-' || text(year) as tag from t \
                   where like(region, 'e%') and year = 2000 order by 1");
