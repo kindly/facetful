@@ -1,50 +1,35 @@
 # facetful
 
-A tiny, read-only, columnar SQL engine for the browser — Rust compiled to
-~170 KB gz of WebAssembly, zero runtime dependencies, running in a dedicated
-worker. Publish data files on any static host; do the analytics at the user,
-with no server.
+A read-only, columnar SQL engine for the browser, written in Rust and
+compiled to WebAssembly. Queries run locally in a dedicated worker over
+data files that can be served from a static host, without a database server.
 
-Built for one job and fast at it: **faceted exploration of 100K–5M row
-datasets** — facet counts, pivots, top-k, filters — at interaction speed.
-
-Measured on a real 183,125 × 52 dataset (native / in-browser):
-
-| | |
-|---|---|
-| facet refresh (counts + sums per dimension) | ~1 ms |
-| two-dimension pivot | ~4 ms |
-| top-100 of the whole filtered set, any sort column | ~2–5 ms |
-| case-insensitive substring search across 3 columns | ~8 ms |
-| open Parquet, first visit | seconds (transcode once, cached in OPFS) |
-| open Parquet, every visit after | **~20–40 ms, zero decode** |
-
-Against the incumbents at 1M rows: ahead of single-threaded DuckDB on 7 of 9
-benchmark queries (facet counts 3 ms vs 14), at ~2% of DuckDB-WASM's download
-size; ahead of SQLite on all 9.
+The focus is faceted exploration: filtering a dataset, counting categories,
+building pivots and selecting top results. The storage format and executor
+are designed around repeated queries over immutable datasets.
 
 ## How
 
-- **Zero-decode format**: `.facetful` files are compiled images — the on-disk
+- **Columnar format**: `.facetful` files are compiled images — the on-disk
   segment layout *is* the in-memory execution layout. Opening a table reads a
   footer; column segments load lazily. Dictionary-encoded strings execute as
   integer scans (predicates like `LIKE`/`IN`/`=` evaluate once per distinct
   value, not once per row).
 - **Filter-mask cache**: each WHERE conjunct's row bitmap is cached per row
   group (LRU, 16 MB). A burst of facet queries sharing a filter evaluates it
-  once; a `LIKE '%needle%'` that extends a cached needle verifies only the
-  rows the shorter one matched, so search-as-you-type costs a fraction per
-  keystroke instead of a blob scan.
-- **Parquet is the public contract**: `openParquet()` transcodes once in the
+  once while the mask remains cached. A `LIKE '%needle%'` that extends a
+  cached needle verifies only the rows the shorter one matched.
+- **Parquet input**: `openParquet()` transcodes in the
   browser (hyparquet + the same Rust compiler the CLI uses), caches the image
-  in OPFS keyed by content hash, and reopens it instantly forever after.
-- **Larger than memory**: tables can live in OPFS and stream segments through
-  a byte-budgeted LRU cache (~2 GB/s through the sync-access-handle path).
-- **SELECT-only SQL, SQLite semantics**, verified cell-for-cell against
-  SQLite by a differential test suite. Hand-rolled lexer/parser with caret
-  diagnostics and did-you-mean hints. Dates, `median`/`stddev`/`group_concat`,
-  `select *`, SIMD substring search — the boring things work.
-- **100% safe Rust** in the executor (`unsafe` only at the wasm FFI edge);
+  in OPFS keyed by content hash, and reuses that image on subsequent opens
+  while it remains cached.
+- **OPFS storage**: tables can live in OPFS and load segments through
+  a byte-budgeted LRU cache, limiting how much source data stays in memory.
+- **SELECT-only SQL** with SQLite-compatible semantics for the supported
+  query subset, checked by a differential test suite. Includes caret
+  diagnostics, did-you-mean hints, dates, `median`/`stddev`/`group_concat`,
+  `select *` and SIMD substring search.
+- **Safe Rust** in the executor (`unsafe` only at the wasm FFI edge);
   the wasm SIMD128 kernels use the safe intrinsics.
 
 ## Quickstart (browser)
@@ -110,9 +95,22 @@ facetful and SQLite must agree cell-for-cell, and a Parquet file pushed
 through the browser transcoder must answer identically to the CLI-built
 image.
 
+## Performance testing
+
+The [benchmark suite](bench/queries.sql) covers filters, grouping, sorting,
+text search and projection. The CLI's `--bench` mode reports cold and warm
+WHERE-mask timings: cold runs clear the filter cache before each query;
+warm runs reuse cached masks. Data and dictionaries stay resident in both
+modes, so these measurements do not include initial loading.
+
+Performance varies with query shape, data distribution, result size and
+runtime. The [benchmark script](scripts/bench.sh) compares runs against a
+local baseline; the [design notes](docs/design.sv) record measurements and
+the reasoning behind optimizations.
+
 ## Status
 
-Working and measured: format, vectorized engine, SQL layer, wasm/JS package,
+Implemented: format, vectorized engine, SQL layer, wasm/JS package,
 OPFS spill-over, Parquet ingest with caching, temporal columns, SIMD text
 search. Designed but deliberately not built (recorded in `docs/design.sv`):
 HTTP-range reads + per-segment compression (one package, awaiting a workload
