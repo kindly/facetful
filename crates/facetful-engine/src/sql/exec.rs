@@ -1425,12 +1425,201 @@ fn scalar_fn(name: &str, mut args: Vec<Val>) -> Val {
 
 // ---------------- aggregation ----------------
 
+/// Drops a value identical to the one its group saw on the previous row it
+/// kept. A pure filter in front of an exact accumulator: it can only skip a
+/// genuine repeat, so it is correct under any row order, and only its hit rate
+/// depends on the layout. Images are usually written in key order (a plant's
+/// rows contiguous), and then it turns the per-row cost of a distinct count
+/// into a per-(group, value) one.
+///
+/// It sits in front of the hash paths only. Guarding a bitmap set with it is a
+/// loss even when it hits: the load-compare-store chain through one group's
+/// slot is a longer dependency than the `or` it saves.
+#[derive(Default)]
+struct LastSeen {
+    v: Vec<u64>,
+    seen: Vec<bool>,
+}
+
+impl LastSeen {
+    fn grow(&mut self, n: usize) {
+        self.v.resize(n, 0);
+        self.seen.resize(n, false);
+    }
+    #[inline]
+    fn repeat(&mut self, g: usize, v: u64) -> bool {
+        if self.seen[g] && self.v[g] == v {
+            return true;
+        }
+        self.v[g] = v;
+        self.seen[g] = true;
+        false
+    }
+}
+
+/// `g == EMPTY` marks a free slot. `for_kept` already skips `u32::MAX` group
+/// ids, so no live group can collide with the sentinel.
+#[derive(Clone, Copy)]
+struct Slot {
+    v: u64,
+    g: u32,
+}
+
+const EMPTY: u32 = u32::MAX;
+
+/// Distinct `u64` values per group: ONE open-addressed table keyed by
+/// (group, value) rather than a hash set per group — a single allocation, no
+/// per-group indirection, linear probing, and a multiply-shift hash, since
+/// SipHash's quality buys nothing on an integer key and costs more than the
+/// probe it guards. Fronted by [`LastSeen`].
+struct DistinctU64 {
+    slots: Vec<Slot>,
+    /// `slots.len() - 1`; probes wrap with it.
+    mask: usize,
+    /// `64 - log2(slots.len())`; the index is the hash's top bits.
+    shift: u32,
+    used: usize,
+    counts: Vec<i64>,
+    last: LastSeen,
+}
+
+impl DistinctU64 {
+    fn new() -> DistinctU64 {
+        DistinctU64 {
+            slots: Vec::new(),
+            mask: 0,
+            shift: 0,
+            used: 0,
+            counts: Vec::new(),
+            last: LastSeen::default(),
+        }
+    }
+    fn grow(&mut self, n: usize) {
+        self.counts.resize(n, 0);
+        self.last.grow(n);
+    }
+    /// A product bit depends only on input bits at or below it, so the index
+    /// has to come from the TOP of the product, and the high half of `v` has
+    /// to be folded down first — otherwise doubles such as 50.0 / 100.0 /
+    /// 200.0, which differ only in exponent and top mantissa bits, all land
+    /// in one probe chain. Only valid once `resize` has run.
+    #[inline]
+    fn index(&self, g: u32, v: u64) -> usize {
+        let mut h = v ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 32;
+        h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        (h >> self.shift) as usize
+    }
+    /// Counts `v` for group `g` unless that group already holds it.
+    #[inline]
+    fn insert(&mut self, g: usize, v: u64) {
+        if !self.last.repeat(g, v) {
+            self.insert_unfiltered(g as u32, v);
+        }
+    }
+    /// The same insert without the last-seen filter, for bulk loads where the
+    /// filter state belongs to the accumulator being replaced.
+    fn insert_unfiltered(&mut self, g: u32, v: u64) {
+        if (self.used + 1) * 4 >= self.slots.len() * 3 {
+            self.resize();
+        }
+        let mut i = self.index(g, v);
+        loop {
+            let slot = self.slots[i];
+            if slot.g == EMPTY {
+                self.slots[i] = Slot { v, g };
+                self.used += 1;
+                self.counts[g as usize] += 1;
+                return;
+            }
+            if slot.g == g && slot.v == v {
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn resize(&mut self) {
+        // 4x while small: rehashing dominates a mid-sized distinct count and
+        // every reinsert is a cache miss, so reaching 64K slots in three hops
+        // rather than six is a measured third of the work. Past that, 2x —
+        // the 16-byte slot would otherwise sit at ~20% load on big counts.
+        let len = self.slots.len();
+        let cap = if len < 1 << 16 { (len * 4).max(1024) } else { len * 2 };
+        let old = std::mem::replace(&mut self.slots, vec![Slot { v: 0, g: EMPTY }; cap]);
+        self.mask = cap - 1;
+        // u64, not usize: the hash is 64-bit on wasm32 too
+        self.shift = (cap as u64).leading_zeros() + 1;
+        for slot in old {
+            if slot.g != EMPTY {
+                let mut i = self.index(slot.g, slot.v);
+                while self.slots[i].g != EMPTY {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = slot;
+            }
+        }
+    }
+}
+
+/// Multiply-xor hashing for the text distinct set — same reasoning as
+/// [`DistinctU64`], applied to the one distinct path that still needs a map.
+#[derive(Default, Clone, Copy)]
+struct FxBuild;
+
+#[derive(Default)]
+struct FxHasher {
+    h: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.h = (self.h.rotate_left(5) ^ w).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(buf));
+        }
+        self.add(bytes.len() as u64);
+    }
+    #[inline]
+    fn write_u8(&mut self, b: u8) {
+        self.add(b as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.h
+    }
+}
+
+impl std::hash::BuildHasher for FxBuild {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher::default()
+    }
+}
+
 enum AggAcc {
     Count(Vec<i64>),
     /// One bitmap per SQL group; dictionary codes are file-global.
     DistinctCodes { bits: Vec<Vec<u64>>, words: usize },
-    DistinctNum(Vec<std::collections::HashSet<u64>>),
-    DistinctStr(Vec<std::collections::HashSet<VStr>>),
+    /// Boxed: inline it and `AggAcc` grows by half, which measurably slows the
+    /// bitmap arms sharing this match.
+    DistinctNum(Box<DistinctU64>),
+    DistinctStr { sets: Vec<std::collections::HashSet<VStr, FxBuild>>, last: Vec<Option<VStr>> },
     SumI { v: Vec<i64>, any: Vec<bool> },
     SumF { v: Vec<f64>, any: Vec<bool> },
     Avg { sum: Vec<f64>, n: Vec<i64> },
@@ -1462,9 +1651,9 @@ impl AggAcc {
                 if let Some(len) = dict_len {
                     AggAcc::DistinctCodes { bits: Vec::new(), words: (len + 63) / 64 }
                 } else if matches!(aty, Ty::Int | Ty::Float | Ty::Bool | Ty::Date | Ty::Timestamp) {
-                    AggAcc::DistinctNum(Vec::new())
+                    AggAcc::DistinctNum(Box::new(DistinctU64::new()))
                 } else {
-                    AggAcc::DistinctStr(Vec::new())
+                    AggAcc::DistinctStr { sets: Vec::new(), last: Vec::new() }
                 }
             }
             "sum" => {
@@ -1507,25 +1696,29 @@ impl AggAcc {
         // aggregate, then retain only observed codes in the sparse fallback.
         if let AggAcc::DistinctCodes { bits, words } = self {
             if n > (1 << 20) / (*words).max(1) {
-                let sets = bits.iter().map(|bitmap| {
-                    let mut set = std::collections::HashSet::new();
+                let mut set = DistinctU64::new();
+                set.grow(bits.len());
+                for (g, bitmap) in bits.iter().enumerate() {
                     for (word_index, &word) in bitmap.iter().enumerate() {
                         let mut remaining = word;
                         while remaining != 0 {
-                            set.insert((word_index * 64 + remaining.trailing_zeros() as usize) as u64);
+                            let code = word_index * 64 + remaining.trailing_zeros() as usize;
+                            set.insert_unfiltered(g as u32, code as u64);
                             remaining &= remaining - 1;
                         }
                     }
-                    set
-                }).collect();
-                *self = AggAcc::DistinctNum(sets);
+                }
+                *self = AggAcc::DistinctNum(Box::new(set));
             }
         }
         match self {
             AggAcc::Count(v) => v.resize(n, 0),
             AggAcc::DistinctCodes { bits, words } => bits.resize_with(n, || vec![0; *words]),
-            AggAcc::DistinctNum(v) => v.resize_with(n, Default::default),
-            AggAcc::DistinctStr(v) => v.resize_with(n, Default::default),
+            AggAcc::DistinctNum(v) => v.grow(n),
+            AggAcc::DistinctStr { sets, last } => {
+                sets.resize_with(n, Default::default);
+                last.resize(n, None);
+            }
             AggAcc::SumI { v, any } => {
                 v.resize(n, 0);
                 any.resize(n, false);
@@ -1694,21 +1887,30 @@ impl AggAcc {
             },
             (AggAcc::DistinctNum(sets), Data::Codes { codes, dict }) => for_kept!(|i, g| {
                 if arg.is_valid(i) && (codes[i] as usize) < dict.len() {
-                    sets[g].insert(codes[i] as u64);
+                    sets.insert(g, codes[i] as u64);
                 }
             }),
             (AggAcc::DistinctNum(sets), Data::I64(x)) => for_kept!(|i, g| {
                 if arg.is_valid(i) {
-                    sets[g].insert(x[i] as u64);
+                    sets.insert(g, x[i] as u64);
                 }
             }),
             (AggAcc::DistinctNum(sets), Data::F64(x)) => for_kept!(|i, g| {
                 if arg.is_valid(i) {
-                    sets[g].insert(x[i].to_bits());
+                    sets.insert(g, x[i].to_bits());
                 }
             }),
-            (AggAcc::DistinctStr(sets), _) => for_kept!(|i, g| {
+            (AggAcc::DistinctStr { sets, last }, _) => for_kept!(|i, g| {
                 if let Some(t) = arg.text_at(i) {
+                    // dictionary lanes hand back the same Rc on every row, so
+                    // the repeat check is a pointer compare before it is a
+                    // string compare
+                    if let Some(prev) = &last[g] {
+                        if Rc::ptr_eq(prev, &t) || **prev == *t {
+                            continue;
+                        }
+                    }
+                    last[g] = Some(t.clone());
                     sets[g].insert(t);
                 }
             }),
@@ -1789,12 +1991,12 @@ impl AggAcc {
                                 Val::Bool(b) => b as u64,
                                 _ => continue,
                             };
-                            sets[g].insert(bits);
+                            sets.insert(g, bits);
                         }
                         AggAcc::Count(c) => c[g] += 1,
                         // these have shape-generic arms above the fallback
                         AggAcc::DistinctCodes { .. }
-                        | AggAcc::DistinctStr(_)
+                        | AggAcc::DistinctStr { .. }
                         | AggAcc::Median(_)
                         | AggAcc::Stddev { .. }
                         | AggAcc::GroupConcat { .. } => unreachable!(),
@@ -1810,8 +2012,8 @@ impl AggAcc {
             AggAcc::DistinctCodes { bits, .. } => {
                 Val::Int(bits[gid].iter().map(|word| word.count_ones() as i64).sum())
             }
-            AggAcc::DistinctNum(v) => Val::Int(v[gid].len() as i64),
-            AggAcc::DistinctStr(v) => Val::Int(v[gid].len() as i64),
+            AggAcc::DistinctNum(v) => Val::Int(v.counts[gid]),
+            AggAcc::DistinctStr { sets, .. } => Val::Int(sets[gid].len() as i64),
             AggAcc::SumI { v, any } => {
                 if any[gid] { Val::Int(v[gid]) } else { Val::Null }
             }
@@ -2388,6 +2590,28 @@ fn direct_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<Di
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round doubles differ only in their exponent and top mantissa bits; a
+    /// hash that draws its index from below those bits puts them all in one
+    /// probe chain (measured: 4x slower than the SipHash set it replaced).
+    #[test]
+    fn distinct_table_spreads_high_bit_keys() {
+        let mut t = DistinctU64::new();
+        t.grow(1);
+        // 0.5, 1.0, 1.5 … 2048.0: the old index put these 4096 keys on 32 slots
+        let keys: Vec<u64> = (1..=4096).map(|k| (k as f64 * 0.5).to_bits()).collect();
+        for &k in &keys {
+            t.insert(0, k);
+        }
+        assert_eq!(t.counts[0], 4096);
+        let mut hit = vec![false; t.slots.len()];
+        for &k in &keys {
+            hit[t.index(0, k)] = true;
+        }
+        let spread = hit.iter().filter(|&&h| h).count();
+        // uniform hashing of 4096 keys into 16384 slots lands on ~3600 of them
+        assert!(spread > 3000, "{spread} home slots for 4096 keys in {}", t.slots.len());
+    }
 
     #[test]
     fn distinct_bitmap_memory_cap_preserves_codes_on_sparse_fallback() {

@@ -737,3 +737,34 @@ facetful now leads every canonical shape against every rival lane, native and wa
 
 Two follow-ups closed it out (`e288d85`, `afa73cf`): David asked whether the wasm *actually* contained SIMD compares — disassembly said the sweep was widening to i64x2 (2 lanes/op); **clamping the bounds to the stored width** made it compare at i16x8 (8 lanes/op; wasm year_hist 2.7 → 1.6 cold). Then bulk-measuring duckdb@1 without its 1-ms CLI timer rounding gave its true year_hist number, **1.20 ms** — and profiling our remaining cold cost found `pack_bits` (bit-indexed RMW + branch per row) cost more than the filter eval it stored; byte-parallel packing landed year_hist at **1.11 cold / 0.93 warm — ahead of duckdb on both**. Filter-only conjuncts: 0.38 cold / 0.21 warm; in_list 0.34/0.21. Lesson recorded: verify codegen with wasm-dis, and measure rivals in bulk, not through their timers.
 </sv-prose>
+
+<sv-prose id="d36">
+## Build log 20 — count(distinct) was a SipHash floor, not a distinct-count floor (2026-09-18)
+
+**Where it came from.** The PUDL explorer (two shipped images: `generator_tech_wide` 42K rows × 17 year columns, `plant_tech_year` 231K rows) had `count(distinct plant_id_eia)` as the largest single cost in every facet query — 3.6× a plain `count(*)` on the plant table — and David's note proposed two ways out: a *clustered-column* flag detected at open time (both images are written in plant order; runs = distinct values exactly) and an *array type* collapsing to one row per plant. Reading the engine first: both distinct columns are **integers** (`gen_key` is a `dense_rank()`), ints never dictionary-encode, so neither touched the 0.3.0 bitmap path (`eadc9f8`) — they went to `DistinctNum(Vec<HashSet<u64>>)`: one `std` SipHash set per group, an insert per row, ~20–33 ns/row. The measured floor was the hasher.
+
+**What landed, in `exec.rs` (the commit carrying this entry):**
+
+1. **`LastSeen`** — per group, the value on the previous kept row; a repeat skips the accumulator. A pure filter in front of an exact structure: it can only drop a genuine duplicate, so it is correct under any row order and only its *hit rate* depends on layout. Key-ordered images (a plant's rows contiguous) turn per-row work into per-(group, value) work: plant_tech_year grouped by fuel goes from 230,891 inserts to ~21,000. This is the clustered-column idea without the file flag, the open-time pass, or the silent cliff when someone rewrites the table in another order.
+2. **`DistinctU64`** — ONE open-addressed table keyed by `(group, value)` (16-byte slot, `u32::MAX` gid as the empty sentinel since `for_kept` already skips it), linear probing, per-group counters; replaces the Vec of hash sets. 4× growth below 64K slots (rehashing dominated mid-sized counts; a measured third of the work), 2× above (memory).
+3. **`FxHasher`** for the text set — the one distinct path still needing a map — with an `Rc::ptr_eq` repeat check in front.
+
+**Two things measurement overruled.** The filter must **not** guard the dictionary bitmap: there it cost 15% on `distinct_grouped` even when it hit — the load-compare-store through one group's slot is a longer dependency chain than the `or` it saves. And `DistinctNum` is **boxed**: inline, `AggAcc` grew 80 → 112 bytes and the bitmap arms sharing the match slowed measurably.
+
+**The bug the benchmarks hid.** First version took the index from bits 32–52 of `v × FIB`. A product bit depends only on input bits at or below it, so keys whose entropy sits above bit 52 all hash alike until the table has 2^21 slots — which is exactly what *round doubles* look like (50.0 / 100.0 / 200.0 differ only in exponent and top mantissa). `count(distinct capacity_mw)` (2,356 values) went 0.61 → **2.40 ms**, 4× *slower* than the SipHash it replaced, while every int-keyed benchmark looked great because int entropy is in the low bits. Fix: fold (`h ^= h >> 32`), multiply, take the **top** bits via a stored shift — and `(cap as u64).leading_zeros()`, because `usize` is 32-bit on wasm32. Regression test: 4096 values of `k × 0.5` must spread over >3000 home slots (old index: 32). Now 0.26 ms. Lesson recorded next to the year_hist one: **a multiply-shift hash indexes from its top bits, and a hash change is tested on float keys as well as ints.**
+
+**Numbers** (wasm in Node, best of 15 warm, ms; `bench/pudl-*-distinct.sql`):
+
+| plant_tech_year (231K) | before | after | | generator_tech_wide (42K) | before | after | |
+|---|---|---|---|---|---|---|---|
+| fuel + 1 distinct | 5.55 | **2.13** | 2.6× | fuel + 2 distinct | 3.57 | **1.56** | 2.3× |
+| fuel, full facet | 6.31 | 2.82 | 2.2× | fuel, full facet | 5.77 | 4.02 | 1.4× |
+| utility + 1 distinct, top 300 | 8.25 | 4.47 | 1.8× | state + 2 distinct | 3.58 | 1.50 | 2.4× |
+| header totals, unfiltered | 5.13 | **0.79** | 6.5× | header totals, unfiltered | 3.58 | 0.86 | 4.2× |
+| year × fuel pivot | 12.21 | 9.75 | 1.3× | utility + 2 distinct, top 300 | 6.09 | 3.94 | 1.5× |
+| map, group by plant | 10.28 | 7.23 | 1.4× | technology + 2 distinct | 3.51 | 1.53 | 2.3× |
+
+Result rows byte-identical before/after on ten cross-check queries. Dictionary-bitmap suite (`null-distinct-queries.sql`, 1M rows): 1.00× on all eight in wasm (native shows +0.2 ms/1M on the ungrouped shape from code layout; not present in wasm). 1M-row unique-int distinct: 51 → 32 ms, peak RSS 58 → 85 MB — the 16-byte slot is a deliberate memory-for-locality trade. Canonical suite: no regressions. 68 tests. wasm 194 KB gz (63%).
+
+**Position on the two proposals.** The clustered flag is subsumed for scan cost; its residual value (dropping the exact structure's memory) doesn't justify a file property that can silently stop applying. The array type stays a *modelling* feature — a two-technology plant being two rows is a real wart — but its perf argument is gone: 0.48× elements is a 2× constant on a path now ~5× cheaper, and the measure doesn't collapse with the count anyway (two images, app-side merge). **Next on this path**: dense-code bitmaps for int columns from footer `Stats::Int{min,max}` (`gen_key` is 1..40,740 and near-unique, so the filter can't help it — still ~1 ms of pure probing), then a compile-time per-column distinct count so unfiltered header totals become a footer read. After that the 17-column measure sum is the floor on the wide table, exactly as the note predicted.
+</sv-prose>

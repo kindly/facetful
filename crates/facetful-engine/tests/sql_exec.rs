@@ -239,6 +239,78 @@ fn dictionary_distinct_ignores_out_of_range_codes() {
     }
 }
 
+/// The last-seen filter in front of a distinct accumulator may only drop a
+/// value the group saw on the row it kept immediately before. `eu` meets
+/// 2000, then 2002, then 2000 again, and the repeat spans two row groups.
+#[test]
+fn numeric_distinct_counts_a_returning_value_once() {
+    let mut t = table();
+    let per_region = vec![vec!["asia", "1"], vec!["eu", "3"], vec!["us", "2"]];
+    assert_eq!(
+        qt(&mut t, "select region, count(distinct year) from t group by region order by region"),
+        per_region
+    );
+    // the same shape through the text accumulator, which filters on Rc identity
+    assert_eq!(
+        qt(&mut t, "select region, count(distinct text(year)) from t group by region order by region"),
+        per_region
+    );
+    assert_eq!(qt(&mut t, "select count(distinct year), count(distinct capacity) from t"),
+               vec![vec!["5", "9"]]);
+}
+
+/// The (group, value) table has to survive its own rehashing, keep groups
+/// apart under collisions, and carry state across row groups.
+#[test]
+fn numeric_distinct_table_resizes_and_keeps_groups_apart() {
+    let schema = Schema { columns: vec![
+        ColumnDef { name: "v".into(), ty: ColumnType::Int32, flags: 0 },
+        ColumnDef { name: "bucket".into(), ty: ColumnType::Int8, flags: 0 },
+    ] };
+    let dicts = vec![None, None];
+    let mut w = Writer::new(schema, vec![], 500, &dicts);
+    // runs of three equal values (the filter fires), and a 5 that keeps
+    // returning to a group it already counted (only the table can catch it)
+    let value = |i: usize| if i % 17 == 0 { 5 } else { (((i / 3) * 37) % 301) as i32 };
+    let bucket = |i: usize| ((i / 91) % 11) as u8;
+    let null = |i: usize| i % 53 == 0;
+
+    let mut pairs: std::collections::HashSet<(u8, i32)> = std::collections::HashSet::new();
+    let mut values: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for chunk in 0..2usize {
+        let rows: Vec<usize> = (chunk * 500..chunk * 500 + 500).collect();
+        let vals: Vec<u8> = rows.iter().flat_map(|&i| value(i).to_le_bytes()).collect();
+        let buckets: Vec<u8> = rows.iter().map(|&i| bucket(i)).collect();
+        let mut validity = vec![0u8; 63];
+        let mut nulls = 0u32;
+        for (j, &i) in rows.iter().enumerate() {
+            if null(i) {
+                nulls += 1;
+            } else {
+                validity[j / 8] |= 1 << (j % 8);
+                pairs.insert((bucket(i), value(i)));
+                values.insert(value(i));
+            }
+        }
+        w.write_group(500, &[
+            ColumnChunk { data: SegmentData::Fixed(&vals), validity: Some(&validity), null_count: nulls },
+            ColumnChunk { data: SegmentData::Fixed(&buckets), validity: None, null_count: 0 },
+        ]);
+    }
+    let mut t = Table::open(w.finish()).unwrap();
+
+    let mut per_bucket = [0usize; 11];
+    for (b, _) in &pairs {
+        per_bucket[*b as usize] += 1;
+    }
+    let want: Vec<Vec<String>> = (0..11)
+        .map(|b| vec![b.to_string(), per_bucket[b].to_string()])
+        .collect();
+    assert!(pairs.len() > 64, "must outgrow the initial table: {}", pairs.len());
+    assert_eq!(qt(&mut t, "select bucket, count(distinct v) from t group by bucket order by bucket"), want);
+    assert_eq!(qt(&mut t, "select count(distinct v) from t"), vec![vec![values.len().to_string()]]);
+}
+
 #[test]
 fn scalar_functions_and_expressions() {
     let rows = q("select upper(region) || '-' || text(year) as tag from t \
