@@ -2552,6 +2552,155 @@ fn int_range<S: ReadAt>(table: &Table<S>, col: usize) -> Option<(i64, i64)> {
     r
 }
 
+/// One GROUP BY position of a `TextGroups` plan.
+enum TextDim {
+    /// dict/int column: packs into the plan's composite code
+    Packed,
+    /// plain Utf8 column: hashed and compared as bytes
+    Text(usize),
+}
+
+/// Grouping when a GROUP BY column is plain Utf8 (cardinality past the
+/// dictionary, so no codes exist). Dict/int dims pack into a composite code
+/// exactly as in `PackedGroups`; text dims hash their bytes straight off the
+/// borrowed blob. A slot holds the 64-bit key hash and a hit is verified
+/// against the group's stored key — its packed code plus byte spans in one
+/// arena — so no `Rc<String>` exists during the scan, and the group table's
+/// key lane is the arena itself, gathered as raw text.
+struct TextGroups {
+    dims: Vec<TextDim>,
+    /// the packed dims in GROUP BY order, as `PackedGroups` keeps them
+    pcols: Vec<usize>,
+    pdims: Vec<DirectDim>,
+    pcards: Vec<usize>,
+    /// `key` is the hash; `gid == EMPTY` marks a free slot
+    slots: Vec<GSlot>,
+    mask: usize,
+    shift: u32,
+    used: usize,
+    /// per group: the packed code of the non-text dims
+    codes: Vec<u64>,
+    /// per group × text dim, row-major: (start, len) into `arena`; a NULL
+    /// key is `len == u32::MAX`
+    spans: Vec<(u32, u32)>,
+    arena: Vec<u8>,
+}
+
+impl TextGroups {
+    fn n_text(&self) -> usize {
+        self.dims.iter().filter(|d| matches!(d, TextDim::Text(_))).count()
+    }
+    /// The gid of the key `(composite, texts)` whose hash is `hash`,
+    /// inserting it as `next` when unseen.
+    #[inline]
+    fn get_or_insert(
+        &mut self,
+        hash: u64,
+        composite: u64,
+        texts: &[Option<&[u8]>],
+        next: u32,
+    ) -> u32 {
+        if (self.used + 1) * 4 >= self.slots.len() * 3 {
+            self.resize();
+        }
+        let mut i = (mix64(hash) >> self.shift) as usize;
+        loop {
+            let slot = self.slots[i];
+            if slot.gid == EMPTY {
+                self.slots[i] = GSlot { key: hash, gid: next };
+                self.used += 1;
+                self.codes.push(composite);
+                for t in texts {
+                    match t {
+                        Some(b) => {
+                            let start = self.arena.len() as u32;
+                            self.arena.extend_from_slice(b);
+                            self.spans.push((start, b.len() as u32));
+                        }
+                        None => self.spans.push((0, u32::MAX)),
+                    }
+                }
+                return next;
+            }
+            if slot.key == hash && self.matches(slot.gid as usize, composite, texts) {
+                return slot.gid;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    fn matches(&self, gid: usize, composite: u64, texts: &[Option<&[u8]>]) -> bool {
+        if self.codes[gid] != composite {
+            return false;
+        }
+        let nt = texts.len();
+        texts.iter().enumerate().all(|(k, t)| {
+            let (start, len) = self.spans[gid * nt + k];
+            match *t {
+                None => len == u32::MAX,
+                Some(b) => {
+                    let (start, len) = (start as usize, len as usize);
+                    len != u32::MAX as usize
+                        && len == b.len()
+                        && &self.arena[start..start + len] == b
+                }
+            }
+        })
+    }
+    #[cold]
+    #[inline(never)]
+    fn resize(&mut self) {
+        let len = self.slots.len();
+        let cap = if len < 1 << 16 { (len * 4).max(1024) } else { len * 2 };
+        let old = std::mem::replace(&mut self.slots, vec![GSlot { key: 0, gid: EMPTY }; cap]);
+        self.mask = cap - 1;
+        self.shift = (cap as u64).leading_zeros() + 1;
+        for slot in old {
+            if slot.gid != EMPTY {
+                let mut i = (mix64(slot.key) >> self.shift) as usize;
+                while self.slots[i].gid != EMPTY {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = slot;
+            }
+        }
+    }
+}
+
+/// FNV-free byte hash for text keys: the Fx mixer over 8-byte words.
+#[inline]
+fn hash_bytes(b: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = FxHasher::default();
+    h.write(b);
+    h.finish()
+}
+
+/// A group-by dimension's dense mapping and lane count (with the null lane),
+/// if the column can be a dense dim: a dictionary column, or an integer/date
+/// column with a small global range from the footer stats.
+fn dense_dim<S: ReadAt>(table: &mut Table<S>, index: usize) -> Option<(DirectDim, usize)> {
+    let (cty, is_dict) = {
+        let def = &table.catalog().schema.columns[index];
+        (def.ty, def.is_dict())
+    };
+    if is_dict {
+        return Some((DirectDim::Dict, table.dictionary(index).ok()?.len() + 1));
+    }
+    let int_lane = matches!(
+        cty,
+        ColumnType::Int8
+            | ColumnType::Int16
+            | ColumnType::Int32
+            | ColumnType::Int64
+            | ColumnType::Date
+            | ColumnType::Timestamp
+    );
+    // narrow-range integers (years, small ids, dates) group densely too
+    let (min, max) = int_lane.then(|| int_range(table, index)).flatten()?;
+    let range = usize::try_from(max.checked_sub(min)?).ok()?.checked_add(1)?;
+    Some((DirectDim::Int { min }, range + 1))
+}
+
 /// Dense-lane budget for packed grouping; larger products go through `GroupMap`.
 const DENSE_LANES: u64 = 1 << 22;
 
@@ -2562,33 +2711,11 @@ fn packed_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<Pa
     let mut product: u64 = 1;
     for g in group_by {
         let Bound::Column { index, .. } = g else { return None };
-        let (cty, is_dict) = {
-            let def = &table.catalog().schema.columns[*index];
-            (def.ty, def.is_dict())
-        };
-        let int_lane = matches!(
-            cty,
-            ColumnType::Int8
-                | ColumnType::Int16
-                | ColumnType::Int32
-                | ColumnType::Int64
-                | ColumnType::Date
-                | ColumnType::Timestamp
-        ) && !is_dict;
-        let card = if is_dict {
-            dims.push(DirectDim::Dict);
-            table.dictionary(*index).ok()?.len() + 1 // extra lane for nulls
-        } else if let Some((min, max)) = int_lane.then(|| int_range(table, *index)).flatten() {
-            // narrow-range integers (years, small ids, dates) group densely too
-            let range = usize::try_from(max.checked_sub(min)?).ok()?.checked_add(1)?;
-            dims.push(DirectDim::Int { min });
-            range + 1 // extra lane for nulls
-        } else {
-            return None;
-        };
+        let (dim, card) = dense_dim(table, *index)?;
         // the code must fit u64; beyond that the Vec<Val> hash path takes over
         product = product.checked_mul(card as u64)?;
         cols.push(*index);
+        dims.push(dim);
         cards.push(card);
     }
     if cols.is_empty() {
@@ -2596,6 +2723,133 @@ fn packed_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<Pa
     }
     let dense = (product <= DENSE_LANES).then(|| vec![-1; product as usize]);
     Some(PackedGroups { cols, dims, cards, dense, map: GroupMap::new() })
+}
+
+/// Every GROUP BY is a direct column, at least one of them plain Utf8, the
+/// rest dense dims.
+fn text_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<TextGroups> {
+    let mut dims = Vec::new();
+    let (mut pcols, mut pdims, mut pcards) = (Vec::new(), Vec::new(), Vec::new());
+    let mut product: u64 = 1;
+    for g in group_by {
+        let Bound::Column { index, .. } = g else { return None };
+        let def = &table.catalog().schema.columns[*index];
+        if def.ty == ColumnType::Utf8 && !def.is_dict() {
+            dims.push(TextDim::Text(*index));
+            continue;
+        }
+        let (dim, card) = dense_dim(table, *index)?;
+        product = product.checked_mul(card as u64)?;
+        pcols.push(*index);
+        pdims.push(dim);
+        pcards.push(card);
+        dims.push(TextDim::Packed);
+    }
+    dims.iter().any(|d| matches!(d, TextDim::Text(_))).then(|| TextGroups {
+        dims,
+        pcols,
+        pdims,
+        pcards,
+        slots: Vec::new(),
+        mask: 0,
+        shift: 0,
+        used: 0,
+        codes: Vec::new(),
+        spans: Vec::new(),
+        arena: Vec::new(),
+    })
+}
+
+/// Raw lanes of the dense dims, hoisted out of the row loop.
+enum FastLane<'a> {
+    Codes(&'a [u16]),
+    Ints { vals: &'a [i64], min: i64 },
+}
+
+struct FastDim<'a> {
+    lane: FastLane<'a>,
+    valid: Option<&'a [u8]>,
+    card: usize,
+}
+
+fn fast_dims<'a>(code_cols: &'a [(VV, usize)], dims: &[DirectDim]) -> Vec<FastDim<'a>> {
+    code_cols
+        .iter()
+        .zip(dims)
+        .map(|((vv, card), dim)| {
+            let lane = match (&vv.data, dim) {
+                (Data::Codes { codes, .. }, DirectDim::Dict) => FastLane::Codes(codes),
+                (Data::I64(vals), DirectDim::Int { min }) => FastLane::Ints { vals, min: *min },
+                _ => unreachable!("dense dims are dict/int columns"),
+            };
+            FastDim { lane, valid: vv.valid.as_deref().map(|v| v.as_slice()), card: *card }
+        })
+        .collect()
+}
+
+/// Row `i`'s mixed-radix code over the dense dims. u64: the product may
+/// exceed usize on wasm32.
+#[inline]
+fn composite_of(fast: &[FastDim<'_>], i: usize) -> u64 {
+    let mut composite = 0u64;
+    for fd in fast {
+        let ok = fd.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
+        let code = if !ok {
+            fd.card - 1
+        } else {
+            match &fd.lane {
+                FastLane::Codes(codes) => codes[i] as usize,
+                FastLane::Ints { vals, min } => (vals[i] - min) as usize,
+            }
+        };
+        composite = composite * fd.card as u64 + code as u64;
+    }
+    composite
+}
+
+/// Group-table key lanes for packed codes: peel each group's mixed-radix
+/// code (last dimension first) into a dictionary code lane or an int lane,
+/// with the null lane as invalid. No string is touched.
+fn packed_key_lanes(
+    codes: &[u64],
+    cols: &[usize],
+    dims: &[DirectDim],
+    cards: &[usize],
+    dicts: &HashMap<usize, Rc<Vec<VStr>>>,
+) -> Vec<(GroupCol, Option<Rc<Vec<u8>>>)> {
+    let (nd, n) = (cols.len(), codes.len());
+    let mut per_dim: Vec<Vec<usize>> = vec![vec![0; n]; nd];
+    for (g, &code) in codes.iter().enumerate() {
+        let mut code = code;
+        for k in (0..nd).rev() {
+            let card = cards[k] as u64;
+            per_dim[k][g] = (code % card) as usize;
+            code /= card;
+        }
+    }
+    per_dim
+        .into_iter()
+        .enumerate()
+        .map(|(k, dim_codes)| {
+            let null_lane = cards[k] - 1;
+            let mut valid = vec![0u8; n.div_ceil(8)];
+            for (g, &c) in dim_codes.iter().enumerate() {
+                if c != null_lane {
+                    valid[g / 8] |= 1 << (g % 8);
+                }
+            }
+            let col = match dims[k] {
+                DirectDim::Dict => GroupCol::Dict {
+                    codes: Rc::new(dim_codes.iter().map(|&c| c as u16).collect()),
+                    dict: dicts[&cols[k]].clone(),
+                },
+                DirectDim::Int { min } => {
+                    GroupCol::I64(Rc::new(dim_codes.iter().map(|&c| min + c as i64).collect()))
+                }
+            };
+            (col, Some(Rc::new(valid)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2768,6 +3022,8 @@ pub fn execute<S: ReadAt>(
     };
 
     let mut direct = if q.is_aggregate { packed_plan(table, &q.group_by) } else { None };
+    let mut textg =
+        if q.is_aggregate && direct.is_none() { text_plan(table, &q.group_by) } else { None };
     let mut hash_groups: HashMap<Vec<Val>, usize> = HashMap::new();
     // one of these holds the keys: packed codes under a PackedGroups plan,
     // materialized tuples otherwise (expression keys, plain-text keys)
@@ -3083,35 +3339,7 @@ pub fn execute<S: ReadAt>(
                     .map(|(&c, &card)| (ctx.column(c), card))
                     .collect();
                 // hoist raw lanes out of the row loop
-                enum FastLane<'a> {
-                    Codes(&'a [u16]),
-                    Ints { vals: &'a [i64], min: i64 },
-                }
-                struct FastDim<'a> {
-                    lane: FastLane<'a>,
-                    valid: Option<&'a [u8]>,
-                    card: usize,
-                }
-                let fast: Vec<FastDim> = code_cols
-                    .iter()
-                    .zip(&d.dims)
-                    .map(|((vv, card), dim)| {
-                        let lane = match (&vv.data, dim) {
-                            (Data::Codes { codes, .. }, DirectDim::Dict) => {
-                                FastLane::Codes(codes)
-                            }
-                            (Data::I64(vals), DirectDim::Int { min }) => {
-                                FastLane::Ints { vals, min: *min }
-                            }
-                            _ => unreachable!("direct plan only over dict/int columns"),
-                        };
-                        FastDim {
-                            lane,
-                            valid: vv.valid.as_deref().map(|v| v.as_slice()),
-                            card: *card,
-                        }
-                    })
-                    .collect();
+                let fast = fast_dims(&code_cols, &d.dims);
                 // count(*)-only queries fuse the count into this loop —
                 // no gids vector, no second aggregation pass
                 let count_only = accs.iter().all(|a| matches!(a, AggAcc::Count(_)))
@@ -3134,20 +3362,7 @@ pub fn execute<S: ReadAt>(
                             if !kept(i) {
                                 continue;
                             }
-                            // u64: the product may exceed usize on wasm32
-                            let mut $composite = 0u64;
-                            for fd in &fast {
-                                let ok = fd.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
-                                let code = if !ok {
-                                    fd.card - 1
-                                } else {
-                                    match &fd.lane {
-                                        FastLane::Codes(codes) => codes[i] as usize,
-                                        FastLane::Ints { vals, min } => (vals[i] - min) as usize,
-                                    }
-                                };
-                                $composite = $composite * fd.card as u64 + code as u64;
-                            }
+                            let $composite = composite_of(&fast, i);
                             let gid: u32 = $lookup;
                             if gid as usize == n_groups {
                                 group_codes.push($composite);
@@ -3186,6 +3401,57 @@ pub fn execute<S: ReadAt>(
                         }
                     }
                     continue; // this group's aggregates are done
+                }
+                Some(gids)
+            } else if let Some(tg) = &mut textg {
+                let code_cols: Vec<(VV, usize)> =
+                    tg.pcols.iter().zip(&tg.pcards).map(|(&c, &card)| (ctx.column(c), card)).collect();
+                let fast = fast_dims(&code_cols, &tg.pdims);
+                // text dims: borrowed views of the blob, no strings
+                struct TextLane<'a> {
+                    offsets: &'a [u32],
+                    bytes: &'a [u8],
+                    valid: Option<&'a [u8]>,
+                }
+                let tlanes: Vec<TextLane> = tg
+                    .dims
+                    .iter()
+                    .filter_map(|d| match d {
+                        TextDim::Text(c) => Some(*c),
+                        TextDim::Packed => None,
+                    })
+                    .map(|c| match &ctx.cols[&c] {
+                        (GroupCol::Text { offsets, bytes, .. }, valid) => TextLane {
+                            offsets,
+                            bytes,
+                            valid: valid.as_deref().map(|v| v.as_slice()),
+                        },
+                        _ => unreachable!("text plan over a plain Utf8 column"),
+                    })
+                    .collect();
+                let mut texts: Vec<Option<&[u8]>> = vec![None; tlanes.len()];
+                let mut gids = vec![u32::MAX; rows];
+                for i in 0..rows {
+                    if !kept(i) {
+                        continue;
+                    }
+                    let composite = composite_of(&fast, i);
+                    let mut hash = composite.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    for (k, tl) in tlanes.iter().enumerate() {
+                        let ok = tl.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
+                        let b = ok.then(|| &tl.bytes[tl.offsets[i] as usize..tl.offsets[i + 1] as usize]);
+                        // a NULL key hashes as a constant no byte string maps to
+                        hash = mix64(hash ^ b.map_or(0x4E55_4C4C, hash_bytes));
+                        texts[k] = b;
+                    }
+                    let gid = tg.get_or_insert(hash, composite, &texts, n_groups as u32);
+                    if gid as usize == n_groups {
+                        n_groups += 1;
+                    }
+                    gids[i] = gid;
+                }
+                for a in &mut accs {
+                    a.grow(n_groups);
                 }
                 Some(gids)
             } else {
@@ -3540,44 +3806,50 @@ pub fn execute<S: ReadAt>(
             gcols.insert(base + i, (GroupCol::Ready(vv), None));
         }
         let key_base = base + agg_calls.len();
-        match &direct {
-            Some(plan) => {
-                // peel the mixed-radix code, last dimension first
-                let nd = plan.cols.len();
-                let mut per_dim: Vec<Vec<usize>> = vec![vec![0; n_groups]; nd];
-                for (g, &code) in group_codes.iter().enumerate() {
-                    let mut code = code;
-                    for k in (0..nd).rev() {
-                        let card = plan.cards[k] as u64;
-                        per_dim[k][g] = (code % card) as usize;
-                        code /= card;
-                    }
-                }
-                for (k, codes) in per_dim.into_iter().enumerate() {
-                    let null_lane = plan.cards[k] - 1;
-                    let mut valid = vec![0u8; n_groups.div_ceil(8)];
-                    for (g, &c) in codes.iter().enumerate() {
-                        if c != null_lane {
-                            valid[g / 8] |= 1 << (g % 8);
-                        }
-                    }
-                    let col = match plan.dims[k] {
-                        DirectDim::Dict => GroupCol::Dict {
-                            codes: Rc::new(codes.iter().map(|&c| c as u16).collect()),
-                            dict: dicts[&plan.cols[k]].clone(),
-                        },
-                        DirectDim::Int { min } => {
-                            GroupCol::I64(Rc::new(codes.iter().map(|&c| min + c as i64).collect()))
-                        }
-                    };
-                    gcols.insert(key_base + k, (col, Some(Rc::new(valid))));
-                }
+        if let Some(plan) = &direct {
+            let lanes = packed_key_lanes(&group_codes, &plan.cols, &plan.dims, &plan.cards, &dicts);
+            for (k, lane) in lanes.into_iter().enumerate() {
+                gcols.insert(key_base + k, lane);
             }
-            None => {
-                for (k, g_expr) in q.group_by.iter().enumerate() {
-                    let vv = lanes_to_vv(n_groups, g_expr.ty(), |g| group_keys[g][k].clone());
-                    gcols.insert(key_base + k, (GroupCol::Ready(vv), None));
-                }
+        } else if let Some(tg) = &textg {
+            let mut packed =
+                packed_key_lanes(&tg.codes, &tg.pcols, &tg.pdims, &tg.pcards, &dicts).into_iter();
+            let nt = tg.n_text();
+            let mut tk = 0;
+            for (k, dim) in tg.dims.iter().enumerate() {
+                let lane = match dim {
+                    TextDim::Packed => packed.next().unwrap(),
+                    TextDim::Text(_) => {
+                        // the arena, compacted per text dim: a raw text column
+                        let mut offsets = Vec::with_capacity(n_groups + 1);
+                        offsets.push(0u32);
+                        let mut bytes = Vec::new();
+                        let mut valid = vec![0u8; n_groups.div_ceil(8)];
+                        for g in 0..n_groups {
+                            let (start, len) = tg.spans[g * nt + tk];
+                            if len != u32::MAX {
+                                bytes.extend_from_slice(&tg.arena[start as usize..(start + len) as usize]);
+                                valid[g / 8] |= 1 << (g % 8);
+                            }
+                            offsets.push(bytes.len() as u32);
+                        }
+                        tk += 1;
+                        (
+                            GroupCol::Text {
+                                strs: std::cell::OnceCell::new(),
+                                offsets: Rc::new(offsets),
+                                bytes: Rc::new(bytes),
+                            },
+                            Some(Rc::new(valid)),
+                        )
+                    }
+                };
+                gcols.insert(key_base + k, lane);
+            }
+        } else {
+            for (k, g_expr) in q.group_by.iter().enumerate() {
+                let vv = lanes_to_vv(n_groups, g_expr.ty(), |g| group_keys[g][k].clone());
+                gcols.insert(key_base + k, (GroupCol::Ready(vv), None));
             }
         }
         let gctx = GroupCtx { cols: gcols, rows: n_groups };
@@ -3635,7 +3907,16 @@ pub fn execute<S: ReadAt>(
             .iter()
             .zip(&sel_tys)
             .map(|(sel, ty)| {
-                gather_outcol(&SelSrc::Vv(vec![eval_vec(&rewrite(&sel.expr), &gctx)]), &refs, *ty)
+                let expr = rewrite(&sel.expr);
+                // a text key selected as-is gathers off its raw lane: no
+                // Rc<String> is ever built for it
+                if let Bound::Column { index, ty: Ty::Text } = &expr {
+                    if let Some((GroupCol::Text { offsets, bytes, .. }, valid)) = gctx.cols.get(index) {
+                        let src = SelSrc::RawText(vec![(offsets.clone(), bytes.clone(), valid.clone())]);
+                        return gather_outcol(&src, &refs, *ty);
+                    }
+                }
+                gather_outcol(&SelSrc::Vv(vec![eval_vec(&expr, &gctx)]), &refs, *ty)
             })
             .collect();
         return Ok(QueryResult {

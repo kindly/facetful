@@ -411,6 +411,103 @@ fn multi_column_grouping_matches_reference() {
     assert_eq!(qt(&mut t, "select coalesce(label, '') || '-' || text(bucket % 2) as k, count(*) as n from t group by coalesce(label, '') || '-' || text(bucket % 2) order by n desc, k"), want);
 }
 
+/// Plain-text keys (no dictionary) group through the blob-hashing plan:
+/// text × int with NULL text, a lone text key, two text keys, ordering by
+/// the text key itself, and LIMIT — all against a reference over the arrays.
+#[test]
+fn text_key_grouping_matches_reference() {
+    use std::collections::BTreeMap;
+    let names = ["Tolk", "Amos", "Bear Creek", "Dolet Hills", "Tolk"]; // Tolk repeats on purpose
+    let tags = ["x", "yy"];
+    let schema = Schema { columns: vec![
+        ColumnDef { name: "name".into(), ty: ColumnType::Utf8, flags: 0 },
+        ColumnDef { name: "tag".into(), ty: ColumnType::Utf8, flags: 0 },
+        ColumnDef { name: "bucket".into(), ty: ColumnType::Int8, flags: 0 },
+        ColumnDef { name: "v".into(), ty: ColumnType::Float64, flags: 0 },
+    ] };
+    let dicts = vec![None, None, None, None];
+    let mut w = Writer::new(schema, vec![], 50, &dicts);
+    let n = 150usize;
+    let name = |i: usize| if i % 11 == 0 { None } else { Some(names[(i * 7) % 5]) };
+    let tag = |i: usize| tags[(i / 3) % 2];
+    let bucket = |i: usize| ((i * 13) % 3) as u8;
+    let value = |i: usize| (i % 5) as f64 + 0.25;
+    for chunk in 0..3 {
+        let rows: Vec<usize> = (chunk * 50..chunk * 50 + 50).collect();
+        let text_col = |f: &dyn Fn(usize) -> Option<&'static str>| {
+            let mut offs = vec![0u32];
+            let mut bytes = Vec::new();
+            let mut valid = vec![0u8; 7];
+            let mut nulls = 0;
+            for (j, &i) in rows.iter().enumerate() {
+                match f(i) {
+                    Some(t) => {
+                        bytes.extend_from_slice(t.as_bytes());
+                        valid[j / 8] |= 1 << (j % 8);
+                    }
+                    None => nulls += 1,
+                }
+                offs.push(bytes.len() as u32);
+            }
+            (offs, bytes, valid, nulls)
+        };
+        let (noffs, nbytes, nvalid, nnulls) = text_col(&name);
+        let (toffs, tbytes, _, _) = text_col(&|i| Some(tag(i)));
+        let buckets: Vec<u8> = rows.iter().map(|&i| bucket(i)).collect();
+        let vals: Vec<u8> = rows.iter().flat_map(|&i| value(i).to_le_bytes()).collect();
+        w.write_group(50, &[
+            ColumnChunk { data: SegmentData::Utf8 { offsets: &noffs, bytes: &nbytes }, validity: Some(&nvalid), null_count: nnulls },
+            ColumnChunk { data: SegmentData::Utf8 { offsets: &toffs, bytes: &tbytes }, validity: None, null_count: 0 },
+            ColumnChunk { data: SegmentData::Fixed(&buckets), validity: None, null_count: 0 },
+            ColumnChunk { data: SegmentData::Fixed(&vals), validity: None, null_count: 0 },
+        ]);
+    }
+    let mut t = Table::open(w.finish()).unwrap();
+    let show = |s: Option<&str>| s.map(str::to_string).unwrap_or("NULL".into());
+
+    // name × bucket, ordered by count desc then key (NULL first)
+    let mut ref_nb: BTreeMap<(Option<&str>, u8), (i64, f64)> = BTreeMap::new();
+    for i in 0..n {
+        let e = ref_nb.entry((name(i), bucket(i))).or_default();
+        e.0 += 1;
+        e.1 += value(i);
+    }
+    let mut want: Vec<Vec<String>> = ref_nb
+        .iter()
+        // qt renders floats to one decimal, so the reference does too
+        .map(|((nm, b), (c, s))| vec![show(*nm), b.to_string(), c.to_string(), format!("{:.1}", s)])
+        .collect();
+    want.sort_by(|a, b| b[2].parse::<i64>().unwrap().cmp(&a[2].parse::<i64>().unwrap()).then_with(|| {
+        // BTreeMap order (None first, then bytes) is the SQL order; recover it
+        let key = |r: &Vec<String>| (r[0] != "NULL", r[0].clone(), r[1].clone());
+        key(a).cmp(&key(b))
+    }));
+    assert_eq!(qt(&mut t, "select name, bucket, count(*) as c, round(sum(v), 2) as s from t group by name, bucket order by c desc, name, bucket"), want);
+    assert_eq!(qt(&mut t, "select name, bucket, count(*) as c, round(sum(v), 2) as s from t group by name, bucket order by c desc, name, bucket limit 4 offset 3"), want[3..7].to_vec());
+
+    // the text key alone, ordered by itself
+    let mut ref_n: BTreeMap<Option<&str>, i64> = BTreeMap::new();
+    for i in 0..n {
+        *ref_n.entry(name(i)).or_default() += 1;
+    }
+    let want: Vec<Vec<String>> = ref_n.iter().map(|(nm, c)| vec![show(*nm), c.to_string()]).collect();
+    assert_eq!(qt(&mut t, "select name, count(*) as c from t group by name order by name"), want);
+
+    // two text keys
+    let mut ref_nt: BTreeMap<(Option<&str>, &str), i64> = BTreeMap::new();
+    for i in 0..n {
+        *ref_nt.entry((name(i), tag(i))).or_default() += 1;
+    }
+    let want: Vec<Vec<String>> = ref_nt.iter().map(|((nm, tg), c)| vec![show(*nm), tg.to_string(), c.to_string()]).collect();
+    assert_eq!(qt(&mut t, "select name, tag, count(*) as c from t group by name, tag order by name, tag"), want);
+    // and the same groups counted without selecting the keys
+    let mut counts: Vec<String> = ref_nt.values().map(|c| c.to_string()).collect();
+    counts.sort();
+    let mut got: Vec<String> = qt(&mut t, "select count(*) as c from t group by name, tag").into_iter().map(|r| r[0].clone()).collect();
+    got.sort();
+    assert_eq!(got, counts);
+}
+
 #[test]
 fn scalar_functions_and_expressions() {
     let rows = q("select upper(region) || '-' || text(year) as tag from t \
