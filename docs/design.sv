@@ -768,3 +768,32 @@ Result rows byte-identical before/after on ten cross-check queries. Dictionary-b
 
 **Position on the two proposals.** The clustered flag is subsumed for scan cost; its residual value (dropping the exact structure's memory) doesn't justify a file property that can silently stop applying. The array type stays a *modelling* feature — a two-technology plant being two rows is a real wart — but its perf argument is gone: 0.48× elements is a 2× constant on a path now ~5× cheaper, and the measure doesn't collapse with the count anyway (two images, app-side merge). **Next on this path**: dense-code bitmaps for int columns from footer `Stats::Int{min,max}` (`gen_key` is 1..40,740 and near-unique, so the filter can't help it — still ~1 ms of pure probing), then a compile-time per-column distinct count so unfiltered header totals become a footer read. After that the 17-column measure sum is the floor on the wide table, exactly as the note predicted.
 </sv-prose>
+
+<sv-prose id="d37">
+## Build log 21 — multi-column GROUP BY: the cost was per group, not per column (2026-09-18)
+
+**Position, recorded because it kept getting lost.** David asked what we had concluded about slow multi-column GROUP BY; the honest answer was nothing — four places held measurements and no decision: the M6 direct-index design (dict dims → composite code → dense lane, 4M-lane cap, `HashMap<Vec<Val>>` beyond it), build log 19's int-dim extension, the v1 risk line "high-cardinality GROUP BY materializes in memory — accepted", and the 2026-09-12 extended bench in `bench/reports/` where `group by "GEM unit/phase ID"` (183K groups) took **100 ms vs DuckDB 9.6** — the one shape we lose badly — with the note "result construction is part of this workload" and no follow-up. The PUDL map (`group by plant, fuel`, 21K groups) was flagged "worth a look" and left.
+
+**Measured first** (plant_tech_year, 231K rows, native ms): `group by fuel, state` + sum, ~500 groups, **2.0** — two columns cost nothing. `group by plant, fuel`: count only 3.3 → + sum 6.0 → + `order by round(sum/1000,1) desc` (the map query) **11.2**. Add `state` (product 41M, past the 4M lanes) → **22.5**. So two things, neither of them "columns": (1) **cost per group** — a `Vec<Val>` key per new group, every accumulator grown per group, a `Vec<Val>` output row per group, `cmp_sql` over those rows, and above all `eval_grouped`, a per-group tree-walking interpreter (~90 ns per expression per group, run twice for anything in both SELECT and ORDER BY); (2) **the dense-lane cliff** into `Vec<Val>` SipHash grouping.
+
+**What landed** (the commit carrying this entry), `exec.rs`:
+
+- **`PackedGroups`** replaces `DirectGroups`: dict/int GROUP BY columns pack to one mixed-radix `u64` code (null lane per dim); ≤ 4M lanes indexes a dense `Vec<i32>` as before, larger products probe **`GroupMap`**, an open-addressed code → gid table (same shape and hash as `DistinctU64`). Keys stay packed for the whole scan: `group_codes: Vec<u64>`, no `Vec<Val>`. Accumulators grow once per batch. The row loop is a macro instantiated twice (dense / map) — a single loop testing the `Option` per row was a measurable wasm-only loss.
+- **The output phase is a vectorized pass over the group table.** Aggregates finish into lanes (`GroupCol::Ready`), packed keys peel into **code lanes** (`GroupCol::Dict` on the real dictionary — no string touched) or int lanes, hash-path keys into `Ready` lanes; SELECT and ORDER BY expressions are rewritten by `substitute_grouped` (aggregate call → its lane's synthetic column, GROUP BY expression → its key lane) and evaluated by `eval_vec`, the same kernels the scan uses. ORDER BY on numeric keys packs to `(validity, u64, gid)` tuples and `sort_unstable`s (gid last = the old stable tie order); text falls back to `cmp_sql`. Only OFFSET/LIMIT survivors are gathered, straight into the **columnar channel** (`cols: Some`, like every other path now; `ensure_rows()` for row consumers). `Overrides`/`eval_grouped`/`scalar_binary` are gone.
+
+**Numbers** (`bench/pudl-grouping.sql`, plant_tech_year; native best-of-3 / wasm best-of-15, warm ms):
+
+| shape | groups | native before → after | wasm before → after |
+|---|---|---|---|
+| map query (`plant, fuel`, min lat/lon, order by float expr) | 21,098 | 13.4 → **5.8** (2.3×) | 20.3 → **9.3** (2.2×) |
+| `plant, fuel, state` (41M product, was the cliff) | 20,577 | 22.8 → **3.3** (7.0×) | 35.1 → **4.7** (7.5×) |
+| `plant, fuel` + sum, order by int | 20,577 | 6.2 → 3.2 | 8.9 → 4.6 |
+| … order by float expr, limit 100 | 20,577 | 10.9 → 4.3 | 14.2 → 5.7 |
+| `plant_name (dict), fuel` count | 20,577 | 3.7 → 2.6 | 5.4 → 3.5 |
+| utility facets (8,261 groups; both PUDL suites) | 8,261 | 1.5–2.1× | 1.5–2.3× |
+| `fuel, state` (~500 groups) | ~500 | 2.0 → 1.8 | 2.6 → 2.3 |
+
+Ten-group facets, the canonical 14-shape suite, the dictionary-distinct suite and the SQLite differential: unchanged (within noise) or slightly faster. New test `multi_column_grouping_matches_reference` checks packed null lanes, the GroupMap path, float-expression and text ordering, LIMIT/OFFSET and an expression key against an independent computation over the same arrays. 69 tests. The phase timers that guided this (group table / order / gather) were temporary and are not in the tree.
+
+**Not yet done — the 183K-group text shape.** `"GEM unit/phase ID"` and `"Plant / Project name"` are plain Utf8 (cardinality > 65,536, no dictionary), so they still take the `HashMap<Vec<Val>>` path: an `Rc<String>` lane materialized per row group, a `Vec<Val>` allocated and SipHashed per row. Phase timers put the new output phase at 7.9 ms of that query; the scan is ~100 ms and, run-to-run, 15–20% slower than before this change for reasons the timers place inside the unchanged scan (allocator state after 183K small frees is the suspect; not chased). **Next step, in flight:** hash plain-text keys straight from the borrowed blob (`GroupCol::Text` offsets + bytes) with the Fx mixer into a `GroupMap`-shaped table whose slot holds the 64-bit hash and whose groups keep their bytes in one arena; the key lane for the group table is then that arena as a raw text column, gathered without an `Rc<String>` ever existing. That is the shape where DuckDB currently leads 10×.
+</sv-prose>

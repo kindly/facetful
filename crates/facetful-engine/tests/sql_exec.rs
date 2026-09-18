@@ -134,8 +134,9 @@ fn count_distinct_and_case() {
 fn nonnull_coalesce_preserves_column_planning() {
     let mut t = table();
     // Folding must happen before pruning, not just inside vector evaluation.
-    let r = run_query(&mut t, "select count(*) from t where coalesce(year, 0) > 9000").unwrap();
+    let mut r = run_query(&mut t, "select count(*) from t where coalesce(year, 0) > 9000").unwrap();
     assert_eq!(r.scanned_groups, 0);
+    r.ensure_rows();
     assert_eq!(r.rows, vec![vec![Val::Int(0)]]);
     for (wrapped, bare) in [
         ("select coalesce(region, 'other') from t order by coalesce(region, 'other') limit 3",
@@ -309,6 +310,105 @@ fn numeric_distinct_table_resizes_and_keeps_groups_apart() {
     assert!(pairs.len() > 64, "must outgrow the initial table: {}", pairs.len());
     assert_eq!(qt(&mut t, "select bucket, count(distinct v) from t group by bucket order by bucket"), want);
     assert_eq!(qt(&mut t, "select count(distinct v) from t"), vec![vec![values.len().to_string()]]);
+}
+
+/// Multi-column grouping end to end, checked against an independent
+/// computation over the same arrays: packed keys with null lanes, the
+/// GroupMap path past the dense budget, ORDER BY on aggregates, float
+/// expressions and text keys, LIMIT/OFFSET, and an expression key through
+/// the hash path.
+#[test]
+fn multi_column_grouping_matches_reference() {
+    use std::collections::BTreeMap;
+    let labels = ["ash", "birch", "cedar"];
+    let (offsets, bytes) = {
+        let mut offs = vec![0u32];
+        let mut b = Vec::new();
+        for l in labels {
+            b.extend_from_slice(l.as_bytes());
+            offs.push(b.len() as u32);
+        }
+        (offs, b)
+    };
+    let schema = Schema { columns: vec![
+        ColumnDef { name: "label".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY | flags::CODES_U8 },
+        ColumnDef { name: "bucket".into(), ty: ColumnType::Int8, flags: 0 },
+        ColumnDef { name: "wide".into(), ty: ColumnType::Int32, flags: 0 },
+        ColumnDef { name: "v".into(), ty: ColumnType::Float64, flags: 0 },
+    ] };
+    let dicts = vec![Some(DictData { offsets, bytes }), None, None, None];
+    let mut w = Writer::new(schema, vec![], 40, &dicts);
+    // 120 rows over three row groups; every 7th label is NULL; `wide` spans
+    // 0..6_000_000 so wide × anything exceeds the dense-lane budget
+    let n = 120usize;
+    let label = |i: usize| if i % 7 == 0 { None } else { Some((i * 5 % 3) as u8) };
+    let bucket = |i: usize| ((i * 11) % 4) as u8;
+    let wide = |i: usize| if i % 3 == 0 { 0i32 } else { 6_000_000 };
+    let value = |i: usize| (i % 9) as f64 * 1.5;
+    for chunk in 0..3 {
+        let rows: Vec<usize> = (chunk * 40..chunk * 40 + 40).collect();
+        let codes: Vec<u8> = rows.iter().map(|&i| label(i).unwrap_or(0)).collect();
+        let mut validity = vec![0u8; 5];
+        let mut nulls = 0;
+        for (j, &i) in rows.iter().enumerate() {
+            if label(i).is_some() { validity[j / 8] |= 1 << (j % 8) } else { nulls += 1 }
+        }
+        let buckets: Vec<u8> = rows.iter().map(|&i| bucket(i)).collect();
+        let wides: Vec<u8> = rows.iter().flat_map(|&i| wide(i).to_le_bytes()).collect();
+        let vals: Vec<u8> = rows.iter().flat_map(|&i| value(i).to_le_bytes()).collect();
+        w.write_group(40, &[
+            ColumnChunk { data: SegmentData::Codes8(&codes), validity: Some(&validity), null_count: nulls },
+            ColumnChunk { data: SegmentData::Fixed(&buckets), validity: None, null_count: 0 },
+            ColumnChunk { data: SegmentData::Fixed(&wides), validity: None, null_count: 0 },
+            ColumnChunk { data: SegmentData::Fixed(&vals), validity: None, null_count: 0 },
+        ]);
+    }
+    let mut t = Table::open(w.finish()).unwrap();
+    // how the engine renders a NULL key, and what coalesce(label, '') yields
+    let text = |l: Option<u8>| l.map(|c| labels[c as usize].to_string()).unwrap_or("NULL".into());
+    let coalesced = |l: Option<u8>| l.map(|c| labels[c as usize].to_string()).unwrap_or_default();
+
+    // label × bucket: (count, sum) per key, in ORDER BY count desc, label, bucket
+    let mut ref_lb: BTreeMap<(Option<u8>, u8), (i64, f64)> = BTreeMap::new();
+    for i in 0..n {
+        let e = ref_lb.entry((label(i), bucket(i))).or_default();
+        e.0 += 1;
+        e.1 += value(i);
+    }
+    let mut rows: Vec<(String, String, String, String)> = ref_lb
+        .iter()
+        .map(|((l, b), (c, s))| (text(*l), b.to_string(), c.to_string(), format!("{:.1}", (s / 2.0 * 10.0).round() / 10.0)))
+        .collect();
+    // NULL label sorts first ascending, so it goes first among ties
+    rows.sort_by(|a, b| b.2.parse::<i64>().unwrap().cmp(&a.2.parse::<i64>().unwrap()).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1)));
+    let want: Vec<Vec<String>> = rows.iter().map(|r| vec![r.0.clone(), r.1.clone(), r.2.clone(), r.3.clone()]).collect();
+    let got = qt(&mut t, "select label, bucket, count(*) as n, round(sum(v)/2.0, 1) as h from t group by label, bucket order by n desc, label, bucket");
+    assert_eq!(got, want);
+    // LIMIT/OFFSET slice the same order
+    assert_eq!(qt(&mut t, "select label, bucket, count(*) as n, round(sum(v)/2.0, 1) as h from t group by label, bucket order by n desc, label, bucket limit 3 offset 2"), want[2..5].to_vec());
+    // ordering by the float expression alone, descending, ties by discovery order
+    let mut by_h: Vec<Vec<String>> = want.clone();
+    let first_seen = |l: &str, b: &str| (0..n).position(|i| text(label(i)) == l && bucket(i).to_string() == b).unwrap();
+    by_h.sort_by(|a, b| b[3].parse::<f64>().unwrap().partial_cmp(&a[3].parse::<f64>().unwrap()).unwrap().then_with(|| first_seen(&a[0], &a[1]).cmp(&first_seen(&b[0], &b[1]))));
+    assert_eq!(qt(&mut t, "select label, bucket, count(*) as n, round(sum(v)/2.0, 1) as h from t group by label, bucket order by h desc"), by_h);
+
+    // wide × label: product exceeds the dense budget -> GroupMap on the packed code
+    let mut ref_wl: BTreeMap<(i32, Option<u8>), i64> = BTreeMap::new();
+    for i in 0..n {
+        *ref_wl.entry((wide(i), label(i))).or_default() += 1;
+    }
+    let want: Vec<Vec<String>> = ref_wl.iter().map(|((w, l), c)| vec![w.to_string(), text(*l), c.to_string()]).collect();
+    // BTreeMap order = wide asc, then None before Some = NULL first, then code order = alphabetical here
+    assert_eq!(qt(&mut t, "select wide, label, count(*) as n from t group by wide, label order by wide, label"), want);
+
+    // an expression key takes the hash path; its output still comes through the group table
+    let mut ref_expr: BTreeMap<String, i64> = BTreeMap::new();
+    for i in 0..n {
+        *ref_expr.entry(format!("{}-{}", coalesced(label(i)), bucket(i) % 2)).or_default() += 1;
+    }
+    let mut want: Vec<Vec<String>> = ref_expr.iter().map(|(k, c)| vec![k.clone(), c.to_string()]).collect();
+    want.sort_by(|a, b| b[1].parse::<i64>().unwrap().cmp(&a[1].parse::<i64>().unwrap()).then_with(|| a[0].cmp(&b[0])));
+    assert_eq!(qt(&mut t, "select coalesce(label, '') || '-' || text(bucket % 2) as k, count(*) as n from t group by coalesce(label, '') || '-' || text(bucket % 2) order by n desc, k"), want);
 }
 
 #[test]

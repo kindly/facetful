@@ -294,6 +294,8 @@ fn valid_and(rows: usize, a: &VV, b: &VV) -> Option<Rc<Vec<u8>>> {
 // ---------------- group context ----------------
 
 enum GroupCol {
+    /// an already-built lane (the group table's aggregate and key columns)
+    Ready(VV),
     I64(Rc<Vec<i64>>),
     F64(Rc<Vec<f64>>),
     Dict { codes: Rc<Vec<u16>>, dict: Rc<Vec<VStr>> },
@@ -316,6 +318,7 @@ impl GroupCtx {
     fn column(&self, idx: usize) -> VV {
         let (c, valid) = &self.cols[&idx];
         let data = match c {
+            GroupCol::Ready(vv) => return vv.clone(),
             GroupCol::I64(v) => Data::I64(v.clone()),
             GroupCol::F64(v) => Data::F64(v.clone()),
             GroupCol::Dict { codes, dict } => {
@@ -1457,6 +1460,14 @@ impl LastSeen {
     }
 }
 
+/// Fold the high half down, then multiply: every input bit reaches the top
+/// bits, which is where table indices are taken from (`>> shift`).
+#[inline]
+fn mix64(mut h: u64) -> u64 {
+    h ^= h >> 32;
+    h.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+}
+
 /// `g == EMPTY` marks a free slot. `for_kept` already skips `u32::MAX` group
 /// ids, so no live group can collide with the sentinel.
 #[derive(Clone, Copy)]
@@ -1505,10 +1516,7 @@ impl DistinctU64 {
     /// in one probe chain. Only valid once `resize` has run.
     #[inline]
     fn index(&self, g: u32, v: u64) -> usize {
-        let mut h = v ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 32;
-        h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        (h >> self.shift) as usize
+        (mix64(v ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> self.shift) as usize
     }
     /// Counts `v` for group `g` unless that group already holds it.
     #[inline]
@@ -2199,117 +2207,51 @@ fn collect_columns(b: &Bound, out: &mut Vec<usize>) {
 }
 
 // grouped-context evaluation (per output group — groups are few)
-struct Overrides<'a> {
-    group_by: &'a [Bound],
-    key: &'a [Val],
-    aggs: &'a [Bound],
-    accs: &'a [AggAcc],
-    gid: usize,
-}
-
-fn eval_grouped(b: &Bound, o: &Overrides<'_>) -> Val {
-    if let Some(i) = o.aggs.iter().position(|a| a == b) {
-        return o.accs[i].finish(o.gid);
+/// Rewrite an output expression against the group table: an aggregate call
+/// becomes the column holding its finished values, a GROUP BY expression the
+/// column holding its keys, and the rest evaluates as any scan expression
+/// would. A bare column that is neither cannot occur in a valid aggregate
+/// query (the binder rejects it); it reads as NULL, as it always did.
+fn substitute_grouped(
+    b: &Bound,
+    group_by: &[Bound],
+    aggs: &[Bound],
+    agg_base: usize,
+    key_base: usize,
+) -> Bound {
+    if let Some(i) = aggs.iter().position(|a| a == b) {
+        return Bound::Column { index: agg_base + i, ty: b.ty() };
     }
-    if let Some(i) = o.group_by.iter().position(|g| g == b) {
-        return o.key[i].clone();
+    if let Some(k) = group_by.iter().position(|g| g == b) {
+        return Bound::Column { index: key_base + k, ty: b.ty() };
     }
+    let sub = |e: &Bound| substitute_grouped(e, group_by, aggs, agg_base, key_base);
     match b {
-        Bound::Number(n, is_float) => {
-            if *is_float || n.fract() != 0.0 {
-                Val::Float(*n)
-            } else {
-                Val::Int(*n as i64)
-            }
-        }
-        Bound::Str(s) => Val::text(s.clone()),
-        Bound::Null => Val::Null,
-        Bound::Unary { op, expr, .. } => {
-            let v = eval_grouped(expr, o);
-            match (op, v) {
-                (_, Val::Null) => Val::Null,
-                (UnOp::Neg, Val::Int(i)) => Val::Int(-i),
-                (UnOp::Neg, Val::Float(f)) => Val::Float(-f),
-                (UnOp::Not, Val::Bool(x)) => Val::Bool(!x),
-                _ => Val::Null,
-            }
-        }
+        Bound::Column { .. } => Bound::Null,
+        Bound::Unary { op, expr, ty } => Bound::Unary { op: *op, expr: Box::new(sub(expr)), ty: *ty },
         Bound::Binary { op, lhs, rhs, ty } => {
-            let l = eval_grouped(lhs, o);
-            let r = eval_grouped(rhs, o);
-            scalar_binary(*op, l, r, *ty)
+            Bound::Binary { op: *op, lhs: Box::new(sub(lhs)), rhs: Box::new(sub(rhs)), ty: *ty }
         }
-        Bound::Call { func, args, .. } => {
-            let vals: Vec<Val> = args.iter().map(|a| eval_grouped(a, o)).collect();
-            if TEMPORAL_FNS.contains(&func.name) {
-                temporal_fn(func.name, args[temporal_arg_index(func.name)].ty(), &vals)
-            } else {
-                scalar_fn(func.name, vals)
-            }
+        Bound::Call { func, args, ty } => {
+            Bound::Call { func, args: args.iter().map(sub).collect(), ty: *ty }
         }
-        Bound::Column { .. } => Val::Null,
+        other => other.clone(),
     }
 }
 
-fn scalar_binary(op: BinOp, l: Val, r: Val, ty: Ty) -> Val {
-    use BinOp::*;
-    match op {
-        And => match (as_b3(&l), as_b3(&r)) {
-            (Some(false), _) | (_, Some(false)) => Val::Bool(false),
-            (Some(true), Some(true)) => Val::Bool(true),
-            _ => Val::Null,
-        },
-        Or => match (as_b3(&l), as_b3(&r)) {
-            (Some(true), _) | (_, Some(true)) => Val::Bool(true),
-            (Some(false), Some(false)) => Val::Bool(false),
-            _ => Val::Null,
-        },
-        Eq | Ne | Lt | Le | Gt | Ge => {
-            if l.is_null() || r.is_null() {
-                return Val::Null;
-            }
-            Val::Bool(cmp_ord(op, l.cmp_sql(&r)))
-        }
-        _ => {
-            if l.is_null() || r.is_null() {
-                return Val::Null;
-            }
-            match (ty, &l, &r) {
-                (Ty::Int, Val::Int(a), Val::Int(b)) => match op {
-                    Add => Val::Int(a + b),
-                    Sub => Val::Int(a - b),
-                    Mul => Val::Int(a * b),
-                    Div => {
-                        if *b == 0 { Val::Null } else { Val::Int(a / b) }
-                    }
-                    _ => {
-                        if *b == 0 { Val::Null } else { Val::Int(a % b) }
-                    }
-                },
-                _ => match (l.as_f64(), r.as_f64()) {
-                    (Some(a), Some(b)) => match op {
-                        Add => Val::Float(a + b),
-                        Sub => Val::Float(a - b),
-                        Mul => Val::Float(a * b),
-                        Div => {
-                            if b == 0.0 { Val::Null } else { Val::Float(a / b) }
-                        }
-                        _ => {
-                            if b == 0.0 { Val::Null } else { Val::Float(a % b) }
-                        }
-                    },
-                    _ => Val::Null,
-                },
-            }
-        }
-    }
-}
-
-fn as_b3(v: &Val) -> Option<bool> {
-    match v {
-        Val::Bool(b) => Some(*b),
-        _ => None,
-    }
+/// Order-preserving (validity, bits) key for one numeric ORDER BY lane value,
+/// so sorting is an integer compare. Validity first so NULLs sort first
+/// ascending (and last after a DESC flip), matching `cmp_sql`.
+fn encode_order(vv: &VV, i: usize, ty: Ty, desc: bool) -> (u8, u64) {
+    let (v, k) = if !vv.is_valid(i) {
+        (0u8, 0u64)
+    } else if ty == Ty::Float {
+        let b = vv.f64_at(i).to_bits();
+        (1, if b >> 63 == 1 { !b } else { b | (1u64 << 63) })
+    } else {
+        (1, (vv.i64_at(i) as u64) ^ (1u64 << 63))
+    };
+    if desc { (1 - v, !k) } else { (v, k) }
 }
 
 // ---------------- pruning ----------------
@@ -2509,8 +2451,6 @@ fn pack_bits(bytes: &[u8]) -> Vec<u8> {
 
 // ---------------- grouping plans ----------------
 
-/// Direct-index grouping: all group-bys are dict columns with a small
-/// cardinality product — gid from arithmetic on codes, no hashing.
 /// How one group-by dimension maps to a dense code.
 enum DirectDim {
     /// dictionary column: the code lane is the dense code
@@ -2519,11 +2459,80 @@ enum DirectDim {
     Int { min: i64 },
 }
 
-struct DirectGroups {
+/// Packed grouping: every GROUP BY is a dict or narrow-int column, so a
+/// group's key is ONE mixed-radix code over the dimensions' cardinalities
+/// (each with a null lane). A small product indexes a dense lane; a larger
+/// one probes `GroupMap` on the code. Either way the key stays packed until
+/// the groups that survive ORDER BY / LIMIT are projected — no `Vec<Val>`
+/// per group during the scan.
+struct PackedGroups {
     cols: Vec<usize>,
     dims: Vec<DirectDim>,
     cards: Vec<usize>,
-    dense: Vec<i32>,
+    /// composite -> gid, `-1` free; `None` when the product exceeds the lane
+    /// budget, in which case `map` holds the groups
+    dense: Option<Vec<i32>>,
+    map: GroupMap,
+}
+
+/// Open-addressed map from a packed group code to its gid: the same table
+/// shape and hash as `DistinctU64`, and the code is the whole key, so a hit
+/// needs no indirection to verify.
+struct GroupMap {
+    slots: Vec<GSlot>,
+    mask: usize,
+    shift: u32,
+    used: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GSlot {
+    key: u64,
+    gid: u32,
+}
+
+impl GroupMap {
+    fn new() -> GroupMap {
+        GroupMap { slots: Vec::new(), mask: 0, shift: 0, used: 0 }
+    }
+    /// The gid of `key`, inserting it as `next` when unseen.
+    #[inline]
+    fn get_or_insert(&mut self, key: u64, next: u32) -> u32 {
+        if (self.used + 1) * 4 >= self.slots.len() * 3 {
+            self.resize();
+        }
+        let mut i = (mix64(key) >> self.shift) as usize;
+        loop {
+            let slot = self.slots[i];
+            if slot.gid == EMPTY {
+                self.slots[i] = GSlot { key, gid: next };
+                self.used += 1;
+                return next;
+            }
+            if slot.key == key {
+                return slot.gid;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn resize(&mut self) {
+        let len = self.slots.len();
+        let cap = if len < 1 << 16 { (len * 4).max(1024) } else { len * 2 };
+        let old = std::mem::replace(&mut self.slots, vec![GSlot { key: 0, gid: EMPTY }; cap]);
+        self.mask = cap - 1;
+        self.shift = (cap as u64).leading_zeros() + 1;
+        for slot in old {
+            if slot.gid != EMPTY {
+                let mut i = (mix64(slot.key) >> self.shift) as usize;
+                while self.slots[i].gid != EMPTY {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = slot;
+            }
+        }
+    }
 }
 
 /// Global (all-groups) integer min/max from the footer stats, if every group
@@ -2543,11 +2552,14 @@ fn int_range<S: ReadAt>(table: &Table<S>, col: usize) -> Option<(i64, i64)> {
     r
 }
 
-fn direct_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<DirectGroups> {
+/// Dense-lane budget for packed grouping; larger products go through `GroupMap`.
+const DENSE_LANES: u64 = 1 << 22;
+
+fn packed_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<PackedGroups> {
     let mut cols = Vec::new();
     let mut dims = Vec::new();
     let mut cards = Vec::new();
-    let mut product: usize = 1;
+    let mut product: u64 = 1;
     for g in group_by {
         let Bound::Column { index, .. } = g else { return None };
         let (cty, is_dict) = {
@@ -2574,17 +2586,16 @@ fn direct_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<Di
         } else {
             return None;
         };
-        product = product.checked_mul(card)?;
-        if product > (1 << 22) {
-            return None;
-        }
+        // the code must fit u64; beyond that the Vec<Val> hash path takes over
+        product = product.checked_mul(card as u64)?;
         cols.push(*index);
         cards.push(card);
     }
     if cols.is_empty() {
         return None;
     }
-    Some(DirectGroups { cols, dims, cards, dense: vec![-1; product] })
+    let dense = (product <= DENSE_LANES).then(|| vec![-1; product as usize]);
+    Some(PackedGroups { cols, dims, cards, dense, map: GroupMap::new() })
 }
 
 #[cfg(test)]
@@ -2756,8 +2767,11 @@ pub fn execute<S: ReadAt>(
         v
     };
 
-    let mut direct = if q.is_aggregate { direct_plan(table, &q.group_by) } else { None };
+    let mut direct = if q.is_aggregate { packed_plan(table, &q.group_by) } else { None };
     let mut hash_groups: HashMap<Vec<Val>, usize> = HashMap::new();
+    // one of these holds the keys: packed codes under a PackedGroups plan,
+    // materialized tuples otherwise (expression keys, plain-text keys)
+    let mut group_codes: Vec<u64> = Vec::new();
     let mut group_keys: Vec<Vec<Val>> = Vec::new();
     let arg_dict_len = |call: &Bound| -> Option<usize> {
         let Bound::Call { args, .. } = call else { return None };
@@ -3112,42 +3126,57 @@ pub fn execute<S: ReadAt>(
                 // than the gids pass it replaces
                 let mut local_counts: Vec<i64> =
                     if count_only { vec![0; n_groups] } else { Vec::new() };
-                for i in 0..rows {
-                    if !kept(i) {
-                        continue;
-                    }
-                    let mut composite = 0usize;
-                    for fd in &fast {
-                        let ok = fd.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
-                        let code = if !ok {
-                            fd.card - 1
-                        } else {
-                            match &fd.lane {
-                                FastLane::Codes(codes) => codes[i] as usize,
-                                FastLane::Ints { vals, min } => (vals[i] - min) as usize,
+                // one loop body, specialized per lookup: testing the
+                // Option inside the row loop measurably slowed the wasm build
+                macro_rules! group_rows {
+                    (|$composite:ident| $lookup:expr) => {
+                        for i in 0..rows {
+                            if !kept(i) {
+                                continue;
                             }
-                        };
-                        composite = composite * fd.card + code;
-                    }
-                    let dense = &mut d.dense[composite];
-                    if *dense < 0 {
-                        *dense = n_groups as i32;
-                        let key: Vec<Val> =
-                            code_cols.iter().map(|(vv, _)| lane_val(vv, i)).collect();
-                        group_keys.push(key);
-                        n_groups += 1;
-                        for a in &mut accs {
-                            a.grow(n_groups);
+                            // u64: the product may exceed usize on wasm32
+                            let mut $composite = 0u64;
+                            for fd in &fast {
+                                let ok = fd.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
+                                let code = if !ok {
+                                    fd.card - 1
+                                } else {
+                                    match &fd.lane {
+                                        FastLane::Codes(codes) => codes[i] as usize,
+                                        FastLane::Ints { vals, min } => (vals[i] - min) as usize,
+                                    }
+                                };
+                                $composite = $composite * fd.card as u64 + code as u64;
+                            }
+                            let gid: u32 = $lookup;
+                            if gid as usize == n_groups {
+                                group_codes.push($composite);
+                                n_groups += 1;
+                                if count_only {
+                                    local_counts.push(0);
+                                }
+                            }
+                            if count_only {
+                                local_counts[gid as usize] += 1;
+                            } else {
+                                gids[i] = gid;
+                            }
                         }
-                        if count_only {
-                            local_counts.push(0);
+                    };
+                }
+                match &mut d.dense {
+                    Some(dense) => group_rows!(|composite| {
+                        let slot = &mut dense[composite as usize];
+                        if *slot < 0 {
+                            *slot = n_groups as i32;
                         }
-                    }
-                    if count_only {
-                        local_counts[*dense as usize] += 1;
-                    } else {
-                        gids[i] = *dense as u32;
-                    }
+                        *slot as u32
+                    }),
+                    None => group_rows!(|composite| d.map.get_or_insert(composite, n_groups as u32)),
+                }
+                // one growth per batch, not one per group
+                for a in &mut accs {
+                    a.grow(n_groups);
                 }
                 if count_only {
                     for a in &mut accs {
@@ -3174,11 +3203,11 @@ pub fn execute<S: ReadAt>(
                     });
                     if gid == next && gid == n_groups {
                         n_groups += 1;
-                        for a in &mut accs {
-                            a.grow(n_groups);
-                        }
                     }
                     gids[i] = gid as u32;
+                }
+                for a in &mut accs {
+                    a.grow(n_groups);
                 }
                 Some(gids)
             };
@@ -3276,20 +3305,6 @@ pub fn execute<S: ReadAt>(
             .all(|(e, _)| matches!(e.ty(), Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp));
         let nk = q.order_by.len();
 
-        // order-preserving u64 encoding; validity first so NULLs sort first
-        // ascending (and last after a DESC flip), matching cmp_sql
-        let encode = |vv: &VV, i: usize, ty: Ty, desc: bool| -> (u8, u64) {
-            let (v, k) = if !vv.is_valid(i) {
-                (0u8, 0u64)
-            } else if ty == Ty::Float {
-                let b = vv.f64_at(i).to_bits();
-                (1, if b >> 63 == 1 { !b } else { b | (1u64 << 63) })
-            } else {
-                (1, (vv.i64_at(i) as u64) ^ (1u64 << 63))
-            };
-            if desc { (1 - v, !k) } else { (v, k) }
-        };
-
         let order_refs: Vec<(u32, u32)> = if numeric_keys && nk == 1 {
             let (_, dir) = &q.order_by[0];
             let desc = *dir == SortDir::Desc;
@@ -3297,7 +3312,7 @@ pub fn execute<S: ReadAt>(
             let mut keyed: Vec<(u8, u64, u32, u32)> = refs
                 .iter()
                 .map(|&(g, r)| {
-                    let (v, k) = encode(&sort_groups[g as usize].0[0], r as usize, ty, desc);
+                    let (v, k) = encode_order(&sort_groups[g as usize].0[0], r as usize, ty, desc);
                     (v, k, g, r)
                 })
                 .collect();
@@ -3307,7 +3322,7 @@ pub fn execute<S: ReadAt>(
             let mut flat: Vec<(u8, u64)> = Vec::with_capacity(refs.len() * nk);
             for &(g, r) in &refs {
                 for (ki, (_, dir)) in q.order_by.iter().enumerate() {
-                    flat.push(encode(
+                    flat.push(encode_order(
                         &sort_groups[g as usize].0[ki],
                         r as usize,
                         ord_tys[ki],
@@ -3502,51 +3517,142 @@ pub fn execute<S: ReadAt>(
         });
     }
 
-    let mut rows: Vec<(Vec<Val>, Vec<Val>)> = if q.is_aggregate {
+    let offset = q.offset.unwrap_or(0) as usize;
+    let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+
+    if q.is_aggregate {
         if q.group_by.is_empty() && n_groups == 0 {
-            group_keys.push(Vec::new());
             n_groups = 1;
             for a in &mut accs {
                 a.grow(1);
             }
         }
-        (0..n_groups)
-            .map(|gid| {
-                let o = Overrides {
-                    group_by: &q.group_by,
-                    key: &group_keys[gid],
-                    aggs: &agg_calls,
-                    accs: &accs,
-                    gid,
-                };
-                let projected: Vec<Val> =
-                    q.select.iter().map(|s| eval_grouped(&s.expr, &o)).collect();
-                let order: Vec<Val> =
-                    q.order_by.iter().map(|(e, _)| eval_grouped(e, &o)).collect();
-                (projected, order)
-            })
-            .collect()
-    } else {
-        out_rows
-    };
-
-    if !q.order_by.is_empty() {
-        rows.sort_by(|a, b| {
-            for (i, (_, dir)) in q.order_by.iter().enumerate() {
-                let ord = a.1[i].cmp_sql(&b.1[i]);
-                let ord = if *dir == SortDir::Desc { ord.reverse() } else { ord };
-                if ord != core::cmp::Ordering::Equal {
-                    return ord;
+        // The output phase is a vectorized pass over the GROUP TABLE — one
+        // row per group, aggregates and keys as columns under synthetic
+        // indices, select/order expressions rewritten onto them and run by
+        // the same kernels as the scan — not a per-group tree walk. Keys of
+        // a packed plan land as code lanes: no string is touched until the
+        // surviving rows are gathered.
+        let base = table.catalog().schema.columns.len();
+        let mut gcols: HashMap<usize, (GroupCol, Option<Rc<Vec<u8>>>)> = HashMap::new();
+        for (i, (acc, call)) in accs.iter().zip(&agg_calls).enumerate() {
+            let vv = lanes_to_vv(n_groups, call.ty(), |g| acc.finish(g));
+            gcols.insert(base + i, (GroupCol::Ready(vv), None));
+        }
+        let key_base = base + agg_calls.len();
+        match &direct {
+            Some(plan) => {
+                // peel the mixed-radix code, last dimension first
+                let nd = plan.cols.len();
+                let mut per_dim: Vec<Vec<usize>> = vec![vec![0; n_groups]; nd];
+                for (g, &code) in group_codes.iter().enumerate() {
+                    let mut code = code;
+                    for k in (0..nd).rev() {
+                        let card = plan.cards[k] as u64;
+                        per_dim[k][g] = (code % card) as usize;
+                        code /= card;
+                    }
+                }
+                for (k, codes) in per_dim.into_iter().enumerate() {
+                    let null_lane = plan.cards[k] - 1;
+                    let mut valid = vec![0u8; n_groups.div_ceil(8)];
+                    for (g, &c) in codes.iter().enumerate() {
+                        if c != null_lane {
+                            valid[g / 8] |= 1 << (g % 8);
+                        }
+                    }
+                    let col = match plan.dims[k] {
+                        DirectDim::Dict => GroupCol::Dict {
+                            codes: Rc::new(codes.iter().map(|&c| c as u16).collect()),
+                            dict: dicts[&plan.cols[k]].clone(),
+                        },
+                        DirectDim::Int { min } => {
+                            GroupCol::I64(Rc::new(codes.iter().map(|&c| min + c as i64).collect()))
+                        }
+                    };
+                    gcols.insert(key_base + k, (col, Some(Rc::new(valid))));
                 }
             }
-            core::cmp::Ordering::Equal
+            None => {
+                for (k, g_expr) in q.group_by.iter().enumerate() {
+                    let vv = lanes_to_vv(n_groups, g_expr.ty(), |g| group_keys[g][k].clone());
+                    gcols.insert(key_base + k, (GroupCol::Ready(vv), None));
+                }
+            }
+        }
+        let gctx = GroupCtx { cols: gcols, rows: n_groups };
+        let rewrite = |b: &Bound| substitute_grouped(b, &q.group_by, &agg_calls, base, key_base);
+
+        // ORDER BY over every group; numeric keys pack to u64 and sort as
+        // integers, anything else compares through cmp_sql. Stable, so ties
+        // keep group discovery order.
+        let order: Vec<u32> = if q.order_by.is_empty() {
+            (0..n_groups as u32).collect()
+        } else {
+            let ord_vvs: Vec<VV> =
+                q.order_by.iter().map(|(e, _)| eval_vec(&rewrite(e), &gctx)).collect();
+            let nk = ord_vvs.len();
+            let numeric = ord_tys
+                .iter()
+                .all(|t| matches!(t, Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp));
+            let mut perm: Vec<u32> = (0..n_groups as u32).collect();
+            if numeric && nk == 1 {
+                let (_, dir) = &q.order_by[0];
+                let desc = *dir == SortDir::Desc;
+                let mut keyed: Vec<(u8, u64, u32)> = (0..n_groups)
+                    .map(|g| {
+                        let (v, k) = encode_order(&ord_vvs[0], g, ord_tys[0], desc);
+                        (v, k, g as u32)
+                    })
+                    .collect();
+                // gid last: ties keep discovery order, and unstable is fine
+                keyed.sort_unstable();
+                perm = keyed.into_iter().map(|t| t.2).collect();
+            } else if numeric {
+                let mut flat: Vec<(u8, u64)> = Vec::with_capacity(n_groups * nk);
+                for g in 0..n_groups {
+                    for (ki, (_, dir)) in q.order_by.iter().enumerate() {
+                        flat.push(encode_order(&ord_vvs[ki], g, ord_tys[ki], *dir == SortDir::Desc));
+                    }
+                }
+                perm.sort_unstable_by(|&a, &b| {
+                    let (ia, ib) = (a as usize * nk, b as usize * nk);
+                    flat[ia..ia + nk].cmp(&flat[ib..ib + nk]).then(a.cmp(&b))
+                });
+            } else {
+                let keys: Vec<Vec<Val>> = (0..n_groups)
+                    .map(|g| ord_vvs.iter().zip(&ord_tys).map(|(v, t)| v.val_at(g, *t)).collect())
+                    .collect();
+                perm.sort_by(|&a, &b| cmp_keys(&keys[a as usize], &keys[b as usize], &q.order_by));
+            }
+            perm
+        };
+        // project only the survivors, straight into the columnar channel
+        let refs: Vec<(u32, u32)> =
+            order.into_iter().skip(offset).take(limit).map(|g| (0, g)).collect();
+        let cols: Vec<OutCol> = q
+            .select
+            .iter()
+            .zip(&sel_tys)
+            .map(|(sel, ty)| {
+                gather_outcol(&SelSrc::Vv(vec![eval_vec(&rewrite(&sel.expr), &gctx)]), &refs, *ty)
+            })
+            .collect();
+        return Ok(QueryResult {
+            columns,
+            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
+            rows: Vec::new(),
+            out_rows: refs.len(),
+            cols: Some(cols),
+            scanned_groups,
+            total_groups: table.group_count(),
         });
     }
 
-    let offset = q.offset.unwrap_or(0) as usize;
-    let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
-    let rows: Vec<Vec<Val>> = rows.into_iter().skip(offset).take(limit).map(|(p, _)| p).collect();
-
+    // every non-aggregate path returned columnar above; this only drains
+    // the (empty) row seed
+    let rows: Vec<Vec<Val>> =
+        out_rows.into_iter().skip(offset).take(limit).map(|(p, _)| p).collect();
     let out_rows = rows.len();
     Ok(QueryResult {
         columns,
