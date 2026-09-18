@@ -59,7 +59,10 @@ impl Aggregate {
         let Aggregate { calls, accs, grouping, n_groups, count_only } = self;
         let count_only = *count_only;
         let rows = ctx.rows;
-        let kept = |i: usize| keep.map_or(true, |k| k[i] != 0);
+        // a plain invariant bool unswitches out of the row loops more reliably
+        // than matching the Option per row (measured 0.1 ms on 183K rows)
+        let (keep_all, keep_bits) = (keep.is_none(), keep.unwrap_or(&[]));
+        let kept = |i: usize| keep_all || keep_bits[i] != 0;
 
         let gids: Option<Vec<u32>> = match grouping {
             Grouping::Ungrouped => {
@@ -238,7 +241,7 @@ impl Aggregate {
         let base = table.catalog().schema.columns.len();
         let mut gcols: Cols = HashMap::new();
         for (i, (acc, call)) in self.accs.iter().zip(&self.calls).enumerate() {
-            let vv = lanes_to_vv(n_groups, call.ty(), |g| acc.finish(g));
+            let vv = acc.finish_lane(n_groups, call.ty());
             gcols.insert(base + i, (GroupCol::Ready(vv), None));
         }
         let key_base = base + self.calls.len();
@@ -288,7 +291,7 @@ impl Aggregate {
             }
             Grouping::Expr { keys, .. } => {
                 for (k, g_expr) in q.group_by.iter().enumerate() {
-                    let vv = lanes_to_vv(n_groups, g_expr.ty(), |g| keys[g][k].clone());
+                    let vv = lanes_to_vv(n_groups, g_expr.ty(), &|g| keys[g][k].clone());
                     gcols.insert(key_base + k, (GroupCol::Ready(vv), None));
                 }
             }
@@ -312,31 +315,32 @@ impl Aggregate {
             if numeric && nk == 1 {
                 let (_, dir) = &q.order_by[0];
                 let desc = *dir == SortDir::Desc;
+                // gid as the tiebreak: ties keep discovery order and the
+                // sort can be unstable
                 let mut keyed: Vec<(u8, u64, u32)> = (0..n_groups)
                     .map(|g| {
                         let (v, k) = encode_order(&ord_vvs[0], g, sh.ord_tys[0], desc);
                         (v, k, g as u32)
                     })
                     .collect();
-                // gid last: ties keep discovery order, and unstable is fine
-                keyed.sort_unstable();
+                sort_keyed3(&mut keyed);
                 perm = keyed.into_iter().map(|t| t.2).collect();
             } else if numeric {
-                let mut flat: Vec<(u8, u64)> = Vec::with_capacity(n_groups * nk);
+                // the gid rides along as one more key: ties keep discovery
+                // order, through the same sort as the row path
+                let mut flat: Vec<(u8, u64)> = Vec::with_capacity(n_groups * (nk + 1));
                 for g in 0..n_groups {
                     for (ki, (_, dir)) in q.order_by.iter().enumerate() {
                         flat.push(encode_order(&ord_vvs[ki], g, sh.ord_tys[ki], *dir == SortDir::Desc));
                     }
+                    flat.push((0, g as u64));
                 }
-                perm.sort_unstable_by(|&a, &b| {
-                    let (ia, ib) = (a as usize * nk, b as usize * nk);
-                    flat[ia..ia + nk].cmp(&flat[ib..ib + nk]).then(a.cmp(&b))
-                });
+                sort_perm_packed(&mut perm, &flat, nk + 1);
             } else {
                 let keys: Vec<Vec<Val>> = (0..n_groups)
                     .map(|g| ord_vvs.iter().zip(&sh.ord_tys).map(|(v, t)| v.val_at(g, *t)).collect())
                     .collect();
-                perm.sort_by(|&a, &b| cmp_keys(&keys[a as usize], &keys[b as usize], &q.order_by));
+                sort_perm_keys(&mut perm, &keys, &q.order_by);
             }
             perm
         };

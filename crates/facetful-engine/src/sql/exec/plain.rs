@@ -41,7 +41,10 @@ impl Plain {
 
     pub(super) fn scan_group(&mut self, sh: &Shared, ctx: &GroupCtx, keep: Option<&[u8]>) -> Flow {
         sel_srcs_for_group(sh.q, ctx, &mut self.srcs);
-        let kept = |i: usize| keep.map_or(true, |k| k[i] != 0);
+        // a plain invariant bool unswitches out of the row loops more reliably
+        // than matching the Option per row (measured 0.1 ms on 183K rows)
+        let (keep_all, keep_bits) = (keep.is_none(), keep.unwrap_or(&[]));
+        let kept = |i: usize| keep_all || keep_bits[i] != 0;
         let gslot = self.gslot;
         self.refs.extend((0..ctx.rows).filter(|&i| kept(i)).map(|i| (gslot, i as u32)));
         self.gslot += 1;

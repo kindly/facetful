@@ -216,8 +216,13 @@ pub(super) fn where_mask<S: ReadAt>(
     for c in conjuncts {
         match table.masks().get(&c.key, g) {
             Some(bits) => {
-                for (i, k) in keep.iter_mut().enumerate() {
-                    *k &= bits[i / 8] >> (i % 8) & 1;
+                // byte-parallel: one mask byte drives eight keep bytes; the
+                // per-row `i / 8, i % 8` form stopped vectorizing once this
+                // moved out of the driver (+0.1 ms on 183K rows)
+                for (chunk, &b) in keep.chunks_mut(8).zip(bits.iter()) {
+                    for (j, k) in chunk.iter_mut().enumerate() {
+                        *k &= (b >> j) & 1;
+                    }
                 }
             }
             None => pending.push(c),

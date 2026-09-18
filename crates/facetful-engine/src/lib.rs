@@ -439,9 +439,20 @@ impl<S: ReadAt> Table<S> {
             }
             base += rows;
         }
-        pairs.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-        pairs.truncate(k);
-        Ok(pairs.into_iter().map(|(_, i)| i).collect())
+        // order-preserving bits, flipped for DESC, in the (u8, u64, u32, u32)
+        // shape the executor's sorts use — one sort instantiation, not a
+        // total_cmp copy of its own
+        let mut keyed: Vec<(u8, u64, u32)> = pairs
+            .into_iter()
+            .map(|(v, i)| {
+                let b = v.to_bits();
+                let k = if b >> 63 == 1 { !b } else { b | (1u64 << 63) };
+                (0u8, !k, i)
+            })
+            .collect();
+        crate::sql::exec::sort_keyed2(&mut keyed);
+        keyed.truncate(k);
+        Ok(keyed.into_iter().map(|t| t.2).collect())
     }
 
     /// Materialize output values of one column for the given global row indices

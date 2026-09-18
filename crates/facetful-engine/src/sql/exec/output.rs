@@ -168,3 +168,41 @@ pub(super) fn cmp_keys(a: &[Val], b: &[Val], order_by: &[(Bound, SortDir)]) -> c
     }
     core::cmp::Ordering::Equal
 }
+
+/// Sort a permutation of indices by their packed numeric keys — `nk`
+/// `(validity, bits)` pairs per index. Unstable, and deliberately without
+/// an index tiebreak: making every key distinct defeats the sort's
+/// equal-element fast path, which real data (capacities, years) hits hard —
+/// measured +9% on a two-key sort of 183K rows. A caller that wants
+/// deterministic ties appends one as an extra key. One instantiation serves
+/// every caller: each distinct closure handed to `sort_by` is a separate
+/// copy of the algorithm.
+pub(super) fn sort_perm_packed(perm: &mut [u32], flat: &[(u8, u64)], nk: usize) {
+    perm.sort_unstable_by(move |&a, &b| {
+        let (ia, ib) = (a as usize * nk, b as usize * nk);
+        flat[ia..ia + nk].cmp(&flat[ib..ib + nk])
+    });
+}
+
+/// Single-key numeric sorts over 16-byte `(validity, bits, payload)`
+/// tuples — every caller in the crate sorts through one of these two, so
+/// there are two instantiations of the algorithm, not one per call site.
+/// Two on purpose: the key is the first two fields here, because real data
+/// ties constantly and a tiebreak defeats the sort's equal-element fast path
+/// (measured +10% on the 183K-row full sort) …
+pub(crate) fn sort_keyed2(v: &mut [(u8, u64, u32)]) {
+    v.sort_unstable_by_key(|t| (t.0, t.1));
+}
+
+/// … and here the payload (a gid) is the tiebreak, so ties keep a
+/// deterministic order — worth it where the rows are groups a UI will show.
+pub(super) fn sort_keyed3(v: &mut [(u8, u64, u32)]) {
+    v.sort_unstable_by_key(|t| (t.0, t.1, t.2));
+}
+
+/// Sort a permutation by materialized key tuples through `cmp_sql`. Stable.
+/// Concrete `&[Vec<Val>]` rather than a closure or `dyn`: one instantiation,
+/// static dispatch (a `dyn` call per compare measured +10% on a text sort).
+pub(super) fn sort_perm_keys(perm: &mut [u32], keys: &[Vec<Val>], order_by: &[(Bound, SortDir)]) {
+    perm.sort_by(|&a, &b| cmp_keys(&keys[a as usize], &keys[b as usize], order_by));
+}

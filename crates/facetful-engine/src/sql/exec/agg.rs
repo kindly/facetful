@@ -396,6 +396,50 @@ impl AggAcc {
         }
     }
 
+    /// The finished values of all `n` groups as one typed lane — this
+    /// aggregate's column in the group table. Direct per variant, no `Val`
+    /// per group (a `dyn` producer here measured −15% on a 183K-group query
+    /// in wasm); the rare aggregates go through `finish`.
+    pub(super) fn finish_lane(&self, n: usize, ty: Ty) -> VV {
+        fn bools(b: &[bool], n: usize) -> Option<Rc<Vec<u8>>> {
+            let mut v = vec![0u8; n.div_ceil(8)];
+            for (i, &ok) in b[..n].iter().enumerate() {
+                if ok {
+                    v[i / 8] |= 1 << (i % 8);
+                }
+            }
+            Some(Rc::new(v))
+        }
+        let ints = |v: Vec<i64>| VV { data: Data::I64(Rc::new(v)), valid: None };
+        match self {
+            AggAcc::Count(c) => ints(c[..n].to_vec()),
+            AggAcc::DistinctCodes { bits, .. } => {
+                ints(bits[..n].iter().map(|b| b.iter().map(|w| w.count_ones() as i64).sum()).collect())
+            }
+            AggAcc::DistinctNum(d) => ints(d.counts[..n].to_vec()),
+            AggAcc::DistinctStr { sets, .. } => ints(sets[..n].iter().map(|s| s.len() as i64).collect()),
+            AggAcc::SumI { v, any } => VV { data: Data::I64(Rc::new(v[..n].to_vec())), valid: bools(any, n) },
+            AggAcc::SumF { v, any } => VV { data: Data::F64(Rc::new(v[..n].to_vec())), valid: bools(any, n) },
+            AggAcc::Avg { sum, n: cnt } => {
+                let seen: Vec<bool> = cnt[..n].iter().map(|&c| c > 0).collect();
+                let v: Vec<f64> =
+                    (0..n).map(|g| if cnt[g] == 0 { 0.0 } else { sum[g] / cnt[g] as f64 }).collect();
+                VV { data: Data::F64(Rc::new(v)), valid: bools(&seen, n) }
+            }
+            AggAcc::MinMaxNum { v, seen, int, .. } => {
+                let valid = bools(seen, n);
+                if *int {
+                    VV { data: Data::I64(Rc::new(v[..n].iter().map(|&x| x as i64).collect())), valid }
+                } else {
+                    VV { data: Data::F64(Rc::new(v[..n].to_vec())), valid }
+                }
+            }
+            AggAcc::MinMaxStr { .. } | AggAcc::Median(_) | AggAcc::Stddev { .. } | AggAcc::GroupConcat { .. } => {
+                lanes_to_vv(n, ty, &|g| self.finish(g))
+            }
+        }
+    }
+
     pub(super) fn finish(&self, gid: usize) -> Val {
         match self {
             AggAcc::Count(v) => Val::Int(v[gid]),
@@ -430,8 +474,20 @@ impl AggAcc {
                 if src.is_empty() {
                     return Val::Null;
                 }
-                let mut v = src.clone();
-                v.sort_unstable_by(f64::total_cmp);
+                // through the shared (u8, u64, u32, u32) sort: order-preserving
+                // bits, then read the values back
+                let mut keyed: Vec<(u8, u64, u32)> = src
+                    .iter()
+                    .map(|x| {
+                        let b = x.to_bits();
+                        (0u8, if b >> 63 == 1 { !b } else { b | (1u64 << 63) }, 0)
+                    })
+                    .collect();
+                sort_keyed2(&mut keyed);
+                let v: Vec<f64> = keyed
+                    .into_iter()
+                    .map(|t| f64::from_bits(if t.1 >> 63 == 1 { t.1 & !(1u64 << 63) } else { !t.1 }))
+                    .collect();
                 let m = v.len() / 2;
                 Val::Float(if v.len() % 2 == 1 { v[m] } else { (v[m - 1] + v[m]) / 2.0 })
             }

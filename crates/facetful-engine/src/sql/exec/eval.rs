@@ -505,7 +505,7 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
             let items: Vec<VV> = std::iter::once(first)
                 .chain(args[1..].iter().map(|a| eval_vec(a, ctx)))
                 .collect();
-            lanes_to_vv(rows, ty, |i| {
+            lanes_to_vv(rows, ty, &|i| {
                 items.iter().find(|v| v.is_valid(i)).map(|v| lane_val(v, i)).unwrap_or(Val::Null)
             })
         }
@@ -531,7 +531,7 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
                     return VV { data: Data::F64(Rc::new(out)), valid: Some(Rc::new(valid)) };
                 }
             }
-            lanes_to_vv(rows, ty, |i| {
+            lanes_to_vv(rows, ty, &|i| {
                 let mut k = 0;
                 while k + 1 < items.len() {
                     if items[k].bool3_at(i) == Some(true) {
@@ -577,7 +577,7 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
             }
             let items: Vec<VV> =
                 std::iter::once(a).chain(args[1..].iter().map(|e| eval_vec(e, ctx))).collect();
-            lanes_to_vv(rows, ty, |i| {
+            lanes_to_vv(rows, ty, &|i| {
                 scalar_fn(name, items.iter().map(|v| lane_val(v, i)).collect())
             })
         }
@@ -702,7 +702,7 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
                 Data::F64(_) if !want_int => a,
                 _ => {
                     let items = vec![a];
-                    lanes_to_vv(rows, ty, |i| {
+                    lanes_to_vv(rows, ty, &|i| {
                         scalar_fn(name, items.iter().map(|v| lane_val(v, i)).collect())
                     })
                 }
@@ -711,7 +711,7 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
         _ if TEMPORAL_FNS.contains(&name) => {
             let aty = args[temporal_arg_index(name)].ty();
             let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
-            lanes_to_vv(rows, ty, |i| {
+            lanes_to_vv(rows, ty, &|i| {
                 let vals: Vec<Val> = items.iter().map(|v| lane_val(v, i)).collect();
                 temporal_fn(name, aty, &vals)
             })
@@ -719,7 +719,7 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
         // remaining scalars through lanes (cold path)
         _ => {
             let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
-            lanes_to_vv(rows, ty, |i| {
+            lanes_to_vv(rows, ty, &|i| {
                 let vals: Vec<Val> = items.iter().map(|v| lane_val(v, i)).collect();
                 scalar_fn(name, vals)
             })
@@ -744,7 +744,8 @@ pub(super) fn lane_val(v: &VV, i: usize) -> Val {
 }
 
 /// Build a typed vector from a per-lane Val producer (cold-op path).
-pub(super) fn lanes_to_vv(rows: usize, ty: Ty, f: impl Fn(usize) -> Val) -> VV {
+/// `dyn`: every `impl Fn` caller was its own copy of the four typed loops.
+pub(super) fn lanes_to_vv(rows: usize, ty: Ty, f: &dyn Fn(usize) -> Val) -> VV {
     let mut valid = vec![0u8; (rows + 7) / 8];
     match ty {
         Ty::Int | Ty::Date | Ty::Timestamp => {

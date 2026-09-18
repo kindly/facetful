@@ -5,22 +5,44 @@
 
 use super::*;
 
-struct Cand {
-    keys: Vec<Val>,
-    g: u32,
-    row: u32,
+/// The candidates as parallel arrays — keys and (group, row) refs — so the
+/// sort is the shared permutation sort over `&[Vec<Val>]`.
+struct Cands {
+    keys: Vec<Vec<Val>>,
+    refs: Vec<(u32, u32)>,
+}
+
+impl Cands {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+    /// Stable sort by key.
+    fn sort(&mut self, order_by: &[(Bound, SortDir)]) {
+        let mut perm: Vec<u32> = (0..self.keys.len() as u32).collect();
+        sort_perm_keys(&mut perm, &self.keys, order_by);
+        let mut keys: Vec<Option<Vec<Val>>> = self.keys.drain(..).map(Some).collect();
+        let refs = std::mem::take(&mut self.refs);
+        for &i in &perm {
+            self.keys.push(keys[i as usize].take().unwrap());
+            self.refs.push(refs[i as usize]);
+        }
+    }
+    fn truncate(&mut self, n: usize) {
+        self.keys.truncate(n);
+        self.refs.truncate(n);
+    }
 }
 
 pub(super) struct TopK {
     cap: usize,
-    cands: Vec<Cand>,
+    cands: Cands,
     /// full key of the current cutoff
     bound_key: Option<Vec<Val>>,
 }
 
 impl TopK {
     pub(super) fn new(cap: usize) -> TopK {
-        TopK { cap, cands: Vec::new(), bound_key: None }
+        TopK { cap, cands: Cands { keys: Vec::new(), refs: Vec::new() }, bound_key: None }
     }
 
     pub(super) fn scan_group(&mut self, sh: &Shared, g: usize, ctx: &GroupCtx, keep: Option<&[u8]>) {
@@ -41,11 +63,12 @@ impl TopK {
             }
             let keys: Vec<Val> =
                 ord_vvs.iter().zip(&sh.ord_tys).map(|(v, t)| v.val_at(i, *t)).collect();
-            self.cands.push(Cand { keys, g: g as u32, row: i as u32 });
+            self.cands.keys.push(keys);
+            self.cands.refs.push((g as u32, i as u32));
             if self.cands.len() >= self.cap * 2 + 16 {
-                self.cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
+                self.cands.sort(&q.order_by);
                 self.cands.truncate(self.cap);
-                self.bound_key = self.cands.last().map(|c| c.keys.clone());
+                self.bound_key = self.cands.keys.last().cloned();
             }
         }
     }
@@ -56,10 +79,11 @@ impl TopK {
         sh: &Shared,
     ) -> Result<QueryResult, FormatError> {
         let q = sh.q;
-        self.cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
+        self.cands.sort(&q.order_by);
         let offset = q.offset.unwrap_or(0) as usize;
         let limit = q.limit.unwrap_or(0) as usize;
-        let winners: Vec<Cand> = self.cands.into_iter().skip(offset).take(limit).collect();
+        // winners as (group, row) refs; keys are no longer needed
+        let winners: Vec<(u32, u32)> = self.cands.refs.into_iter().skip(offset).take(limit).collect();
 
         // Plain-text columns selected directly are gathered per winner row
         // straight off the borrowed segments — loading the lane would copy
@@ -77,13 +101,13 @@ impl TopK {
             let Some(ci) = ci else { continue };
             let mut vals = vec![Val::Null; winners.len()];
             let mut ok = true;
-            for g in winners.iter().map(|w| w.g).collect::<std::collections::BTreeSet<_>>() {
+            for g in winners.iter().map(|w| w.0).collect::<std::collections::BTreeSet<_>>() {
                 let got = table.with_text_segments(g as usize, ci, |offs, blob, valid| {
-                    for (wi, w) in winners.iter().enumerate() {
-                        if w.g != g {
+                    for (wi, &(wg, wrow)) in winners.iter().enumerate() {
+                        if wg != g {
                             continue;
                         }
-                        let i = w.row as usize;
+                        let i = wrow as usize;
                         if valid.is_some_and(|v| v[i / 8] >> (i % 8) & 1 == 0) {
                             continue; // stays Null
                         }
@@ -118,11 +142,11 @@ impl TopK {
 
         let mut sel_cache: HashMap<u32, Vec<Option<VV>>> = HashMap::new();
         let mut rows: Vec<Vec<Val>> = Vec::with_capacity(winners.len());
-        for (wi, c) in winners.iter().enumerate() {
-            if !sel_cache.contains_key(&c.g) {
-                let g = c.g as usize;
+        for (wi, &(cg, crow)) in winners.iter().enumerate() {
+            if !sel_cache.contains_key(&cg) {
+                let g = cg as usize;
                 // lanes only as deep as this group's deepest winner
-                let cap = winners.iter().filter(|w| w.g == c.g).map(|w| w.row as usize + 1).max().unwrap();
+                let cap = winners.iter().filter(|w| w.0 == cg).map(|w| w.1 as usize + 1).max().unwrap();
                 let mut cols: Cols = HashMap::new();
                 sh.load(table, g, &mut cols, &lane_cols, cap)?;
                 let ctx = GroupCtx { cols, rows: cap };
@@ -132,15 +156,15 @@ impl TopK {
                     .enumerate()
                     .map(|(si, s)| (!gathered.contains_key(&si)).then(|| eval_vec(&s.expr, &ctx)))
                     .collect();
-                sel_cache.insert(c.g, sel_vvs);
+                sel_cache.insert(cg, sel_vvs);
             }
-            let sel = &sel_cache[&c.g];
+            let sel = &sel_cache[&cg];
             rows.push(
                 sel.iter()
                     .zip(&sh.sel_tys)
                     .enumerate()
                     .map(|(si, (v, t))| match v {
-                        Some(v) => v.val_at(c.row as usize, *t),
+                        Some(v) => v.val_at(crow as usize, *t),
                         None => gathered[&si][wi].clone(),
                     })
                     .collect(),

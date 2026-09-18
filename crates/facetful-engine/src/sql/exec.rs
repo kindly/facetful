@@ -39,6 +39,7 @@ use output::*;
 use filter::*;
 use grouping::*;
 pub use value::{OutCol, QueryResult, Val};
+pub(crate) use output::sort_keyed2;
 
 fn collect_aggs(b: &Bound, out: &mut Vec<Bound>) {
     match b {

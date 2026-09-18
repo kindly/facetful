@@ -831,3 +831,36 @@ Against the 2026-09-12 rival numbers for this shape — DuckDB native 9.6 ms, Du
 
 **Still on the list, in order.** (1) Expression keys (`group by lower(x)`) are the last user of the `Vec<Val>` hash path: evaluate them to lanes and feed `TextGroups`, and `Grouping::Expr`, `lane_val` on keys and `HashMap<Vec<Val>>` all go — a net deletion. (2) `update_batch`'s accumulator × lane matrix and `eval_call_vec`'s function table are the remaining width; both are flat and each arm is independently testable, so they are the right kind of big. (3) `QueryResult.rows` is now produced only by top-k's finish; once that gathers columnar too, `rows` becomes `ensure_rows()`-only and the row representation leaves the executor entirely.
 </sv-prose>
+
+<sv-prose id="d39">
+## Build log 23 — wasm size: the bytes were monomorphization, not type handling (2026-09-18)
+
+**The question.** David asked whether the wasm could shrink by "reducing particular type handling and using wider types". Measured before answering: no size tooling installed, so the wasm was built unstripped and its code section attributed per function from the name section with a 60-line Python parser (v0 mangling grouped by path). Answer: the executor already evaluates every int as `i64` and every float as `f64`; narrow widths live only in the storage readers and the filter sweep, and none of that appears in the top of the list. What is large is **monomorphization** — generic code stamped out once per closure or key type.
+
+| code family | before | after | |
+|---|---|---|---|
+| `core::slice::sort` | **86 KB, ~68 fns** | **46 KB** | one full quicksort/driftsort per distinct closure handed to `sort_by`: 3 in `FullSort::finish`, 3 in `Aggregate::finish`, 2 for top-k `Cand`, `total_cmp` for median and the spike top-k, … |
+| `exec::eval` | 52 KB | 42 KB | `lanes_to_vv(impl Fn)` re-instantiated at every call site |
+| `exec::agg` | 36 KB | 41 KB | `update_batch` 28 KB (the accumulator × lane × validity matrix) + the new `finish_lane` |
+| parser + binder + lexer | 50 KB | 50 KB | needed |
+| float → text (`flt2dec`) | 16 KB | 16 KB | `{}` on f64, reached by `text()`/`\|\|`/`group_concat` |
+| Unicode case tables | 9 KB | 9 KB | `lower()`/`upper()` on non-ASCII — GEM names need it |
+| **whole module, stripped** | **569 KB raw / 207.6 KB gz** | **513 KB raw / 195.1 KB gz** | 67% → 63% of budget; below v0.3.0's 193 KB with everything since |
+
+**What landed (this commit).** Every sort in the crate goes through four functions in `output.rs`, so there are four instantiations of the algorithm instead of ~14: `sort_keyed2`/`sort_keyed3` over 16-byte `(validity, bits, payload)` tuples (median and the spike top-k route through them too), `sort_perm_packed` for multi-key numeric permutations, and `sort_perm_keys(perm, &[Vec<Val>], order_by)` for text keys — top-k's candidates became parallel `keys`/`refs` arrays so they fit that signature. `lanes_to_vv` takes `&dyn Fn` (the cold per-value path; six copies → one). `AggAcc::finish_lane` builds each aggregate's group-table column directly per variant — `Count` is a `to_vec`, `SumF` is the vector plus a validity bitmap from `any` — with no `Val` per group, which is faster than what it replaced. The cached-mask AND in `where_mask` is byte-parallel (eight `keep` bytes per mask byte).
+
+**Six traps, each measured, each the reason for a line of code above:**
+
+1. A derived `Ord` on a 4-tuple as the sort key was **1.7× slower** than `sort_unstable_by_key(|t| (t.0, t.1))` on the same tuple: `full_sort` 10 → 17 ms. Keys are explicit two- or three-field tuples.
+2. An index tiebreak on the multi-key sort cost **+9%** (22.5 → 25 ms): making every key distinct defeats the sort's equal-element fast path, and real data (capacities, years) ties constantly. `sort_perm_packed` has no tiebreak; the aggregate path appends the gid as one more key instead.
+3. The same reasoning splits `sort_keyed2` from `sort_keyed3`: a third key field is only worth paying for where the rows are groups a UI will show, so ties stay deterministic there and nowhere else.
+4. A `dyn` call per comparison in the text-key sort cost **+10%** (40 → 44.5 ms on 183K rows). The concrete `&[Vec<Val>]` signature is one instantiation *and* static dispatch.
+5. A 24-byte tuple element instead of 16 cost **−15% in wasm** on the 183K-group ordered shapes (memory moved by the sort). Payload is one `u32`; the full-sort path indexes its refs through it.
+6. A `dyn` producer for the aggregate finish lanes — the one *warm* `lanes_to_vv` site — cost **−15% in wasm** (`call_indirect` is far dearer than a native indirect call) while native showed nothing. Hence `finish_lane`.
+
+And one from the previous commit, found by bisecting wasm builds: `like_2col_facet` 0.32 → 0.42 ms arrived with the restructure — the per-row `bits[i / 8] >> (i % 8)` AND stopped vectorizing once it moved out of the driver. Byte-parallel, it now makes every cached-filter shape faster than before the restructure (`like_dict` 0.23 → 0.19, `in_list` 0.23 → 0.18, `facet_filtered` 1.15 → 1.09); `like_2col_facet` sits at 0.38, the residual 0.06 ms being the fixed cost of the vectorized output phase (a `HashMap` and a few `Vec`s) on a ten-group query.
+
+**Net speed.** Native, interleaved best-of-3 against the pre-size-work binary: `full_sort` 10.7 → 9.3 ms, `agg_order_1key` 3.6 → 3.2, two-key and text sorts within noise; wasm text-key shapes 0.96–1.05×; the canonical suite at parity or faster (`facet_count` 1.95 → 1.38 from the restructure). Gate clean; 70 tests; eight cross-check queries covering every changed sort path — full sorts by one, two and text keys, grouped ordering with ties, median, the 183K text-key top-100, the PUDL map — return byte-identical result sets.
+
+**Remaining size, if it is ever wanted.** `update_batch`'s no-null / check-the-bit arm pairs (~10 KB, and the no-null arms are what vectorize unfiltered sums — measure first); `flt2dec` (16 KB) if `text()` on floats ever gets a leaner formatter; the parser/binder is what it is. The fixed ~0.06 ms of the group-table output phase would come out by giving `GroupCtx` a `Vec` indexed by synthetic offset instead of a `HashMap`.
+</sv-prose>
