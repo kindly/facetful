@@ -168,6 +168,22 @@ self.onmessage = async (e) => {
         } catch { /* non-secure context or quota: stay memory-only */ }
       }
       reply({ ok: true, rows, source: "transcode", cached, transcodeMs });
+    } else if (cmd === "materialize") {
+      // derived table: run the query on the source table, compile its result
+      // into a new in-memory table under `name`; optionally persist the image
+      const src = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!src) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
+      const t0 = performance.now();
+      const img = engine.materialize(src, e.data.sql);
+      let bytes = 0;
+      if (e.data.persist) {
+        const image = engine.imageBytes(img);
+        bytes = image.byteLength;
+        await opfsWrite(e.data.persist, image);
+      }
+      const { handle, rows } = engine.openImage(img);
+      tables.set(e.data.name, handle);
+      reply({ ok: true, rows, bytes, elapsedMs: performance.now() - t0 });
     } else if (cmd === "storeOpfs") {
       await opfsWrite(e.data.path, new Uint8Array(e.data.buffer));
       reply({ ok: true, bytes: e.data.buffer.byteLength });

@@ -71,6 +71,17 @@ export class Facetful {
     return this._call({ cmd: "loadParquet", name, buffer }, [buffer]);
   }
 
+  /**
+   * Materialize a query's result as a new table named `name`: a derived,
+   * immutable table you then query like any other (`{ table: name }`).
+   * Runs against `table` (default: the last loaded). With `persist`, the
+   * compiled image is also written to OPFS at that path, so a later visit
+   * can `loadOpfs(name, path)` instead of recomputing. Returns { rows, bytes }.
+   */
+  async materialize(name, sql, { table, persist } = {}) {
+    return this._call({ cmd: "materialize", name, sql, table, persist });
+  }
+
   /** Persist a .facetful image into OPFS at `path` (e.g. "facetful/plants.facetful"). */
   async storeOpfs(path, buffer) {
     return this._call({ cmd: "storeOpfs", path, buffer }, [buffer]);

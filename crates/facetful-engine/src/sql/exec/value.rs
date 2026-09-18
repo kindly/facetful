@@ -20,7 +20,7 @@ impl Val {
     pub(super) fn is_null(&self) -> bool {
         matches!(self, Val::Null)
     }
-    pub(super) fn as_f64(&self) -> Option<f64> {
+    pub fn as_f64(&self) -> Option<f64> {
         match self {
             Val::Int(i) => Some(*i as f64),
             Val::Float(f) => Some(*f),

@@ -925,3 +925,15 @@ At 184.5 KB shipped this lands near 203 KB, 68% of budget, with the optimization
 
 **Not in this design:** query-time join execution, filter pushdown into a dimension scan, merge join, many-to-many, recursive CTEs, windows. Each is a separate decision if a workload ever asks; none is needed for a facet page over a star schema.
 </sv-prose>
+
+<sv-prose id="d42">
+## Build log 25 — `materialize`: a query result is a table (2026-09-18)
+
+Step (1) of the d41 plan, the primitive the rest stands on. `facetful_engine::materialize::materialize(table, sql, group_target) -> image` parses and binds the query, executes it, and hands the result's typed columns to the compiler Parquet ingest already uses (`compile_sorted`, the existing `compile` with a `sorted_by` parameter): text dictionary-encodes when the cardinality pays (the compiler's existing `dict × 2 < rows` rule), ints narrow to their range, every segment gets min/max stats. Two things are new in kind rather than plumbing: **the leading `ORDER BY` keys that are SELECT items become the table's `sorted_by`**, so a materialized ordering prunes by disjoint ranges and is free to re-sort by later; and **row order is the query's output order**, so a projection of a plant-ordered table keeps its clustering, which is what the d41 join design relies on. Duplicate SELECT names are an error at materialize time ("alias it"); booleans land as 0/1 ints (the compiler's input has no bool lane); an empty result is a valid zero-row table.
+
+Surfaces: wasm `table_materialize(t, sql, group_target)` → an `Outcome::Image` taken by `outcome_image` into the existing image handle (`image_open_table` / `image_ptr` — no copy back through JS to open it); worker command `materialize`; `db.materialize(name, sql, {table, persist})` registers the derived table under `name` and, with `persist`, writes the image to OPFS for a later `loadOpfs`; CLI `facetful materialize in.facetful "sql" out.facetful`, which is also how the differential can test it.
+
+Measured on PUDL: `group by fuel, state` with a distinct count and a sum over 231K rows → a 466-row, 7.5 KB image in **3.9 ms**; the fuel facet against it answers in **0.1 ms** where the source takes 1.8, with identical numbers. Tests: types, nulls, multi-group output, the recorded sort prefix, an empty result and the duplicate-name error; the node smoke runs a grouped materialize round-trip and the `QueryError` path. wasm **191.2 KB gz locally (62%)** — +3.4 KB for the module, in line with the d41 estimate. 73 tests, canonical gate clean.
+
+Next per d41: the derived-table cache and `WITH` / `FROM (subquery)` through it.
+</sv-prose>

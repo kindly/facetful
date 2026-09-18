@@ -57,6 +57,25 @@ Persistence is always explicit (`storeOpfs`), never write-behind. OPFS needs a
 secure context (https or localhost); everything degrades to memory-only
 without one.
 
+## Derived tables: `materialize`
+
+```js
+// a grouped result becomes a table of its own — queryable like any other,
+// with the same typed columns, nulls and (here) sort metadata
+await db.materialize("fuel_state", `
+  select fuel, state, count(*) as n, round(sum(net_generation_mwh)/1e6, 3) as twh
+  from t group by fuel, state order by twh desc`);
+const r = await db.query("select fuel, sum(twh) as twh from t group by fuel", { table: "fuel_state" });
+
+// persist the image to OPFS so a later visit can loadOpfs() it instead
+await db.materialize("fuel_state", sql, { persist: "facetful/fuel_state.facetful" });
+```
+
+Pre-aggregate a large detail table once per session and run the facets
+against the rollup; every SELECT item needs a distinct name. Row order is the
+query's output order, so a materialized `ORDER BY` is recorded as the table's
+sort. The CLI has the same verb: `facetful materialize in.facetful "select …" out.facetful`.
+
 ## Parquet support
 
 Reading uses [hyparquet](https://github.com/hyparam/hyparquet) (~20 KB gz),

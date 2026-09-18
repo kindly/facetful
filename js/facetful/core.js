@@ -121,6 +121,30 @@ export class Engine {
     return img;
   }
 
+  /**
+   * Materialize a query's result as a compiled image: the derived-table
+   * primitive. Returns an image handle (pass to openImage / imageBytes), or
+   * throws QueryError with the engine's diagnostic.
+   */
+  materialize(tableHandle, sql, { groupTarget = 65536 } = {}) {
+    const sqlBytes = this.enc.encode(sql);
+    const sqlPtr = u32(this.w.alloc(sqlBytes.byteLength));
+    new Uint8Array(this.mem(), sqlPtr, sqlBytes.byteLength).set(sqlBytes);
+    const h = this.w.table_materialize(tableHandle, sqlPtr, sqlBytes.byteLength, groupTarget);
+    try {
+      if (this.w.outcome_is_err(h)) {
+        const n = this.w.outcome_error(h, this.scratch, 4096);
+        throw new QueryError(this.dec.decode(new Uint8Array(this.mem(), this.scratch, n)));
+      }
+      const img = this.w.outcome_image(h);
+      if (!img) throw new Error("materialize produced no image");
+      return img;
+    } finally {
+      this.w.dealloc(sqlPtr, sqlBytes.byteLength);
+      this.w.outcome_free(h);
+    }
+  }
+
   /** Copy a compiled image's bytes out (for OPFS persistence). */
   imageBytes(img) {
     return new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), u32(this.w.image_len(img))).slice();

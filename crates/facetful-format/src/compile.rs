@@ -9,7 +9,7 @@
 //! when cardinality ≤ 256), validity bitmaps, group slicing.
 
 use crate::write::{ColumnChunk, DictData, SegmentData, Writer};
-use crate::{flags, ColumnDef, ColumnType, Schema};
+use crate::{flags, ColumnDef, ColumnType, Schema, SortKey};
 use std::collections::HashMap;
 
 /// One input column. `valid` is per-row (true = present); None = no nulls.
@@ -160,6 +160,21 @@ pub fn compile(
     cols: Vec<InCol>,
     group_target: u32,
 ) -> Result<(Vec<u8>, Schema), &'static str> {
+    compile_sorted(names, cols, group_target, Vec::new())
+}
+
+/// `compile`, recording that the rows arrive sorted by `sorted_by` (a
+/// materialized `ORDER BY`): readers then prune by disjoint ranges and skip
+/// the sort for a matching `ORDER BY`.
+pub fn compile_sorted(
+    names: &[String],
+    cols: Vec<InCol>,
+    group_target: u32,
+    sorted_by: Vec<SortKey>,
+) -> Result<(Vec<u8>, Schema), &'static str> {
+    if sorted_by.iter().any(|k| k.column as usize >= cols.len()) {
+        return Err("sort key column out of range");
+    }
     if names.len() != cols.len() || cols.is_empty() {
         return Err("column names and data must match and be non-empty");
     }
@@ -205,7 +220,7 @@ pub fn compile(
         })
         .collect();
 
-    let mut w = Writer::new(schema.clone(), vec![], group_target, &dicts);
+    let mut w = Writer::new(schema.clone(), sorted_by, group_target, &dicts);
     let group = group_target as usize;
     let mut start = 0;
     while start < nrows {

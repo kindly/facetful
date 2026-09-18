@@ -314,6 +314,8 @@ pub struct ColBuf {
 pub enum Outcome {
     Ok { cols: Vec<ColBuf>, rows: usize, scanned: u32, total: u32 },
     Err(String),
+    /// a materialized query: a compiled image, taken with `outcome_image`
+    Image(Vec<u8>),
 }
 
 fn columnize(mut r: QueryResult) -> Outcome {
@@ -459,6 +461,39 @@ pub extern "C" fn query_run(t: usize, sql_ptr: *const u8, sql_len: usize) -> usi
 
 fn outcome(h: usize) -> &'static Outcome {
     unsafe { &*(h as *const Outcome) }
+}
+
+/// Materialize `sql` over table `t` into a compiled image. The outcome is
+/// `Image` on success (take it with `outcome_image`, then `image_open_table`
+/// or `image_ptr`/`image_len`) or `Err` with the rendered diagnostic.
+#[no_mangle]
+pub extern "C" fn table_materialize(
+    t: usize,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    group_target: u32,
+) -> usize {
+    let t = unsafe { &mut *(t as *mut T) };
+    let sql = unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) };
+    let outcome = match core::str::from_utf8(sql) {
+        Err(_) => Outcome::Err("query is not valid UTF-8".into()),
+        Ok(sql) => match facetful_engine::materialize::materialize(t, sql, group_target) {
+            Ok(image) => Outcome::Image(image),
+            Err(d) => Outcome::Err(d.render(sql)),
+        },
+    };
+    Box::into_raw(Box::new(outcome)) as usize
+}
+
+/// Move a materialized image out of its outcome as an image handle
+/// (0 when the outcome is not an image).
+#[no_mangle]
+pub extern "C" fn outcome_image(h: usize) -> usize {
+    let o = unsafe { &mut *(h as *mut Outcome) };
+    match o {
+        Outcome::Image(img) => Box::into_raw(Box::new(core::mem::take(img))) as usize,
+        _ => 0,
+    }
 }
 
 #[no_mangle]

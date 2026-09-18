@@ -96,4 +96,22 @@ try {
   console.log("temporal round-trip: OK");
 }
 
+// materialize: a grouped, ordered result becomes a table; types and the
+// sort metadata survive; the derived table answers the same query
+{
+  const img = engine.materialize(handle, "select country, count(*) as n, round(sum(capacity), 1) as mw from t group by country order by mw desc");
+  const derived = engine.openImage(img);
+  const a = engine.query(derived.handle, "select country, n, mw from t order by mw desc limit 3");
+  const b = engine.query(handle, "select country, count(*) as n, round(sum(capacity), 1) as mw from t group by country order by mw desc limit 3");
+  for (let i = 0; i < 3; i++) {
+    if (text(a.columns[0], i) !== text(b.columns[0], i) || a.columns[1].values[i] !== b.columns[1].values[i]
+        || a.columns[2].values[i] !== b.columns[2].values[i]) throw new Error(`materialize row ${i} differs`);
+  }
+  if (a.columns[1].kind !== "int" || a.columns[2].kind !== "float") throw new Error(`materialize kinds: ${a.columns.map((c) => c.kind)}`);
+  let bad = false;
+  try { engine.materialize(handle, "select country, country from t"); } catch (e) { bad = e instanceof QueryError && /duplicate column/.test(e.message); }
+  if (!bad) throw new Error("duplicate select names must be a QueryError");
+  console.log(`materialize round-trip: OK (${derived.rows} rows)`);
+}
+
 console.log("js protocol smoke: OK");

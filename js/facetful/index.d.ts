@@ -92,6 +92,17 @@ export declare class Facetful {
   loadParquet(name: string, buffer: ArrayBuffer): Promise<{ rows: number; transcodeMs: number }>;
 
   /** Persist a .facetful image into OPFS at `path` (buffer transferred). */
+  /**
+   * Materialize a query's result as a new table `name`, queryable via
+   * `{ table: name }`. With `persist`, the image is also written to OPFS at
+   * that path for a later `loadOpfs`. `bytes` is the persisted image size (0
+   * when not persisted).
+   */
+  materialize(
+    name: string,
+    sql: string,
+    options?: { table?: string; persist?: string },
+  ): Promise<{ rows: number; bytes: number; elapsedMs: number }>;
   storeOpfs(path: string, buffer: ArrayBuffer): Promise<{ bytes: number }>;
 
   /**

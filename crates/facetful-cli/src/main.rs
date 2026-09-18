@@ -37,6 +37,7 @@ fn main() {
         Some("convert") => convert(&args[1..]),
         Some("inspect") => inspect(&args[1..]),
         Some("query") => query(&args[1..]),
+        Some("materialize") => materialize(&args[1..]),
         _ => {
             eprintln!("usage: facetful convert in.csv out.facetful [--row-group-size N]");
             eprintln!("       facetful inspect file.facetful");
@@ -434,4 +435,57 @@ fn inspect(args: &[String]) {
         });
         println!("  {:20} {:?}{} {:>10} bytes  {}", c.name, c.ty, if c.is_dict() { " dict" } else { "" }, bytes_total, stats);
     }
+}
+
+
+/// `facetful materialize in.facetful "sql" out.facetful [--row-group-size N]`:
+/// run the query and write its result as a new image — the CLI face of the
+/// derived-table primitive (and how the differential tests it).
+fn materialize(args: &[String]) {
+    let mut group_target = 65_536u32;
+    let mut pos: Vec<&String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--row-group-size" {
+            group_target = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                eprintln!("--row-group-size needs a positive integer");
+                exit(2);
+            });
+        } else {
+            pos.push(a);
+        }
+    }
+    let [input, sql, output] = pos[..] else {
+        eprintln!("usage: facetful materialize in.facetful \"select …\" out.facetful [--row-group-size N]");
+        exit(2);
+    };
+    let bytes = std::fs::read(input).unwrap_or_else(|e| {
+        eprintln!("cannot read {input}: {e}");
+        exit(1);
+    });
+    let mut table = facetful_engine::Table::open(bytes).unwrap_or_else(|e| {
+        eprintln!("{input}: {e}");
+        exit(1);
+    });
+    let t0 = std::time::Instant::now();
+    let image = facetful_engine::materialize::materialize(&mut table, sql, group_target)
+        .unwrap_or_else(|d| {
+            eprint!("{}", d.render(sql));
+            exit(1);
+        });
+    let derived = facetful_engine::Table::open(image.clone()).unwrap_or_else(|e| {
+        eprintln!("materialized image failed to open: {e}");
+        exit(1);
+    });
+    std::fs::write(output, &image).unwrap_or_else(|e| {
+        eprintln!("cannot write {output}: {e}");
+        exit(1);
+    });
+    eprintln!(
+        "{output}: {} rows, {} columns, {} bytes, {:.1} ms",
+        (0..derived.group_count()).map(|g| derived.group_rows(g)).sum::<usize>(),
+        derived.catalog().schema.columns.len(),
+        image.len(),
+        t0.elapsed().as_secs_f64() * 1e3
+    );
 }
