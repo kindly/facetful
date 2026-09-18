@@ -1,4 +1,10 @@
 # SIMD128 is the default for wasm builds (decision 2026-08-30: its browser floor —
 # Chrome 91+/FF 89+/Safari 16.4+ — matches OPFS's, and the lang-bench measured 3-10x on scans).
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128"]
+# inline-threshold=50 (LLVM default at O3 is 250): measured 2026-09-18 across
+# 30 shapes on three datasets — speed at parity (several shapes slightly faster),
+# 7 KB gz smaller locally, 6 KB after CI's wasm-opt. 25 was past the knee
+# (projections 5-9% slower, no smaller); opt-level "s" cost 10-27% on grouping
+# and projection for 19 KB, "z" 1.5-4x for 32 KB. An LLVM-internal flag: if a
+# toolchain bump changes it, size-check.sh and bench.sh are the tripwires.
+rustflags = ["-C", "target-feature=+simd128", "-C", "llvm-args=-inline-threshold=50"]

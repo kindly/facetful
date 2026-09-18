@@ -864,3 +864,25 @@ And one from the previous commit, found by bisecting wasm builds: `like_2col_fac
 
 **Remaining size, if it is ever wanted.** `update_batch`'s no-null / check-the-bit arm pairs (~10 KB, and the no-null arms are what vectorize unfiltered sums — measure first); `flt2dec` (16 KB) if `text()` on floats ever gets a leaner formatter; the parser/binder is what it is. The fixed ~0.06 ms of the group-table output phase would come out by giving `GroupCtx` a `Vec` indexed by synthetic offset instead of a `HashMap`.
 </sv-prose>
+
+<sv-prose id="d40">
+## Build log 24 — the middle ground between opt-level 3 and z (2026-09-18)
+
+**The question.** David remembered the M6 decision (`opt-level=3`, not `"z"`: 2–3× faster for +15 KB gz) as "one extreme to the other" and asked whether a compiler flag sits in between. Measured the same way as then: every variant built, then every one of the 30 shapes (canonical 14 on GEM, the 6 text-key shapes, the 10 PUDL grouping shapes) run in Node, best of 15 warm.
+
+| variant | gz (local) | speed vs `O3` | verdict |
+|---|---|---|---|
+| `opt-level=3` (current) | 195.1 KB | — | |
+| **`3` + `-inline-threshold=50`** | **187.8 KB** | **parity; several shapes 2–5% faster** (`full_sort` 14.2 → 13.7, `like_2col_facet` 0.39 → 0.35) | **adopted** |
+| `3` + `-inline-threshold=25` | 189.2 KB | projections 5–9% slower | past the knee — and no smaller |
+| `opt-level=2` | 190.3 KB | parity | dominated by the line above |
+| `2` + `-inline-threshold=50` | 183.3 KB | top-k +11%, text projection +5% | 4.5 KB not worth a slower keystroke |
+| `opt-level=s` | 176.3 KB | **10–27% slower** on grouping and projection (`map` 7.8 → 9.0, `pf_sum_order_limit` 5.2 → 6.4, `topk` 1.9 → 2.4) | no |
+| `opt-level=z` | 163.2 KB | **1.5–4× slower** everywhere (`projection_floats` 2.8 → 10.5) | the 2026-09-04 decision stands |
+| per-crate `z` for `facetful-format` | 194.8 KB | — | −0.3 KB: under fat LTO a per-crate level barely exists |
+| `wasm-opt -O3` vs `-Os` vs `-Oz` post-pass | within 0.5 KB of each other | — | CI's `-O3` is right; the pass itself is worth ~5 KB |
+
+**Adopted:** `-C llvm-args=-inline-threshold=50` in the wasm target's rustflags (`.cargo/config.toml`), beside `+simd128`. LLVM's default at O3 is 250; the flag trims the *duplication* that inlining creates in the big `execute`/`Strategy` bodies while the kernels — which are small and hot — still inline. It is an LLVM-internal flag rather than a rustc guarantee; `size-check.sh` and `bench.sh` are the tripwires if a toolchain bump changes its meaning. Shipped size after CI's `wasm-opt -O3`: **190.3 → 184.5 KB gz**. Node smoke, temporal round-trip and the Parquet-path differential pass on the new build; three interleaved rounds against the plain O3 build show no shape outside noise.
+
+**Position.** Two of the three levers are now settled by measurement: code shape (build log 23: monomorphization, not type width) and compiler flags (this entry). The third, `opt-level=s`, is what to reach for only if the budget ever genuinely binds — it buys 11 KB more for a 10–27% cost the pages would feel. At 61% of budget with headroom of ~120 KB, nothing argues for it.
+</sv-prose>
