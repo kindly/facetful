@@ -16,6 +16,14 @@ fn repo(p: &str) -> PathBuf {
 }
 
 const QUERIES: &[&str] = &[
+    // CTEs and FROM subqueries: materialized here, inlined by SQLite — same answers
+    "with c as (select country, count(*) as n, sum(capacity) as total from t group by country) \
+     select country, n, total from c where n > 100 order by total desc, country limit 10",
+    "select fuel, sum(n) as rows, count(*) as groups from \
+     (select fuel, status, count(*) as n from t group by fuel, status) s group by fuel order by fuel",
+    "with a as (select id, country, capacity from t where capacity is not null), \
+     b as (select country, max(capacity) as top from a group by country) \
+     select country, top from b order by top desc, country limit 5",
     // counts, distinct, null-aware counting
     "select count(*), count(capacity), count(distinct country) from t",
     // group + aggregates + order + limit

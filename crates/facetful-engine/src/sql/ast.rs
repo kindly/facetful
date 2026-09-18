@@ -77,11 +77,29 @@ pub struct OrderItem {
     pub dir: SortDir,
 }
 
+/// `WITH name AS (query)`: a named derived table, materialized once and
+/// cached — the optimization fence is the only mode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub name_span: Span,
+    pub query: Box<Query>,
+    /// the parenthesized body's text, for the derived-table cache key
+    pub body_span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    pub with: Vec<Cte>,
     pub select: Vec<SelectItem>,
+    /// the FROM name: a CTE in scope, else the table itself (any spelling);
+    /// for `FROM (subquery) alias`, the alias (or empty)
     pub from: String,
     pub from_span: Span,
+    /// `FROM (subquery)`: an anonymous CTE
+    pub from_subquery: Option<Box<Query>>,
+    /// the whole query's text
+    pub span: Span,
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub order_by: Vec<OrderItem>,

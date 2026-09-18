@@ -10,23 +10,28 @@
 use crate::format::compile::{compile_sorted, InCol};
 use crate::format::read::ReadAt;
 use crate::format::SortKey;
-use crate::sql::binder::{Binder, BoundQuery, Ty};
-use crate::sql::exec::{execute, OutCol, QueryResult, Val};
-use crate::sql::{parse_query, span::Span, Diagnostic};
+use crate::sql::binder::{BoundQuery, Ty};
+use crate::sql::exec::{OutCol, QueryResult, Val};
+use crate::sql::{execute_sql, span::Span, Diagnostic};
 use crate::Table;
 
-/// Run `sql` against `table` and compile the result into a `.facetful`
-/// image. Every SELECT item needs a distinct name (alias it if not).
+/// Run `sql` against `table` (CTEs and subqueries included) and compile the
+/// result into a `.facetful` image. Every SELECT item needs a distinct name
+/// (alias it if not).
 pub fn materialize<S: ReadAt>(
     table: &mut Table<S>,
     sql: &str,
     group_target: u32,
 ) -> Result<Vec<u8>, Diagnostic> {
-    let q = parse_query(sql)?;
-    let schema = table.catalog().schema.clone();
-    let bound = Binder::new(&schema).bind_query(&q)?;
-    let err = |m: String| Diagnostic::new(m, Span::new(0, 0));
+    let (bound, result) = execute_sql(table, sql)?;
+    compile_result(&bound, result, group_target)
+}
 
+/// A finished query's result as an image: the columns typed from the bound
+/// query, nulls kept, the leading ORDER BY keys that are SELECT items
+/// recorded as the table's sort.
+pub fn compile_result(bound: &BoundQuery, mut r: QueryResult, group_target: u32) -> Result<Vec<u8>, Diagnostic> {
+    let err = |m: String| Diagnostic::new(m, Span::new(0, 0));
     let names: Vec<String> = bound.select.iter().map(|s| s.name.clone()).collect();
     for (i, n) in names.iter().enumerate() {
         if names[..i].contains(n) {
@@ -34,9 +39,7 @@ pub fn materialize<S: ReadAt>(
         }
     }
     let tys: Vec<Ty> = bound.select.iter().map(|s| s.expr.ty()).collect();
-    let sorted_by = sorted_by_of(&bound);
-
-    let mut r = execute(table, &bound).map_err(|e| err(format!("execution error: {e}")))?;
+    let sorted_by = sorted_by_of(bound);
     let n = r.n_rows();
     let cols: Vec<InCol> = match r.cols.take() {
         Some(out) => out.iter().zip(&tys).map(|(c, ty)| from_outcol(c, *ty, n)).collect(),

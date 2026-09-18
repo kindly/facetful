@@ -38,6 +38,27 @@ pub struct Table<S: ReadAt> {
     dict_rc_cache: Vec<Option<std::rc::Rc<Vec<std::rc::Rc<String>>>>>,
     /// WHERE-conjunct bitmaps (see `mask_cache`); byte-bounded, LRU.
     masks: mask_cache::MaskCache,
+    /// Derived tables — materialized CTEs, subqueries and (later) joins —
+    /// keyed by their canonical SQL over this table; byte-bounded, LRU.
+    /// The mask cache's shape, one level up: tables never change, so nothing
+    /// goes stale and only the budget evicts. A Vec, not a HashMap: a handful
+    /// of entries, and a HashMap<String, _> instantiation is kilobytes of wasm.
+    derived: Vec<Derived<S>>,
+    derived_bytes: usize,
+    derived_budget: usize,
+    derived_tick: u64,
+    pub derived_hits: u64,
+    pub derived_misses: u64,
+}
+
+/// Default derived-table budget: a few large rollups, dozens of facet-sized ones.
+pub const DEFAULT_DERIVED_BUDGET: usize = 64 << 20;
+
+struct Derived<S: ReadAt> {
+    key: String,
+    table: Table<S>,
+    bytes: usize,
+    last_used: u64,
 }
 
 struct SegEntry {
@@ -80,12 +101,89 @@ impl<S: ReadAt> Table<S> {
             dict_cache,
             dict_rc_cache,
             masks: mask_cache::MaskCache::default(),
+            derived: Vec::new(),
+            derived_bytes: 0,
+            derived_budget: DEFAULT_DERIVED_BUDGET,
+            derived_tick: 0,
+            derived_hits: 0,
+            derived_misses: 0,
         })
     }
 
     /// The filter-mask cache (per-conjunct WHERE bitmaps).
     pub fn masks(&mut self) -> &mut mask_cache::MaskCache {
         &mut self.masks
+    }
+
+    /// A cached derived table, touched as most recently used.
+    pub fn derived_get(&mut self, key: &str) -> Option<&mut Table<S>> {
+        self.derived_tick += 1;
+        let tick = self.derived_tick;
+        match self.derived.iter_mut().find(|d| d.key == key) {
+            Some(d) => {
+                self.derived_hits += 1;
+                d.last_used = tick;
+                Some(&mut d.table)
+            }
+            None => {
+                self.derived_misses += 1;
+                None
+            }
+        }
+    }
+
+    /// A derived table known to be present, for running a query against it;
+    /// touches it as most recently used without counting as a probe.
+    pub fn derived_table(&mut self, key: &str) -> Option<&mut Table<S>> {
+        self.derived_tick += 1;
+        let tick = self.derived_tick;
+        self.derived.iter_mut().find(|d| d.key == key).map(|d| {
+            d.last_used = tick;
+            &mut d.table
+        })
+    }
+
+    /// Drop least-recently-used derived tables until `incoming` more bytes fit.
+    fn evict_derived(&mut self, incoming: usize) {
+        while self.derived_bytes + incoming > self.derived_budget && !self.derived.is_empty() {
+            let (i, _) = self
+                .derived
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, d)| d.last_used)
+                .expect("non-empty");
+            let d = self.derived.swap_remove(i);
+            self.derived_bytes -= d.bytes;
+        }
+    }
+
+    /// Open `image` as a derived table under `key`, evicting least-recently-
+    /// used derived tables past the budget. With a zero budget the table is
+    /// still returned for this query but not kept.
+    pub fn derived_insert(&mut self, key: &str, image: Vec<u8>) -> Result<&mut Table<S>, FormatError> {
+        let bytes = image.len();
+        let src = S::from_memory(image)
+            .ok_or(FormatError::Io("derived tables need a source that can own memory"))?;
+        let table = Table::open(src)?;
+        self.evict_derived(bytes);
+        self.derived_tick += 1;
+        self.derived_bytes += bytes;
+        if let Some(i) = self.derived.iter().position(|d| d.key == key) {
+            self.derived_bytes -= self.derived[i].bytes;
+            self.derived.swap_remove(i);
+        }
+        self.derived.push(Derived { key: key.to_string(), table, bytes, last_used: self.derived_tick });
+        Ok(&mut self.derived.last_mut().expect("just pushed").table)
+    }
+
+    pub fn set_derived_budget(&mut self, bytes: usize) {
+        self.derived_budget = bytes;
+        self.evict_derived(0);
+    }
+
+    /// (entries, bytes, hits, misses) of the derived-table cache.
+    pub fn derived_stats(&self) -> (usize, usize, u64, u64) {
+        (self.derived.len(), self.derived_bytes, self.derived_hits, self.derived_misses)
     }
 
     /// Bound the segment cache (bytes). Exceeding it evicts least-recently-used

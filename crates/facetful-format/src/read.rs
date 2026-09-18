@@ -15,9 +15,22 @@ pub trait ReadAt {
     fn read_ref(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
         None
     }
+    /// Wrap an in-memory image as a source of this type, so a derived table
+    /// (a materialized CTE or join) uses the same `S` as its source and the
+    /// executor is instantiated once. Borrowed sources cannot own bytes and
+    /// keep the `None` default.
+    fn from_memory(_bytes: Vec<u8>) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 impl ReadAt for Vec<u8> {
+    fn from_memory(bytes: Vec<u8>) -> Option<Self> {
+        Some(bytes)
+    }
     fn len(&self) -> u64 {
         Vec::len(self) as u64
     }

@@ -937,3 +937,17 @@ Measured on PUDL: `group by fuel, state` with a distinct count and a sum over 23
 
 Next per d41: the derived-table cache and `WITH` / `FROM (subquery)` through it.
 </sv-prose>
+
+<sv-prose id="d43">
+## Build log 26 — WITH and FROM (subquery) as cached materializations (2026-09-18)
+
+Step (2) of d41. `WITH name AS (query) [, …] select … from name` and `select … from (query) alias` parse as full nested queries (`ast::Cte`, `Query::from_subquery`, whole-query spans). Resolution lives in `sql::exec_query`: each CTE body is materialized through `materialize::compile_result` into the table's new **derived-table cache** — `Table::derived`, the mask cache's shape one level up: keyed by the body's **token stream re-spelled from its spans** (whitespace vanishes, keywords and bare identifiers lowercase, string literals and quoted identifiers keep their case — not `{:?}` of the token enum, which is wasm bytes) plus the key of the table it reads from, byte-bounded (64 MB default, `set_derived_budget`, wasm `table_set_derived_budget`), least-recently-used eviction, never stale because tables never change. The final query then binds against whichever table its FROM names — a CTE in scope, else the table itself — and runs unchanged; a CTE may shadow the table's name, bodies chain (each sees the CTEs before it) and nest. `materialize` itself now goes through `execute_sql`, so a `db.materialize` body may use CTEs.
+
+**One instantiation, not two.** A derived table must have the *same* source type `S` as its parent, or the wasm would carry a second copy of the whole executor (~20 KB gz). `ReadAt::from_memory(Vec<u8>) -> Option<Self>` wraps an image as the source's own type — `Vec<u8>` and the wasm `Src::Mem` say `Some`, borrowed sources keep the `None` default and report "derived tables need a source that can own memory". The cache is a `Vec` with a linear scan, not a `HashMap<String, _>` — a handful of entries, and the map instantiation alone measured 0.8 KB. Net wasm cost of the whole step, measured against the materialize commit: **+4.2 KB gz** (191.2 → 195.4; 64%) — the parser's recursive query, the resolver and the cache.
+
+**Measured** (plant_tech_year, native): the fuel facet written as `with r as (fuel × state rollup) select … from r group by fuel` — **3.7 ms on first use, 0.01 ms after**; a *different* query over the same CTE body (`state` totals) hits the cache at 0.01 ms; the direct facet is 2.1 ms every time. The optimization fence, which most databases apply to CTEs as a compromise, is here the whole point: over immutable data queried in bursts, computing a CTE once per session is simply faster.
+
+Tests: results equal the unfolded query, chained CTEs, `FROM (subquery)` under an outer aggregate, cache hit on a re-spelled body, shadowing, types preserved, an error inside a body rendered with its span. Three CTE / subquery queries joined the SQLite differential, which inlines them and agrees. 74 tests, canonical gate clean.
+
+Next per d41: the one-shot LEFT hash join as a shape `materialize` accepts, then `JOIN` syntax as its cached anonymous form.
+</sv-prose>

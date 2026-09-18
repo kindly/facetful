@@ -31,6 +31,7 @@ pub enum Tok {
     Concat, // ||
     // keywords (reserved set — some spellings are sugar, all reserved now)
     Select,
+    With,
     From,
     Where,
     Group,
@@ -61,6 +62,7 @@ pub enum Tok {
 
 pub const KEYWORDS: &[(&str, Tok)] = &[
     ("select", Tok::Select),
+    ("with", Tok::With),
     ("from", Tok::From),
     ("where", Tok::Where),
     ("group", Tok::Group),

@@ -508,6 +508,50 @@ fn text_key_grouping_matches_reference() {
     assert_eq!(got, counts);
 }
 
+/// WITH and FROM (subquery) materialize into the table's derived cache: the
+/// results equal the unfolded query, chained CTEs see earlier ones, an
+/// identical body is a cache hit, and a CTE may shadow the table's name.
+#[test]
+fn ctes_and_subqueries_materialize_and_cache() {
+    let mut t = table();
+    let folded = qt(&mut t, "select region, count(*) as n, sum(capacity) as cap from t group by region order by cap desc");
+    let with = "with r as (select region, count(*) as n, sum(capacity) as cap from t group by region) \
+                select region, n, cap from r order by cap desc";
+    assert_eq!(qt(&mut t, with), folded);
+    let (entries, bytes, hits, misses) = t.derived_stats();
+    assert_eq!((entries, hits, misses), (1, 0, 1));
+    assert!(bytes > 0);
+    // same body, different whitespace: a hit, no new entry
+    let with2 = "with   r as ( select region,  count(*) as n, sum(capacity) as cap from t group by region )\n select region, n, cap from r order by cap desc";
+    assert_eq!(qt(&mut t, with2), folded);
+    assert_eq!(t.derived_stats().0, 1);
+    assert_eq!(t.derived_stats().2, 1, "second run hits the cache");
+    // FROM (subquery) is an anonymous CTE; an outer aggregate over it
+    assert_eq!(
+        qt(&mut t, "select sum(n) as rows, count(*) as regions from (select region, count(*) as n from t group by region) x"),
+        vec![vec!["10", "3"]]
+    );
+    // chained: the second CTE reads the first; the final query reads the second
+    assert_eq!(
+        qt(&mut t, "with a as (select region, year, capacity from t where year >= 2002), \
+                    b as (select region, count(*) as n from a group by region) \
+                    select region, n from b order by n desc, region"),
+        vec![vec!["eu", "3"], vec!["asia", "2"], vec!["us", "1"]]
+    );
+    // a CTE named like the table shadows it for the outer query
+    assert_eq!(qt(&mut t, "with t as (select year from t where year = 2004) select count(*) from t"), vec![vec!["2"]]);
+    // types survive: a CTE's float sum is still a float, its count an int
+    let mut r = run_query(&mut t, with).unwrap();
+    r.ensure_rows();
+    assert!(matches!(r.rows[0][1], Val::Int(_)));
+    assert!(matches!(r.rows[0][2], Val::Float(_)));
+    // a bad column inside a CTE body is reported (spans are whole-text)
+    let Err(err) = run_query(&mut t, "with r as (select nope from t) select * from r") else {
+        panic!("an unknown column inside a CTE body must be an error")
+    };
+    assert!(err.render("").contains("nope"), "{}", err.render(""));
+}
+
 #[test]
 fn scalar_functions_and_expressions() {
     let rows = q("select upper(region) || '-' || text(year) as tag from t \

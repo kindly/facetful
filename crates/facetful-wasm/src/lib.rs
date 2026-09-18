@@ -34,6 +34,9 @@ pub enum Src {
 }
 
 impl ReadAt for Src {
+    fn from_memory(bytes: Vec<u8>) -> Option<Self> {
+        Some(Src::Mem(bytes))
+    }
     fn len(&self) -> u64 {
         match self {
             Src::Mem(v) => v.len() as u64,
@@ -134,6 +137,14 @@ pub extern "C" fn table_set_mask_budget(t: usize, bytes: f64) {
 }
 
 /// (cached segments << 32) | cached KiB — cache observability for the JS side.
+/// Byte budget for derived tables (materialized CTEs / subqueries) cached on
+/// this table; 0 disables caching.
+#[no_mangle]
+pub extern "C" fn table_set_derived_budget(t: usize, bytes: f64) {
+    let t = unsafe { &mut *(t as *mut T) };
+    t.set_derived_budget(bytes as usize);
+}
+
 #[no_mangle]
 pub extern "C" fn table_cache_stats(t: usize) -> u64 {
     let t = unsafe { &*(t as *const T) };

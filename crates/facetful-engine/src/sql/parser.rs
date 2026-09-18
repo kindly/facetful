@@ -87,6 +87,23 @@ impl Parser {
     // ---------------- query skeleton ----------------
 
     fn query(&mut self) -> Result<Query, Diagnostic> {
+        let start = self.peek_span().start;
+        // WITH name AS (query) [, …] — each body is a full query, recursively
+        let mut with = Vec::new();
+        if self.eat(&Tok::With) {
+            loop {
+                let (name, name_span) = self.ident("as the name after 'with'")?;
+                self.expect(Tok::As, "after the name in 'with name as (…)'")?;
+                let open = self.expect(Tok::LParen, "to open the with-query")?;
+                let query = Box::new(self.query()?);
+                let close = self.expect(Tok::RParen, "to close the with-query")?;
+                let body_span = Span::new(open.start, close.end);
+                with.push(Cte { name, name_span, query, body_span });
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
         self.expect(Tok::Select, "to start the query")?;
         let mut select = vec![self.select_item()?];
         while self.eat(&Tok::Comma) {
@@ -94,7 +111,23 @@ impl Parser {
         }
         self.expect(Tok::From, "after the select list")
             .map_err(|d| d.with_hint("multiple select expressions are separated by ','"))?;
-        let (from, from_span) = self.table_name()?;
+        // FROM name, or FROM (subquery) [AS] alias
+        let (from, from_span, from_subquery) = if let Tok::LParen = self.peek() {
+            let open = self.next().span;
+            let sub = Box::new(self.query()?);
+            let close = self.expect(Tok::RParen, "to close the subquery")?;
+            let alias = if self.eat(&Tok::As) {
+                Some(self.ident("after 'as'")?.0)
+            } else if let Tok::Ident(_) | Tok::QuotedIdent(_) = self.peek() {
+                Some(self.ident("as the subquery alias")?.0)
+            } else {
+                None
+            };
+            (alias.unwrap_or_default(), Span::new(open.start, close.end), Some(sub))
+        } else {
+            let (f, s) = self.table_name()?;
+            (f, s, None)
+        };
 
         let filter = if self.eat(&Tok::Where) { Some(self.expr(0)?) } else { None };
 
@@ -134,7 +167,20 @@ impl Parser {
             }
         }
 
-        Ok(Query { select, from, from_span, filter, group_by, order_by, limit, offset })
+        let end = self.toks[self.pos.saturating_sub(1)].span.end;
+        Ok(Query {
+            with,
+            select,
+            from,
+            from_span,
+            from_subquery,
+            span: Span::new(start, end),
+            filter,
+            group_by,
+            order_by,
+            limit,
+            offset,
+        })
     }
 
     fn select_item(&mut self) -> Result<SelectItem, Diagnostic> {
