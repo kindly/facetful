@@ -886,3 +886,42 @@ And one from the previous commit, found by bisecting wasm builds: `like_2col_fac
 
 **Position.** Two of the three levers are now settled by measurement: code shape (build log 23: monomorphization, not type width) and compiler flags (this entry). The third, `opt-level=s`, is what to reach for only if the budget ever genuinely binds — it buys 11 KB more for a 10–27% cost the pages would feel. At 61% of budget with headroom of ~120 KB, nothing argues for it.
 </sv-prose>
+
+<sv-prose id="d41">
+## Position — materialize is the primitive; JOIN and CTEs are cached materializations (2026-09-18, discussion with David)
+
+**Where it started.** Two worries met: (1) the size forecast — David, correctly, that the executor is what costs, "especially if you optimise", and that a query-time join done in this codebase's style (a specialized arm per key type, per lane type, composite keys, both tables scanned together) would run 16–20 KB gz, not the 8–10 first estimated; (2) the long-standing aim of making new tables from existing ones in the browser. The two resolve into one design.
+
+**What DuckDB does, for reference** (asked and recorded): hash join for every equality join (inner/outer/semi/anti/mark, radix-partitioned, spilling), a **perfect hash join** when the build key is a small-range integer (a direct-indexed array on `key − min` — our `PackedGroups`), piecewise merge join and IEJoin for one and two *inequality* predicates, nested-loop for the rest, ASOF and POSITIONAL as specialised operators. **No sort-merge join for equi-joins**: one good hash join plus dynamic min/max filter pushdown beat a second code path. That settled merge-vs-hash here: one algorithm, hash, even though both PUDL images happen to be plant-ordered — that is a property of those files, not of the model.
+
+**The decision.**
+
+1. **`materialize` is the primitive.** A query's columnar result becomes a new immutable table: the compiler and writer already in the wasm for Parquet ingest take a `QueryResult` instead of Parquet rows — dictionary-encode text (cardinality ≤ 65,536), narrow ints by range, per-segment stats, 65K-row groups. Row order is the query's output order, so a materialized `ORDER BY` yields `sorted_by` metadata and free ordering later, and a join preserves fact order so clustering (and the last-seen distinct filter) survives. `db.materialize(name, sql, {persist})` names it and optionally writes it to OPFS keyed by source content hash + SQL — the fetch-once story extended to derived tables. This is also the PUDL "derive after load" case: pre-aggregate a 5M-row detail image into a 0.5M-row facet table in the browser instead of at build time.
+
+2. **`JOIN` is accepted syntax and is a cached anonymous materialization.** The query `select … from fact f join dim d on f.k = d.k where …` runs as: materialize the joined table (once), then run the rest of the query against it as an ordinary table. David's instinct was materialize-then-discard with a recommendation against the syntax; the refinement is **don't discard, cache**: a byte-budgeted LRU of derived tables — the mask cache's shape (`Table::masks`, 16 MB) applied one level up — keyed by (left table, right table, key columns, join type, right-side columns touched; a superset of columns satisfies a subset). The facet workload runs 10–30 queries per interaction against the same join; with the cache the first pays ~20 ms and the rest pay nothing, so `JOIN` needs no warning — the docs recommend `materialize` only for a *named* or *persisted* result, and warn against join conditions that vary per query (each variant is its own materialization).
+   - **Restricted to a unique right-side key** (the d29 decision, unchanged), now enforced cheaply and loudly: the build side is fully seen, so a non-unique key is an error at first use, never a silent row explosion. Many-to-many stays declined.
+   - **LEFT is the base, INNER is a mask.** The LEFT join preserves the fact row count (positional model intact) and adds a `matched` lane; INNER is the same cached table with `matched` as an implicit conjunct. One cached table serves both.
+   - **Dimension-side WHERE needs nothing special.** `where d.region = 'EU'` is a filter on a gathered lane: mask-cacheable, dictionary fast path, like any conjunct. The semi-join pushdown a query-time join would need never exists as a concept.
+   - **Dictionary code translation**: two tables' dictionaries differ, so a dict-to-dict key equality maps codes once per dictionary pair (O(|dict|) lookups), then probes on the fact side's codes. Int keys probe directly (perfect-hash style through `PackedGroups` when the range is small); text keys hash bytes through the `TextGroups` arena. **The join's key machinery is the grouping's key machinery** — build = group the dimension table by its key — which is what keeps the estimate at the low end.
+
+3. **CTEs and `FROM (subquery)` are materialized temporaries — the optimization fence, on purpose.** `WITH x AS (select …) select … from x` materializes `x` (anonymous, cached by canonical SQL + source table identities), then binds the outer query against it as a table; a CTE may reference an earlier one (sequential); a `FROM` subquery is an unnamed CTE. This is what PostgreSQL did unconditionally before 12 and still does under `MATERIALIZED`, and what DuckDB does for a CTE referenced more than once; here it is simply the only mode, and it is the right one for repeated queries over immutable data — the CTE is computed once per session, not once per query, and never re-planned. It also costs almost nothing: the executor is untouched, the work is a binder scope stack and the cache. Recursive CTEs stay out.
+
+4. **`IN (select k from y)`** (d34) rides the same catalog: materialize the distinct `k` of the inner query, then a membership mask on the outer column — the semi-join, through the dictionary trick where both sides are dictionaries.
+
+**Size, re-estimated honestly against today's measured analogs** (grouping subsystem 20 KB raw / 8 KB gz; `gather_outcol` 3 KB raw for four lane kinds; binder 21 KB raw; FFI 24 KB raw):
+
+| piece | gz | reuses |
+|---|---|---|
+| materialize (QueryResult → table) | ~3 KB | compiler + writer already present |
+| derived-table cache | ~1 KB | the mask cache's shape |
+| one-shot LEFT hash join into a table | ~6–8 KB | `PackedGroups`/`TextGroups` for build and probe, `gather_outcol` for the four lane kinds, plus dict translation and the `matched` lane |
+| catalog + two-table binder scope + `JOIN`/`WITH` syntax | ~4–5 KB | |
+| FFI: multi-table open/query | ~2 KB | |
+| **total** | **~16–19 KB** | vs 25–35 for optimized query-time join + windows-style CTE execution |
+
+At 184.5 KB shipped this lands near 203 KB, 68% of budget, with the optimization tiers that history says cost 5–10 KB each never needed for joins at all.
+
+**Order of work.** (1) `materialize` — the primitive, plus OPFS persist; it is independently valuable and makes everything else a binder change. (2) The derived-table cache and `WITH` / `FROM (subquery)` through it — small, and it exercises the cache before joins depend on it. (3) The one-shot LEFT hash join as a query shape `materialize` accepts, then `JOIN` syntax as its cached anonymous form; INNER as the mask. (4) `IN (select …)`. The SQLite differential tests every step directly: `WITH`, `JOIN` and `IN (select)` queries run on both engines as written.
+
+**Not in this design:** query-time join execution, filter pushdown into a dimension scan, merge join, many-to-many, recursive CTEs, windows. Each is a separate decision if a workload ever asks; none is needed for a facet page over a star schema.
+</sv-prose>
