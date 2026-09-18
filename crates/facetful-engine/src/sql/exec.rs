@@ -8,7 +8,7 @@
 //! per-lane accessors — still no per-row tree walks or Val allocations.
 
 use super::ast::{BinOp, SortDir, UnOp};
-use super::binder::{Bound, FuncKind, Ty};
+use super::binder::{Bound, BoundQuery, FuncKind, Ty};
 use crate::format::read::ReadAt;
 use crate::format::{ColumnType, FormatError};
 use crate::mask_cache::LikeKey;
@@ -26,6 +26,10 @@ mod agg;
 mod output;
 mod filter;
 mod grouping;
+mod aggregate;
+mod plain;
+mod sort;
+mod topk;
 use vector::*;
 use eval::*;
 use scalar::*;
@@ -191,973 +195,239 @@ fn fold_query<'a>(
     out
 }
 
-pub fn execute<S: ReadAt>(
+/// Per-row-group column lanes, keyed by column index.
+type Cols = HashMap<usize, (GroupCol, Option<Rc<Vec<u8>>>)>;
+/// Dictionaries of every dict column the query touches.
+type Dicts = HashMap<usize, Rc<Vec<VStr>>>;
+
+/// Load `which` columns of row group `g` into `cols` (those not already
+/// there), `cap` rows deep.
+fn load_columns<S: ReadAt>(
     table: &mut Table<S>,
-    q: &super::binder::BoundQuery,
-) -> Result<QueryResult, FormatError> {
-    let folded = fold_query(q, table.catalog());
-    let q = folded.as_ref();
-    let columns: Vec<String> = q.select.iter().map(|s| s.name.clone()).collect();
-
-    let mut needed = Vec::new();
-    q.select.iter().for_each(|s| collect_columns(&s.expr, &mut needed));
-    if let Some(f) = &q.filter {
-        collect_columns(f, &mut needed);
-    }
-    q.group_by.iter().for_each(|g| collect_columns(g, &mut needed));
-    q.order_by.iter().for_each(|(e, _)| collect_columns(e, &mut needed));
-    needed.sort_unstable();
-    needed.dedup();
-
-    let mut dicts: HashMap<usize, Rc<Vec<VStr>>> = HashMap::new();
-    for &c in &needed {
-        if table.catalog().schema.columns[c].is_dict() {
-            dicts.insert(c, table.dictionary_rc(c)?);
-        }
-    }
-
-    let constraints = q.filter.as_ref().map(collect_ranges).unwrap_or_default();
-    let conjuncts = conjuncts_of(table, q.filter.as_ref());
-    // columns the projection/grouping/ordering need — the filter's own columns
-    // are loaded only when a conjunct misses the mask cache
-    let proj_needed: Vec<usize> = {
-        let mut v = Vec::new();
-        q.select.iter().for_each(|s| collect_columns(&s.expr, &mut v));
-        q.group_by.iter().for_each(|g| collect_columns(g, &mut v));
-        q.order_by.iter().for_each(|(e, _)| collect_columns(e, &mut v));
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-
-    let agg_calls: Vec<Bound> = {
-        let mut v = Vec::new();
-        q.select.iter().for_each(|s| collect_aggs(&s.expr, &mut v));
-        q.order_by.iter().for_each(|(e, _)| collect_aggs(e, &mut v));
-        v
-    };
-
-    let mut direct = if q.is_aggregate { packed_plan(table, &q.group_by) } else { None };
-    let mut textg =
-        if q.is_aggregate && direct.is_none() { text_plan(table, &q.group_by) } else { None };
-    let mut hash_groups: HashMap<Vec<Val>, usize> = HashMap::new();
-    // one of these holds the keys: packed codes under a PackedGroups plan,
-    // materialized tuples otherwise (expression keys, plain-text keys)
-    let mut group_codes: Vec<u64> = Vec::new();
-    let mut group_keys: Vec<Vec<Val>> = Vec::new();
-    let arg_dict_len = |call: &Bound| -> Option<usize> {
-        let Bound::Call { args, .. } = call else { return None };
-        let Bound::Column { index, .. } = &args[0] else { return None };
-        dicts.get(index).map(|dict| dict.len())
-    };
-    let mut accs: Vec<AggAcc> =
-        agg_calls.iter().map(|c| AggAcc::new(c, arg_dict_len(c))).collect();
-    let mut n_groups = 0usize;
-
-    let sel_tys: Vec<Ty> = q.select.iter().map(|s| s.expr.ty()).collect();
-    let ord_tys: Vec<Ty> = q.order_by.iter().map(|(e, _)| e.ty()).collect();
-    // every non-aggregate path now early-returns columnar; this remains only
-    // as the aggregate path's row buffer seed
-    let out_rows: Vec<(Vec<Val>, Vec<Val>)> = Vec::new();
-
-    // Bounded top-k: ORDER BY + LIMIT with a small window — keep only ~2*cap
-    // candidates, cheap first-key reject for the vast majority of rows, and
-    // project ONLY the winners at the end.
-    // Limit-only bound: no ORDER BY, no aggregation — the scan can stop the
-    // moment offset+limit rows are collected, and each group only needs its
-    // projection lanes materialized up to the last row it can contribute.
-    let scan_cap = if !q.is_aggregate && q.order_by.is_empty() {
-        q.limit.map(|l| l as usize + q.offset.unwrap_or(0) as usize)
-    } else {
-        None
-    };
-    // top-k scans need only the ORDER BY columns; select lanes load later,
-    // for winning groups only (true late materialization)
-    let ord_needed: Vec<usize> = {
-        let mut v = Vec::new();
-        q.order_by.iter().for_each(|(e, _)| collect_columns(e, &mut v));
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-
-    let topk_cap = if !q.is_aggregate && !q.order_by.is_empty() {
-        q.limit
-            .map(|l| (l + q.offset.unwrap_or(0)) as usize)
-            .filter(|c| *c <= 100_000)
-    } else {
-        None
-    };
-    struct Cand {
-        keys: Vec<Val>,
-        g: u32,
-        row: u32,
-    }
-    let mut cands: Vec<Cand> = Vec::new();
-    let mut bound_key: Option<Vec<Val>> = None; // full key of current cutoff
-    let cmp_keys = |a: &Vec<Val>, b: &Vec<Val>, order_by: &[(Bound, SortDir)]| {
-        for (i, (_, dir)) in order_by.iter().enumerate() {
-            let ord = a[i].cmp_sql(&b[i]);
-            let ord = if *dir == SortDir::Desc { ord.reverse() } else { ord };
-            if ord != core::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        core::cmp::Ordering::Equal
-    };
-
-    // full-table ORDER BY (no usable top-k bound): defer everything — sort
-    // packed keys + row refs, project only afterwards
-    let full_sort = !q.is_aggregate && !q.order_by.is_empty() && topk_cap.is_none();
-    let mut sort_groups: Vec<(Vec<VV>, Vec<u32>)> = Vec::new();
-    let mut sort_srcs: Vec<Option<SelSrc>> = (0..q.select.len()).map(|_| None).collect();
-    // plain projection (no ORDER BY): columnar refs + sources
-    let plain = !q.is_aggregate && q.order_by.is_empty();
-    let mut plain_srcs: Vec<Option<SelSrc>> = (0..q.select.len()).map(|_| None).collect();
-    let mut plain_refs: Vec<(u32, u32)> = Vec::new();
-    let mut plain_gslot = 0u32;
-
-    let mut scanned_groups = 0usize;
-    for g in 0..table.group_count() {
-        if group_prunable(table, g, &constraints) {
+    g: usize,
+    dicts: &Dicts,
+    cols: &mut Cols,
+    which: &[usize],
+    cap: usize,
+) -> Result<(), FormatError> {
+    for &c in which {
+        if cols.contains_key(&c) {
             continue;
         }
-        scanned_groups += 1;
-        let rows = table.group_rows(g);
-        let load = |table: &mut Table<S>,
-                    cols: &mut HashMap<usize, (GroupCol, Option<Rc<Vec<u8>>>)>,
-                    which: &[usize],
-                    cap: usize|
-         -> Result<(), FormatError> {
-            for &c in which {
-                if cols.contains_key(&c) {
-                    continue;
-                }
-                let (cty, is_dict) = {
-                    let def = &table.catalog().schema.columns[c];
-                    (def.ty, def.is_dict())
-                };
-                let validity = table.validity(g, c)?.map(Rc::new);
-                let col = if is_dict {
-                    GroupCol::Dict { codes: Rc::new(table.codes(g, c, cap)?), dict: dicts[&c].clone() }
-                } else {
-                    match cty {
-                        ColumnType::Float64 => GroupCol::F64(Rc::new(table.f64s(g, c, cap)?)),
-                        ColumnType::Utf8 => {
-                            let (offs, bytes) = table.texts_raw(g, c, cap)?;
-                            GroupCol::Text {
-                                strs: std::cell::OnceCell::new(),
-                                offsets: Rc::new(offs),
-                                bytes: Rc::new(bytes),
-                            }
-                        }
-                        _ => GroupCol::I64(Rc::new(table.i64s(g, c, cap)?)),
-                    }
-                };
-                cols.insert(c, (col, validity));
-            }
-            Ok(())
+        let (cty, is_dict) = {
+            let def = &table.catalog().schema.columns[c];
+            (def.ty, def.is_dict())
         };
-
-        // phase 1: the WHERE mask, per conjunct — from the mask cache when
-        // present, else evaluated over its columns (full group) and cached
-        let mut cols = HashMap::new();
-        let keep: Option<Vec<u8>> = if conjuncts.is_empty() {
-            None
+        let validity = table.validity(g, c)?.map(Rc::new);
+        let col = if is_dict {
+            GroupCol::Dict { codes: Rc::new(table.codes(g, c, cap)?), dict: dicts[&c].clone() }
         } else {
-            let mut keep = vec![1u8; rows];
-            let mut pending: Vec<&Conjunct> = Vec::new();
-            for c in &conjuncts {
-                match table.masks().get(&c.key, g) {
-                    Some(bits) => {
-                        for (i, k) in keep.iter_mut().enumerate() {
-                            *k &= bits[i / 8] >> (i % 8) & 1;
-                        }
+            match cty {
+                ColumnType::Float64 => GroupCol::F64(Rc::new(table.f64s(g, c, cap)?)),
+                ColumnType::Utf8 => {
+                    let (offs, bytes) = table.texts_raw(g, c, cap)?;
+                    GroupCol::Text {
+                        strs: std::cell::OnceCell::new(),
+                        offsets: Rc::new(offs),
+                        bytes: Rc::new(bytes),
                     }
-                    None => pending.push(c),
                 }
+                _ => GroupCol::I64(Rc::new(table.i64s(g, c, cap)?)),
             }
-            if !pending.is_empty() {
-                let n_groups = table.group_count();
-                let store = |table: &mut Table<S>, c: &Conjunct, m: &[u8], keep: &mut [u8]| {
-                    table.masks().put(&c.key, g, n_groups, Rc::new(pack_bits(m)), c.like.clone());
-                    for (k, &b) in keep.iter_mut().zip(m) {
-                        *k &= b;
-                    }
-                };
-                // contains-LIKE extending a cached needle: verify only the rows
-                // the superset admits, straight off the image — no blob scan,
-                // no column copy
-                let mut full: Vec<&Conjunct> = Vec::new();
-                for c in pending {
-                    let narrowed = c.like.as_ref().and_then(|lk| {
-                        let sup = table.masks().like_superset(lk.col, &lk.needle, g)?;
-                        let needle = lk.needle.as_bytes();
-                        table
-                            .with_text_segments(g, lk.col, |offs, blob, valid| {
-                                let off = |i: usize| {
-                                    u32::from_le_bytes(offs[i * 4..i * 4 + 4].try_into().unwrap()) as usize
-                                };
-                                let mut m = vec![0u8; rows];
-                                for (i, mi) in m.iter_mut().enumerate() {
-                                    if sup[i / 8] >> (i % 8) & 1 == 0
-                                        || valid.is_some_and(|v| v[i / 8] >> (i % 8) & 1 == 0)
-                                    {
-                                        continue;
-                                    }
-                                    let s = &blob[off(i)..off(i + 1)];
-                                    *mi = crate::text::contains_ci(s, needle) as u8;
-                                }
-                                m
-                            })
-                            .ok()
-                            .flatten()
-                    });
-                    if let Some(m) = narrowed {
-                        store(table, c, &m, &mut keep);
-                        continue;
-                    }
-                    // integer comparison straight off the raw narrow segment —
-                    // widening the lane into Vec<i64> costs more than the compare
-                    let int_fast = int_cmp_lit(&c.expr).and_then(|(col, lo, hi, inv)| {
-                        table
-                            .with_fixed_segments(g, col, |vals, w, valid| {
-                                let mut m = vec![0u8; rows];
-                                // Bounds are clamped to the stored width so the
-                                // compare runs at that width — verified in the
-                                // wasm disassembly: i64 bounds forced an
-                                // extend-to-i64x2 chain (2 lanes/op); clamped
-                                // i16 bounds compare as i16x8 (8 lanes/op).
-                                macro_rules! sweep {
-                                    ($t:ty, $w:expr, |$i:ident, $ch:ident| $x:expr) => {{
-                                        if lo > <$t>::MAX as i64 || hi < <$t>::MIN as i64 {
-                                            m.fill(inv as u8); // empty range
-                                        } else {
-                                            let lo = lo.max(<$t>::MIN as i64) as $t;
-                                            let hi = hi.min(<$t>::MAX as i64) as $t;
-                                            for ($i, $ch) in
-                                                vals[..rows * $w].chunks_exact($w).enumerate()
-                                            {
-                                                let x: $t = $x;
-                                                m[$i] =
-                                                    ((x >= lo && x <= hi) != inv) as u8;
-                                            }
-                                        }
-                                    }};
-                                }
-                                match w {
-                                    1 => sweep!(i8, 1, |i, ch| ch[0] as i8),
-                                    2 => {
-                                        sweep!(i16, 2, |i, ch| i16::from_le_bytes([
-                                            ch[0], ch[1]
-                                        ]))
-                                    }
-                                    4 => {
-                                        sweep!(i32, 4, |i, ch| i32::from_le_bytes([
-                                            ch[0], ch[1], ch[2], ch[3]
-                                        ]))
-                                    }
-                                    _ => {
-                                        sweep!(i64, 8, |i, ch| i64::from_le_bytes([
-                                            ch[0], ch[1], ch[2], ch[3], ch[4], ch[5],
-                                            ch[6], ch[7]
-                                        ]))
-                                    }
-                                }
-                                if let Some(vb) = valid {
-                                    for (i, mi) in m.iter_mut().enumerate() {
-                                        *mi &= vb[i / 8] >> (i % 8) & 1;
-                                    }
-                                }
-                                m
-                            })
-                            .ok()
-                            .flatten()
-                    });
-                    match int_fast {
-                        Some(m) => store(table, c, &m, &mut keep),
-                        None => full.push(c),
-                    }
-                }
-                if !full.is_empty() {
-                    let mut full_cols: Vec<usize> =
-                        full.iter().flat_map(|c| c.cols.iter().copied()).collect();
-                    full_cols.sort_unstable();
-                    full_cols.dedup();
-                    load(table, &mut cols, &full_cols, usize::MAX)?;
-                    for c in full {
-                        let fctx = GroupCtx { cols: core::mem::take(&mut cols), rows };
-                        let v = eval_vec(&c.expr, &fctx);
-                        cols = fctx.cols;
-                        let m: Vec<u8> =
-                            (0..rows).map(|i| (v.bool3_at(i) == Some(true)) as u8).collect();
-                        store(table, c, &m, &mut keep);
-                    }
-                }
-            }
-            Some(keep)
         };
+        cols.insert(c, (col, validity));
+    }
+    Ok(())
+}
+
+/// What every strategy shares: the bound query, which columns it needs and
+/// how they type, the dictionaries, and the WHERE as cacheable conjuncts.
+struct Shared<'q> {
+    q: &'q BoundQuery,
+    columns: Vec<String>,
+    dicts: Dicts,
+    constraints: Vec<Range>,
+    conjuncts: Vec<Conjunct>,
+    /// columns the projection, grouping and ordering read (the filter's own
+    /// columns load only when a conjunct misses the mask cache)
+    proj_needed: Vec<usize>,
+    /// just the ORDER BY columns — all a top-k scan needs
+    ord_needed: Vec<usize>,
+    sel_tys: Vec<Ty>,
+    ord_tys: Vec<Ty>,
+    scanned_groups: usize,
+}
+
+impl<'q> Shared<'q> {
+    fn new<S: ReadAt>(table: &mut Table<S>, q: &'q BoundQuery) -> Result<Self, FormatError> {
+        let cols_of = |exprs: &[&Bound]| -> Vec<usize> {
+            let mut v = Vec::new();
+            exprs.iter().for_each(|e| collect_columns(e, &mut v));
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let sel: Vec<&Bound> = q.select.iter().map(|s| &s.expr).collect();
+        let ord: Vec<&Bound> = q.order_by.iter().map(|(e, _)| e).collect();
+        let grp: Vec<&Bound> = q.group_by.iter().collect();
+        let proj_needed = cols_of(&[sel.as_slice(), grp.as_slice(), ord.as_slice()].concat());
+        let ord_needed = cols_of(&ord);
+        let mut needed = proj_needed.clone();
+        if let Some(f) = &q.filter {
+            collect_columns(f, &mut needed);
+        }
+        let mut dicts: Dicts = HashMap::new();
+        for &c in &needed {
+            if table.catalog().schema.columns[c].is_dict() && !dicts.contains_key(&c) {
+                dicts.insert(c, table.dictionary_rc(c)?);
+            }
+        }
+        Ok(Shared {
+            q,
+            columns: q.select.iter().map(|s| s.name.clone()).collect(),
+            dicts,
+            constraints: q.filter.as_ref().map(collect_ranges).unwrap_or_default(),
+            conjuncts: conjuncts_of(table, q.filter.as_ref()),
+            proj_needed,
+            ord_needed,
+            sel_tys: q.select.iter().map(|s| s.expr.ty()).collect(),
+            ord_tys: q.order_by.iter().map(|(e, _)| e.ty()).collect(),
+            scanned_groups: 0,
+        })
+    }
+
+    fn load<S: ReadAt>(
+        &self,
+        table: &mut Table<S>,
+        g: usize,
+        cols: &mut Cols,
+        which: &[usize],
+        cap: usize,
+    ) -> Result<(), FormatError> {
+        load_columns(table, g, &self.dicts, cols, which, cap)
+    }
+
+    /// The result envelope every strategy fills the same way.
+    fn result<S: ReadAt>(
+        &self,
+        table: &Table<S>,
+        rows: Vec<Vec<Val>>,
+        cols: Option<Vec<OutCol>>,
+        out_rows: usize,
+    ) -> QueryResult {
+        QueryResult {
+            columns: self.columns.clone(),
+            col_types: self.sel_tys.clone(),
+            rows,
+            out_rows,
+            cols,
+            scanned_groups: self.scanned_groups,
+            total_groups: table.group_count(),
+        }
+    }
+
+    fn window(&self) -> (usize, usize) {
+        let offset = self.q.offset.unwrap_or(0) as usize;
+        let limit = self.q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+        (offset, limit)
+    }
+}
+
+/// Whether the scan continues after this row group.
+enum Flow {
+    Continue,
+    Stop,
+}
+
+/// How a query runs. Chosen once, before the scan; each variant owns only
+/// its own state and lives in its own module.
+enum Strategy {
+    /// GROUP BY / aggregates: accumulate per group, then a vectorized pass
+    /// over the group table
+    Aggregate(aggregate::Aggregate),
+    /// ORDER BY + small LIMIT: bounded candidates, project only the winners
+    TopK(topk::TopK),
+    /// ORDER BY without a usable bound: sort packed keys + refs, project after
+    FullSort(sort::FullSort),
+    /// projection, optionally LIMIT-capped: stop the scan when enough rows exist
+    Plain(plain::Plain),
+}
+
+impl Strategy {
+    fn plan<S: ReadAt>(table: &mut Table<S>, sh: &Shared) -> Result<Strategy, FormatError> {
+        let q = sh.q;
+        if q.is_aggregate {
+            return Ok(Strategy::Aggregate(aggregate::Aggregate::plan(table, sh)?));
+        }
+        let cap = q.limit.map(|l| l as usize + q.offset.unwrap_or(0) as usize);
+        if q.order_by.is_empty() {
+            return Ok(Strategy::Plain(plain::Plain::new(q.select.len(), cap)));
+        }
+        Ok(match cap.filter(|c| *c <= 100_000) {
+            Some(cap) => Strategy::TopK(topk::TopK::new(cap)),
+            None => Strategy::FullSort(sort::FullSort::new(q.select.len())),
+        })
+    }
+
+    /// Which lanes this group needs, how deep to load them, and how many
+    /// rows to evaluate.
+    fn load_plan<'s>(&self, sh: &'s Shared, keep: Option<&[u8]>, rows: usize) -> (&'s [usize], usize, usize) {
+        match self {
+            Strategy::TopK(_) => (&sh.ord_needed, usize::MAX, rows),
+            Strategy::Plain(p) => {
+                let depth = p.depth(keep, rows);
+                (&sh.proj_needed, depth, depth)
+            }
+            Strategy::Aggregate(_) | Strategy::FullSort(_) => (&sh.proj_needed, rows, rows),
+        }
+    }
+
+    fn scan_group(&mut self, sh: &Shared, g: usize, ctx: &GroupCtx, keep: Option<&[u8]>) -> Flow {
+        match self {
+            Strategy::Aggregate(a) => a.scan_group(sh, ctx, keep),
+            Strategy::TopK(t) => t.scan_group(sh, g, ctx, keep),
+            Strategy::FullSort(f) => f.scan_group(sh, ctx, keep),
+            Strategy::Plain(p) => return p.scan_group(sh, ctx, keep),
+        }
+        Flow::Continue
+    }
+
+    fn finish<S: ReadAt>(self, table: &mut Table<S>, sh: &Shared) -> Result<QueryResult, FormatError> {
+        match self {
+            Strategy::Aggregate(a) => a.finish(table, sh),
+            Strategy::TopK(t) => t.finish(table, sh),
+            Strategy::FullSort(f) => Ok(f.finish(table, sh)),
+            Strategy::Plain(p) => Ok(p.finish(table, sh)),
+        }
+    }
+}
+
+pub fn execute<S: ReadAt>(
+    table: &mut Table<S>,
+    q: &BoundQuery,
+) -> Result<QueryResult, FormatError> {
+    let folded = fold_query(q, table.catalog());
+    let mut sh = Shared::new(table, folded.as_ref())?;
+    let mut strategy = Strategy::plan(table, &sh)?;
+
+    for g in 0..table.group_count() {
+        if group_prunable(table, g, &sh.constraints) {
+            continue;
+        }
+        sh.scanned_groups += 1;
+        let rows = table.group_rows(g);
+        let mut cols: Cols = HashMap::new();
+        let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols)?;
         // fully filtered out: nothing else to load or evaluate for this group
         if keep.as_ref().is_some_and(|k| k.iter().all(|&b| b == 0)) {
             continue;
         }
-
-        // phase 2: how deep must projection lanes go? (limit-only: just far
-        // enough to yield the rows still missing)
-        let take_rows = match scan_cap {
-            None => rows,
-            Some(c) => {
-                let rem = c.saturating_sub(out_rows.len());
-                match &keep {
-                    None => rem.min(rows),
-                    Some(k) => {
-                        let mut cnt = 0usize;
-                        let mut cut = rows;
-                        for (i, &b) in k.iter().enumerate() {
-                            if b != 0 {
-                                cnt += 1;
-                                if cnt == rem {
-                                    cut = i + 1;
-                                    break;
-                                }
-                            }
-                        }
-                        cut
-                    }
-                }
-            }
-        };
-        if topk_cap.is_some() {
-            load(table, &mut cols, &ord_needed, usize::MAX)?;
-        } else {
-            load(table, &mut cols, &proj_needed, take_rows)?;
-        }
-        let eval_rows = if scan_cap.is_some() { take_rows } else { rows };
+        let (which, cap, eval_rows) = strategy.load_plan(&sh, keep.as_deref(), rows);
+        sh.load(table, g, &mut cols, which, cap)?;
         let ctx = GroupCtx { cols, rows: eval_rows };
-        let kept = |i: usize| keep.as_ref().map_or(true, |k| k[i] != 0);
-
-        if q.is_aggregate {
-            let gids: Option<Vec<u32>> = if q.group_by.is_empty() {
-                // ungrouped: one group, no gids vector — aggregate off the mask
-                if n_groups == 0 {
-                    group_keys.push(Vec::new());
-                    n_groups = 1;
-                    for a in &mut accs {
-                        a.grow(1);
-                    }
-                }
-                None
-            } else if let Some(d) = &mut direct {
-                let code_cols: Vec<(VV, usize)> = d
-                    .cols
-                    .iter()
-                    .zip(&d.cards)
-                    .map(|(&c, &card)| (ctx.column(c), card))
-                    .collect();
-                // hoist raw lanes out of the row loop
-                let fast = fast_dims(&code_cols, &d.dims);
-                // count(*)-only queries fuse the count into this loop —
-                // no gids vector, no second aggregation pass
-                let count_only = accs.iter().all(|a| matches!(a, AggAcc::Count(_)))
-                    && agg_calls.iter().all(|c| {
-                        let Bound::Call { args, .. } = c else { return false };
-                        matches!(args[0], Bound::Number(..) | Bound::Str(_))
-                    });
-                let mut gids =
-                    if count_only { Vec::new() } else { vec![u32::MAX; rows] };
-                // fused counting goes through a plain local buffer (merged
-                // below) — touching the accumulator enum per row is slower
-                // than the gids pass it replaces
-                let mut local_counts: Vec<i64> =
-                    if count_only { vec![0; n_groups] } else { Vec::new() };
-                // one loop body, specialized per lookup: testing the
-                // Option inside the row loop measurably slowed the wasm build
-                macro_rules! group_rows {
-                    (|$composite:ident| $lookup:expr) => {
-                        for i in 0..rows {
-                            if !kept(i) {
-                                continue;
-                            }
-                            let $composite = composite_of(&fast, i);
-                            let gid: u32 = $lookup;
-                            if gid as usize == n_groups {
-                                group_codes.push($composite);
-                                n_groups += 1;
-                                if count_only {
-                                    local_counts.push(0);
-                                }
-                            }
-                            if count_only {
-                                local_counts[gid as usize] += 1;
-                            } else {
-                                gids[i] = gid;
-                            }
-                        }
-                    };
-                }
-                match &mut d.dense {
-                    Some(dense) => group_rows!(|composite| {
-                        let slot = &mut dense[composite as usize];
-                        if *slot < 0 {
-                            *slot = n_groups as i32;
-                        }
-                        *slot as u32
-                    }),
-                    None => group_rows!(|composite| d.map.get_or_insert(composite, n_groups as u32)),
-                }
-                // one growth per batch, not one per group
-                for a in &mut accs {
-                    a.grow(n_groups);
-                }
-                if count_only {
-                    for a in &mut accs {
-                        let AggAcc::Count(c) = a else { unreachable!("count_only") };
-                        for (g, &n) in local_counts.iter().enumerate() {
-                            c[g] += n;
-                        }
-                    }
-                    continue; // this group's aggregates are done
-                }
-                Some(gids)
-            } else if let Some(tg) = &mut textg {
-                let code_cols: Vec<(VV, usize)> =
-                    tg.pcols.iter().zip(&tg.pcards).map(|(&c, &card)| (ctx.column(c), card)).collect();
-                let fast = fast_dims(&code_cols, &tg.pdims);
-                // text dims: borrowed views of the blob, no strings
-                struct TextLane<'a> {
-                    offsets: &'a [u32],
-                    bytes: &'a [u8],
-                    valid: Option<&'a [u8]>,
-                }
-                let tlanes: Vec<TextLane> = tg
-                    .dims
-                    .iter()
-                    .filter_map(|d| match d {
-                        TextDim::Text(c) => Some(*c),
-                        TextDim::Packed => None,
-                    })
-                    .map(|c| match &ctx.cols[&c] {
-                        (GroupCol::Text { offsets, bytes, .. }, valid) => TextLane {
-                            offsets,
-                            bytes,
-                            valid: valid.as_deref().map(|v| v.as_slice()),
-                        },
-                        _ => unreachable!("text plan over a plain Utf8 column"),
-                    })
-                    .collect();
-                let mut texts: Vec<Option<&[u8]>> = vec![None; tlanes.len()];
-                let mut gids = vec![u32::MAX; rows];
-                for i in 0..rows {
-                    if !kept(i) {
-                        continue;
-                    }
-                    let composite = composite_of(&fast, i);
-                    let mut hash = composite.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    for (k, tl) in tlanes.iter().enumerate() {
-                        let ok = tl.valid.map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
-                        let b = ok.then(|| &tl.bytes[tl.offsets[i] as usize..tl.offsets[i + 1] as usize]);
-                        // a NULL key hashes as a constant no byte string maps to
-                        hash = mix64(hash ^ b.map_or(0x4E55_4C4C, hash_bytes));
-                        texts[k] = b;
-                    }
-                    let gid = tg.get_or_insert(hash, composite, &texts, n_groups as u32);
-                    if gid as usize == n_groups {
-                        n_groups += 1;
-                    }
-                    gids[i] = gid;
-                }
-                for a in &mut accs {
-                    a.grow(n_groups);
-                }
-                Some(gids)
-            } else {
-                let key_vvs: Vec<VV> = q.group_by.iter().map(|e| eval_vec(e, &ctx)).collect();
-                let mut gids = vec![u32::MAX; rows];
-                for i in 0..rows {
-                    if !kept(i) {
-                        continue;
-                    }
-                    let key: Vec<Val> = key_vvs.iter().map(|v| lane_val(v, i)).collect();
-                    let next = n_groups;
-                    let gid = *hash_groups.entry(key).or_insert_with_key(|k| {
-                        group_keys.push(k.clone());
-                        next
-                    });
-                    if gid == next && gid == n_groups {
-                        n_groups += 1;
-                    }
-                    gids[i] = gid as u32;
-                }
-                for a in &mut accs {
-                    a.grow(n_groups);
-                }
-                Some(gids)
-            };
-            let src = match &gids {
-                Some(g) => RowsSrc::Gids(g),
-                None => RowsSrc::Mask { keep: keep.as_deref(), n: rows },
-            };
-            for (acc, call) in accs.iter_mut().zip(&agg_calls) {
-                let Bound::Call { args, .. } = call else { unreachable!() };
-                let arg = eval_vec(&args[0], &ctx);
-                acc.update_batch(src, &arg);
-            }
-        } else if let Some(cap) = topk_cap {
-            let ord_vvs: Vec<VV> = q.order_by.iter().map(|(e, _)| eval_vec(e, &ctx)).collect();
-            for i in 0..rows {
-                if !kept(i) {
-                    continue;
-                }
-                // cheap reject on the first order key against the cutoff
-                if let Some(bk) = &bound_key {
-                    let k0 = ord_vvs[0].val_at(i, ord_tys[0]);
-                    let ord = k0.cmp_sql(&bk[0]);
-                    let ord =
-                        if q.order_by[0].1 == SortDir::Desc { ord.reverse() } else { ord };
-                    if ord == core::cmp::Ordering::Greater {
-                        continue;
-                    }
-                }
-                let keys: Vec<Val> =
-                    ord_vvs.iter().zip(&ord_tys).map(|(v, t)| v.val_at(i, *t)).collect();
-                cands.push(Cand { keys, g: g as u32, row: i as u32 });
-                if cands.len() >= cap * 2 + 16 {
-                    cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
-                    cands.truncate(cap);
-                    bound_key = cands.last().map(|c| c.keys.clone());
-                }
-            }
-        } else if full_sort {
-            sel_srcs_for_group(q, &ctx, &mut sort_srcs);
-            let ord_vvs: Vec<VV> = q.order_by.iter().map(|(e, _)| eval_vec(e, &ctx)).collect();
-            let kept_rows: Vec<u32> =
-                (0..ctx.rows).filter(|&i| kept(i)).map(|i| i as u32).collect();
-            sort_groups.push((ord_vvs, kept_rows));
-        } else {
-            debug_assert!(plain);
-            sel_srcs_for_group(q, &ctx, &mut plain_srcs);
-            plain_refs
-                .extend((0..ctx.rows).filter(|&i| kept(i)).map(|i| (plain_gslot, i as u32)));
-            plain_gslot += 1;
-            if let Some(c) = scan_cap {
-                if plain_refs.len() >= c {
-                    plain_refs.truncate(c);
-                    break;
-                }
-            }
+        if let Flow::Stop = strategy.scan_group(&sh, g, &ctx, keep.as_deref()) {
+            break;
         }
     }
-
-    if plain {
-        let offset = q.offset.unwrap_or(0) as usize;
-        let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
-        let refs: Vec<(u32, u32)> =
-            plain_refs.into_iter().skip(offset).take(limit).collect();
-        let cols: Vec<OutCol> = plain_srcs
-            .iter()
-            .zip(&sel_tys)
-            .map(|(src, ty)| match src {
-                Some(src) => gather_outcol(src, &refs, *ty),
-                None => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty), // zero groups scanned
-            })
-            .collect();
-        return Ok(QueryResult {
-            columns,
-            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
-            rows: Vec::new(),
-            out_rows: refs.len(),
-            cols: Some(cols),
-            scanned_groups,
-            total_groups: table.group_count(),
-        });
-    }
-
-    if full_sort {
-        // flatten refs: (group slot, row)
-        let total: usize = sort_groups.iter().map(|(_, k)| k.len()).sum();
-        let mut refs: Vec<(u32, u32)> = Vec::with_capacity(total);
-        for (gslot, (_, kept_rows)) in sort_groups.iter().enumerate() {
-            for &r in kept_rows {
-                refs.push((gslot as u32, r));
-            }
-        }
-        let numeric_keys = q
-            .order_by
-            .iter()
-            .all(|(e, _)| matches!(e.ty(), Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp));
-        let nk = q.order_by.len();
-
-        let order_refs: Vec<(u32, u32)> = if numeric_keys && nk == 1 {
-            let (_, dir) = &q.order_by[0];
-            let desc = *dir == SortDir::Desc;
-            let ty = ord_tys[0];
-            let mut keyed: Vec<(u8, u64, u32, u32)> = refs
-                .iter()
-                .map(|&(g, r)| {
-                    let (v, k) = encode_order(&sort_groups[g as usize].0[0], r as usize, ty, desc);
-                    (v, k, g, r)
-                })
-                .collect();
-            keyed.sort_unstable_by_key(|t| (t.0, t.1));
-            keyed.into_iter().map(|t| (t.2, t.3)).collect()
-        } else if numeric_keys {
-            let mut flat: Vec<(u8, u64)> = Vec::with_capacity(refs.len() * nk);
-            for &(g, r) in &refs {
-                for (ki, (_, dir)) in q.order_by.iter().enumerate() {
-                    flat.push(encode_order(
-                        &sort_groups[g as usize].0[ki],
-                        r as usize,
-                        ord_tys[ki],
-                        *dir == SortDir::Desc,
-                    ));
-                }
-            }
-            let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
-            perm.sort_unstable_by(|&a, &b| {
-                flat[a as usize * nk..a as usize * nk + nk]
-                    .cmp(&flat[b as usize * nk..b as usize * nk + nk])
-            });
-            perm.into_iter().map(|p| refs[p as usize]).collect()
-        } else {
-            // text keys: materialize the (small) key tuples, sort refs by them
-            let keys: Vec<Vec<Val>> = refs
-                .iter()
-                .map(|&(g, r)| {
-                    sort_groups[g as usize]
-                        .0
-                        .iter()
-                        .zip(&ord_tys)
-                        .map(|(v, t)| v.val_at(r as usize, *t))
-                        .collect()
-                })
-                .collect();
-            let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
-            perm.sort_by(|&a, &b| {
-                cmp_keys(&keys[a as usize], &keys[b as usize], &q.order_by)
-            });
-            perm.into_iter().map(|p| refs[p as usize]).collect()
-        };
-
-        let offset = q.offset.unwrap_or(0) as usize;
-        let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
-        let final_refs: Vec<(u32, u32)> =
-            order_refs.into_iter().skip(offset).take(limit).collect();
-        let cols: Vec<OutCol> = sort_srcs
-            .iter()
-            .zip(&sel_tys)
-            .map(|(src, ty)| match src {
-                Some(src) => gather_outcol(src, &final_refs, *ty),
-                None => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty),
-            })
-            .collect();
-        return Ok(QueryResult {
-            columns,
-            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
-            rows: Vec::new(),
-            out_rows: final_refs.len(),
-            cols: Some(cols),
-            scanned_groups,
-            total_groups: table.group_count(),
-        });
-    }
-
-    // finish bounded top-k: sort survivors, window, then load ONLY the
-    // winning groups' select lanes and project the winner rows
-    if topk_cap.is_some() {
-        cands.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &q.order_by));
-        let offset = q.offset.unwrap_or(0) as usize;
-        let limit = q.limit.unwrap_or(0) as usize;
-        let winners: Vec<Cand> = cands.into_iter().skip(offset).take(limit).collect();
-
-        // Plain-text columns selected directly are gathered per winner row
-        // straight off the borrowed segments — loading the lane would copy
-        // the whole blob up to the deepest winner for a handful of rows.
-        let is_direct_text = |b: &Bound| -> Option<usize> {
-            let Bound::Column { index, .. } = b else { return None };
-            let def = &table.catalog().schema.columns[*index];
-            (def.ty == ColumnType::Utf8 && !def.is_dict()).then_some(*index)
-        };
-        let mut direct_text: Vec<Option<usize>> =
-            q.select.iter().map(|s| is_direct_text(&s.expr)).collect();
-        // gathered[sel_idx][winner_idx]
-        let mut gathered: HashMap<usize, Vec<Val>> = HashMap::new();
-        for (si, ci) in direct_text.clone().into_iter().enumerate() {
-            let Some(ci) = ci else { continue };
-            let mut vals = vec![Val::Null; winners.len()];
-            let mut ok = true;
-            for g in winners.iter().map(|w| w.g).collect::<std::collections::BTreeSet<_>>() {
-                let got = table.with_text_segments(g as usize, ci, |offs, blob, valid| {
-                    for (wi, w) in winners.iter().enumerate() {
-                        if w.g != g {
-                            continue;
-                        }
-                        let i = w.row as usize;
-                        if valid.is_some_and(|v| v[i / 8] >> (i % 8) & 1 == 0) {
-                            continue; // stays Null
-                        }
-                        let at = |n: usize| {
-                            u32::from_le_bytes(offs[n * 4..n * 4 + 4].try_into().unwrap())
-                                as usize
-                        };
-                        let s = core::str::from_utf8(&blob[at(i)..at(i + 1)])
-                            .expect("image text is utf8");
-                        vals[wi] = Val::Text(Rc::new(s.to_string()));
-                    }
-                })?;
-                if got.is_none() {
-                    ok = false; // segments not resident: fall back to the lane path
-                    break;
-                }
-            }
-            if ok {
-                gathered.insert(si, vals);
-            } else {
-                direct_text[si] = None;
-            }
-        }
-        // lanes still needed: any select expr that isn't a gathered direct text
-        let mut lane_cols = Vec::new();
-        for (si, s) in q.select.iter().enumerate() {
-            if direct_text[si].is_none() || !gathered.contains_key(&si) {
-                collect_columns(&s.expr, &mut lane_cols);
-            }
-        }
-        lane_cols.sort_unstable();
-        lane_cols.dedup();
-
-        let mut sel_cache: HashMap<u32, Vec<Option<VV>>> = HashMap::new();
-        let mut rows: Vec<Vec<Val>> = Vec::with_capacity(winners.len());
-        for (wi, c) in winners.iter().enumerate() {
-            if !sel_cache.contains_key(&c.g) {
-                let g = c.g as usize;
-                let cap = winners
-                    .iter()
-                    .filter(|w| w.g == c.g)
-                    .map(|w| w.row as usize + 1)
-                    .max()
-                    .unwrap();
-                let mut cols = HashMap::new();
-                for &ci in &lane_cols {
-                    let (cty, is_dict) = {
-                        let def = &table.catalog().schema.columns[ci];
-                        (def.ty, def.is_dict())
-                    };
-                    let validity = table.validity(g, ci)?.map(Rc::new);
-                    let col = if is_dict {
-                        GroupCol::Dict {
-                            codes: Rc::new(table.codes(g, ci, cap)?),
-                            dict: dicts[&ci].clone(),
-                        }
-                    } else {
-                        match cty {
-                            ColumnType::Float64 => GroupCol::F64(Rc::new(table.f64s(g, ci, cap)?)),
-                            ColumnType::Utf8 => {
-                                let (offs, bytes) = table.texts_raw(g, ci, cap)?;
-                                GroupCol::Text {
-                                    strs: std::cell::OnceCell::new(),
-                                    offsets: Rc::new(offs),
-                                    bytes: Rc::new(bytes),
-                                }
-                            }
-                            _ => GroupCol::I64(Rc::new(table.i64s(g, ci, cap)?)),
-                        }
-                    };
-                    cols.insert(ci, (col, validity));
-                }
-                let ctx = GroupCtx { cols, rows: cap };
-                let sel_vvs: Vec<Option<VV>> = q
-                    .select
-                    .iter()
-                    .enumerate()
-                    .map(|(si, s)| {
-                        (!gathered.contains_key(&si)).then(|| eval_vec(&s.expr, &ctx))
-                    })
-                    .collect();
-                sel_cache.insert(c.g, sel_vvs);
-            }
-            let sel = &sel_cache[&c.g];
-            rows.push(
-                sel.iter()
-                    .zip(&sel_tys)
-                    .enumerate()
-                    .map(|(si, (v, t))| match v {
-                        Some(v) => v.val_at(c.row as usize, *t),
-                        None => gathered[&si][wi].clone(),
-                    })
-                    .collect(),
-            );
-        }
-        let out_rows = rows.len();
-        return Ok(QueryResult {
-            columns,
-            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
-            rows,
-            out_rows,
-            cols: None,
-            scanned_groups,
-            total_groups: table.group_count(),
-        });
-    }
-
-    let offset = q.offset.unwrap_or(0) as usize;
-    let limit = q.limit.map(|l| l as usize).unwrap_or(usize::MAX);
-
-    if q.is_aggregate {
-        if q.group_by.is_empty() && n_groups == 0 {
-            n_groups = 1;
-            for a in &mut accs {
-                a.grow(1);
-            }
-        }
-        // The output phase is a vectorized pass over the GROUP TABLE — one
-        // row per group, aggregates and keys as columns under synthetic
-        // indices, select/order expressions rewritten onto them and run by
-        // the same kernels as the scan — not a per-group tree walk. Keys of
-        // a packed plan land as code lanes: no string is touched until the
-        // surviving rows are gathered.
-        let base = table.catalog().schema.columns.len();
-        let mut gcols: HashMap<usize, (GroupCol, Option<Rc<Vec<u8>>>)> = HashMap::new();
-        for (i, (acc, call)) in accs.iter().zip(&agg_calls).enumerate() {
-            let vv = lanes_to_vv(n_groups, call.ty(), |g| acc.finish(g));
-            gcols.insert(base + i, (GroupCol::Ready(vv), None));
-        }
-        let key_base = base + agg_calls.len();
-        if let Some(plan) = &direct {
-            let lanes = packed_key_lanes(&group_codes, &plan.cols, &plan.dims, &plan.cards, &dicts);
-            for (k, lane) in lanes.into_iter().enumerate() {
-                gcols.insert(key_base + k, lane);
-            }
-        } else if let Some(tg) = &textg {
-            let mut packed =
-                packed_key_lanes(&tg.codes, &tg.pcols, &tg.pdims, &tg.pcards, &dicts).into_iter();
-            let nt = tg.n_text();
-            let mut tk = 0;
-            for (k, dim) in tg.dims.iter().enumerate() {
-                let lane = match dim {
-                    TextDim::Packed => packed.next().unwrap(),
-                    TextDim::Text(_) => {
-                        // the arena, compacted per text dim: a raw text column
-                        let mut offsets = Vec::with_capacity(n_groups + 1);
-                        offsets.push(0u32);
-                        let mut bytes = Vec::new();
-                        let mut valid = vec![0u8; n_groups.div_ceil(8)];
-                        for g in 0..n_groups {
-                            let (start, len) = tg.spans[g * nt + tk];
-                            if len != u32::MAX {
-                                bytes.extend_from_slice(&tg.arena[start as usize..(start + len) as usize]);
-                                valid[g / 8] |= 1 << (g % 8);
-                            }
-                            offsets.push(bytes.len() as u32);
-                        }
-                        tk += 1;
-                        (
-                            GroupCol::Text {
-                                strs: std::cell::OnceCell::new(),
-                                offsets: Rc::new(offsets),
-                                bytes: Rc::new(bytes),
-                            },
-                            Some(Rc::new(valid)),
-                        )
-                    }
-                };
-                gcols.insert(key_base + k, lane);
-            }
-        } else {
-            for (k, g_expr) in q.group_by.iter().enumerate() {
-                let vv = lanes_to_vv(n_groups, g_expr.ty(), |g| group_keys[g][k].clone());
-                gcols.insert(key_base + k, (GroupCol::Ready(vv), None));
-            }
-        }
-        let gctx = GroupCtx { cols: gcols, rows: n_groups };
-        let rewrite = |b: &Bound| substitute_grouped(b, &q.group_by, &agg_calls, base, key_base);
-
-        // ORDER BY over every group; numeric keys pack to u64 and sort as
-        // integers, anything else compares through cmp_sql. Stable, so ties
-        // keep group discovery order.
-        let order: Vec<u32> = if q.order_by.is_empty() {
-            (0..n_groups as u32).collect()
-        } else {
-            let ord_vvs: Vec<VV> =
-                q.order_by.iter().map(|(e, _)| eval_vec(&rewrite(e), &gctx)).collect();
-            let nk = ord_vvs.len();
-            let numeric = ord_tys
-                .iter()
-                .all(|t| matches!(t, Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp));
-            let mut perm: Vec<u32> = (0..n_groups as u32).collect();
-            if numeric && nk == 1 {
-                let (_, dir) = &q.order_by[0];
-                let desc = *dir == SortDir::Desc;
-                let mut keyed: Vec<(u8, u64, u32)> = (0..n_groups)
-                    .map(|g| {
-                        let (v, k) = encode_order(&ord_vvs[0], g, ord_tys[0], desc);
-                        (v, k, g as u32)
-                    })
-                    .collect();
-                // gid last: ties keep discovery order, and unstable is fine
-                keyed.sort_unstable();
-                perm = keyed.into_iter().map(|t| t.2).collect();
-            } else if numeric {
-                let mut flat: Vec<(u8, u64)> = Vec::with_capacity(n_groups * nk);
-                for g in 0..n_groups {
-                    for (ki, (_, dir)) in q.order_by.iter().enumerate() {
-                        flat.push(encode_order(&ord_vvs[ki], g, ord_tys[ki], *dir == SortDir::Desc));
-                    }
-                }
-                perm.sort_unstable_by(|&a, &b| {
-                    let (ia, ib) = (a as usize * nk, b as usize * nk);
-                    flat[ia..ia + nk].cmp(&flat[ib..ib + nk]).then(a.cmp(&b))
-                });
-            } else {
-                let keys: Vec<Vec<Val>> = (0..n_groups)
-                    .map(|g| ord_vvs.iter().zip(&ord_tys).map(|(v, t)| v.val_at(g, *t)).collect())
-                    .collect();
-                perm.sort_by(|&a, &b| cmp_keys(&keys[a as usize], &keys[b as usize], &q.order_by));
-            }
-            perm
-        };
-        // project only the survivors, straight into the columnar channel
-        let refs: Vec<(u32, u32)> =
-            order.into_iter().skip(offset).take(limit).map(|g| (0, g)).collect();
-        let cols: Vec<OutCol> = q
-            .select
-            .iter()
-            .zip(&sel_tys)
-            .map(|(sel, ty)| {
-                let expr = rewrite(&sel.expr);
-                // a text key selected as-is gathers off its raw lane: no
-                // Rc<String> is ever built for it
-                if let Bound::Column { index, ty: Ty::Text } = &expr {
-                    if let Some((GroupCol::Text { offsets, bytes, .. }, valid)) = gctx.cols.get(index) {
-                        let src = SelSrc::RawText(vec![(offsets.clone(), bytes.clone(), valid.clone())]);
-                        return gather_outcol(&src, &refs, *ty);
-                    }
-                }
-                gather_outcol(&SelSrc::Vv(vec![eval_vec(&expr, &gctx)]), &refs, *ty)
-            })
-            .collect();
-        return Ok(QueryResult {
-            columns,
-            col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
-            rows: Vec::new(),
-            out_rows: refs.len(),
-            cols: Some(cols),
-            scanned_groups,
-            total_groups: table.group_count(),
-        });
-    }
-
-    // every non-aggregate path returned columnar above; this only drains
-    // the (empty) row seed
-    let rows: Vec<Vec<Val>> =
-        out_rows.into_iter().skip(offset).take(limit).map(|(p, _)| p).collect();
-    let out_rows = rows.len();
-    Ok(QueryResult {
-        columns,
-        col_types: q.select.iter().map(|s| s.expr.ty()).collect(),
-        rows,
-        out_rows,
-        cols: None,
-        scanned_groups,
-        total_groups: table.group_count(),
-    })
+    strategy.finish(table, &sh)
 }

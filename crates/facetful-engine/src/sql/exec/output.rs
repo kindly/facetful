@@ -156,3 +156,15 @@ pub(super) fn encode_order(vv: &VV, i: usize, ty: Ty, desc: bool) -> (u8, u64) {
     };
     if desc { (1 - v, !k) } else { (v, k) }
 }
+
+/// Compare two ORDER BY key tuples under the query's directions.
+pub(super) fn cmp_keys(a: &[Val], b: &[Val], order_by: &[(Bound, SortDir)]) -> core::cmp::Ordering {
+    for (i, (_, dir)) in order_by.iter().enumerate() {
+        let ord = a[i].cmp_sql(&b[i]);
+        let ord = if *dir == SortDir::Desc { ord.reverse() } else { ord };
+        if ord != core::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    core::cmp::Ordering::Equal
+}

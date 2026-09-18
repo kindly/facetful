@@ -196,3 +196,133 @@ pub(super) fn pack_bits(bytes: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+/// The WHERE mask for row group `g`, per conjunct: from the mask cache when
+/// present, else evaluated and cached. `None` when there is no WHERE. Columns
+/// a conjunct had to load stay in `cols` for the strategy to reuse.
+pub(super) fn where_mask<S: ReadAt>(
+    table: &mut Table<S>,
+    g: usize,
+    rows: usize,
+    conjuncts: &[Conjunct],
+    dicts: &Dicts,
+    cols: &mut Cols,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    if conjuncts.is_empty() {
+        return Ok(None);
+    }
+    let mut keep = vec![1u8; rows];
+    let mut pending: Vec<&Conjunct> = Vec::new();
+    for c in conjuncts {
+        match table.masks().get(&c.key, g) {
+            Some(bits) => {
+                for (i, k) in keep.iter_mut().enumerate() {
+                    *k &= bits[i / 8] >> (i % 8) & 1;
+                }
+            }
+            None => pending.push(c),
+        }
+    }
+    if pending.is_empty() {
+        return Ok(Some(keep));
+    }
+    let n_groups = table.group_count();
+    let store = |table: &mut Table<S>, c: &Conjunct, m: &[u8], keep: &mut [u8]| {
+        table.masks().put(&c.key, g, n_groups, Rc::new(pack_bits(m)), c.like.clone());
+        for (k, &b) in keep.iter_mut().zip(m) {
+            *k &= b;
+        }
+    };
+    // contains-LIKE extending a cached needle: verify only the rows the
+    // superset admits, straight off the image — no blob scan, no column copy
+    let mut full: Vec<&Conjunct> = Vec::new();
+    for c in pending {
+        let narrowed = c.like.as_ref().and_then(|lk| {
+            let sup = table.masks().like_superset(lk.col, &lk.needle, g)?;
+            let needle = lk.needle.as_bytes();
+            table
+                .with_text_segments(g, lk.col, |offs, blob, valid| {
+                    let off = |i: usize| {
+                        u32::from_le_bytes(offs[i * 4..i * 4 + 4].try_into().unwrap()) as usize
+                    };
+                    let mut m = vec![0u8; rows];
+                    for (i, mi) in m.iter_mut().enumerate() {
+                        if sup[i / 8] >> (i % 8) & 1 == 0
+                            || valid.is_some_and(|v| v[i / 8] >> (i % 8) & 1 == 0)
+                        {
+                            continue;
+                        }
+                        let s = &blob[off(i)..off(i + 1)];
+                        *mi = crate::text::contains_ci(s, needle) as u8;
+                    }
+                    m
+                })
+                .ok()
+                .flatten()
+        });
+        if let Some(m) = narrowed {
+            store(table, c, &m, &mut keep);
+            continue;
+        }
+        // integer comparison straight off the raw narrow segment — widening
+        // the lane into Vec<i64> costs more than the compare
+        let int_fast = int_cmp_lit(&c.expr).and_then(|(col, lo, hi, inv)| {
+            table
+                .with_fixed_segments(g, col, |vals, w, valid| {
+                    let mut m = vec![0u8; rows];
+                    // Bounds are clamped to the stored width so the compare
+                    // runs at that width — verified in the wasm disassembly:
+                    // i64 bounds forced an extend-to-i64x2 chain (2 lanes/op);
+                    // clamped i16 bounds compare as i16x8 (8 lanes/op).
+                    macro_rules! sweep {
+                        ($t:ty, $w:expr, |$i:ident, $ch:ident| $x:expr) => {{
+                            if lo > <$t>::MAX as i64 || hi < <$t>::MIN as i64 {
+                                m.fill(inv as u8); // empty range
+                            } else {
+                                let lo = lo.max(<$t>::MIN as i64) as $t;
+                                let hi = hi.min(<$t>::MAX as i64) as $t;
+                                for ($i, $ch) in vals[..rows * $w].chunks_exact($w).enumerate() {
+                                    let x: $t = $x;
+                                    m[$i] = ((x >= lo && x <= hi) != inv) as u8;
+                                }
+                            }
+                        }};
+                    }
+                    match w {
+                        1 => sweep!(i8, 1, |i, ch| ch[0] as i8),
+                        2 => sweep!(i16, 2, |i, ch| i16::from_le_bytes([ch[0], ch[1]])),
+                        4 => sweep!(i32, 4, |i, ch| i32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]])),
+                        _ => sweep!(i64, 8, |i, ch| i64::from_le_bytes([
+                            ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7]
+                        ])),
+                    }
+                    if let Some(vb) = valid {
+                        for (i, mi) in m.iter_mut().enumerate() {
+                            *mi &= vb[i / 8] >> (i % 8) & 1;
+                        }
+                    }
+                    m
+                })
+                .ok()
+                .flatten()
+        });
+        match int_fast {
+            Some(m) => store(table, c, &m, &mut keep),
+            None => full.push(c),
+        }
+    }
+    if !full.is_empty() {
+        let mut full_cols: Vec<usize> = full.iter().flat_map(|c| c.cols.iter().copied()).collect();
+        full_cols.sort_unstable();
+        full_cols.dedup();
+        load_columns(table, g, dicts, cols, &full_cols, usize::MAX)?;
+        for c in full {
+            let fctx = GroupCtx { cols: core::mem::take(cols), rows };
+            let v = eval_vec(&c.expr, &fctx);
+            *cols = fctx.cols;
+            let m: Vec<u8> = (0..rows).map(|i| (v.bool3_at(i) == Some(true)) as u8).collect();
+            store(table, c, &m, &mut keep);
+        }
+    }
+    Ok(Some(keep))
+}
