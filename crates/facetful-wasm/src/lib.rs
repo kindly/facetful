@@ -19,13 +19,155 @@ use std::mem;
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn opfs_read(file_id: u32, offset: f64, len: u32, dest: *mut u8) -> i32;
+    /// The second import (design.sv d49): evaluate user-defined function `id`
+    /// over `len` rows. `args` points at `argc` lane descriptors and `out` at
+    /// one more for the result (layout: `udf::DESC_WORDS` u32s each, see
+    /// `WasmHost`). Returns 0, or -n with an n-byte error message the JS side
+    /// allocated (its pointer in the out descriptor's ERR field).
+    fn udf_call(id: u32, argc: u32, args: *const u32, out: *mut u32, len: u32) -> i32;
 }
 
-/// Native builds (tests, CLI linkage) never call this; stub keeps them linking.
+/// Native builds (tests, CLI linkage) never call these; stubs keep them linking.
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(unused)]
 unsafe fn opfs_read(_file_id: u32, _offset: f64, _len: u32, _dest: *mut u8) -> i32 {
     -1
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused)]
+unsafe fn udf_call(_id: u32, _argc: u32, _args: *const u32, _out: *mut u32, _len: u32) -> i32 {
+    -1
+}
+
+// ---------------- user-defined functions ----------------
+//
+// Lane descriptor, 8 u32 words:
+//   0 KIND   udf::Kind as u8        4 AUX    text: u32 offsets ptr (len+1)
+//   1 LEN    values in the lane     5 VALID  validity bitmap ptr, 0 = all valid
+//   2 FLAGS  bit0 = broadcast       6 BYTES  text: byte length of DATA
+//   3 DATA   f64 lane / u8 bools /  7 ERR    out only: JS-allocated error text
+//            text bytes ptr
+// Numbers (ints, days, ms) travel as f64, like the rest of the boundary. For a
+// text OUTPUT the engine allocates the offsets; JS allocates the bytes with
+// `alloc`, writes their ptr in DATA and length in BYTES, and the host frees it.
+const DESC_WORDS: usize = 8;
+
+struct WasmHost;
+
+impl facetful_engine::udf::Host for WasmHost {
+    fn call(
+        &mut self,
+        id: u32,
+        args: &[facetful_engine::udf::Arg],
+        len: usize,
+        out: &mut facetful_engine::udf::Output,
+    ) -> Result<(), String> {
+        use facetful_engine::udf::{Lane, Out};
+        let mut desc = vec![0u32; (args.len() + 1) * DESC_WORDS];
+        for (i, a) in args.iter().enumerate() {
+            let d = &mut desc[i * DESC_WORDS..(i + 1) * DESC_WORDS];
+            d[0] = a.kind as u32;
+            d[2] = a.broadcast as u32;
+            match &a.lane {
+                Lane::Num(v) => {
+                    d[1] = v.len() as u32;
+                    d[3] = v.as_ptr() as u32;
+                }
+                Lane::Bool(v) => {
+                    d[1] = v.len() as u32;
+                    d[3] = v.as_ptr() as u32;
+                }
+                Lane::Text { offsets, bytes } => {
+                    d[1] = (offsets.len() - 1) as u32;
+                    d[3] = bytes.as_ptr() as u32;
+                    d[4] = offsets.as_ptr() as u32;
+                    d[6] = bytes.len() as u32;
+                }
+            }
+            d[5] = a.valid.map_or(0, |v| v.as_ptr() as u32);
+        }
+        let o = args.len() * DESC_WORDS;
+        desc[o] = out.kind as u32;
+        desc[o + 1] = len as u32;
+        desc[o + 5] = out.valid.as_ptr() as u32;
+        match &mut out.out {
+            Out::Num(v) => desc[o + 3] = v.as_mut_ptr() as u32,
+            Out::Bool(v) => desc[o + 3] = v.as_mut_ptr() as u32,
+            Out::Text { offsets, .. } => desc[o + 4] = offsets.as_mut_ptr() as u32,
+        }
+        let rc = unsafe { udf_call(id, args.len() as u32, desc.as_ptr(), desc[o..].as_mut_ptr(), len as u32) };
+        if rc < 0 {
+            let n = (-rc) as usize;
+            let p = desc[o + 7] as *mut u8;
+            let msg = if p.is_null() || n == 0 {
+                "user function failed".to_string()
+            } else {
+                let m = unsafe { String::from_utf8_lossy(core::slice::from_raw_parts(p, n)).into_owned() };
+                dealloc(p, n);
+                m
+            };
+            return Err(msg);
+        }
+        if let Out::Text { bytes, .. } = &mut out.out {
+            let (p, n) = (desc[o + 3] as *mut u8, desc[o + 6] as usize);
+            if !p.is_null() && n > 0 {
+                bytes.extend_from_slice(unsafe { core::slice::from_raw_parts(p, n) });
+                dealloc(p, n);
+            }
+        }
+        Ok(())
+    }
+}
+
+static mut UDF_ERROR: Option<String> = None;
+
+/// Declare a user-defined function: `params` is `argc` kind bytes, `ret` a
+/// kind, `flags` bit0 = strict (NULL in → NULL out), bit1 = variadic. Returns
+/// the function id (≥ 1), or 0 with the reason in `udf_error`.
+#[no_mangle]
+pub extern "C" fn udf_register(
+    name_ptr: *const u8,
+    name_len: usize,
+    params_ptr: *const u8,
+    argc: usize,
+    ret: u32,
+    flags: u32,
+) -> u32 {
+    use facetful_engine::udf::{self, Kind};
+    let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    let params = unsafe { core::slice::from_raw_parts(params_ptr, argc) };
+    let result = (|| {
+        let name = core::str::from_utf8(name).map_err(|_| "name is not UTF-8".to_string())?;
+        let params: Vec<_> = params
+            .iter()
+            .map(|&k| Kind::from_u8(k).map(|k| k.ty()).ok_or_else(|| format!("unknown parameter kind {k}")))
+            .collect::<Result<_, _>>()?;
+        let ret = Kind::from_u8(ret as u8).ok_or_else(|| format!("unknown return kind {ret}"))?.ty();
+        udf::set_host(Box::new(WasmHost));
+        udf::register(name, &params, ret, flags & 1 != 0, flags & 2 != 0)
+    })();
+    match result {
+        Ok(id) => id,
+        Err(e) => {
+            unsafe { *core::ptr::addr_of_mut!(UDF_ERROR) = Some(e) };
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn udf_unregister(name_ptr: *const u8, name_len: usize) -> u32 {
+    let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    core::str::from_utf8(name).is_ok_and(facetful_engine::udf::unregister) as u32
+}
+
+/// The last `udf_register` failure, copied into `out` (returns bytes written).
+#[no_mangle]
+pub extern "C" fn udf_error(out: *mut u8, cap: usize) -> u32 {
+    let msg = unsafe { (*core::ptr::addr_of_mut!(UDF_ERROR)).take() }.unwrap_or_default();
+    let n = msg.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(msg.as_ptr(), out, n) };
+    n as u32
 }
 
 pub enum Src {

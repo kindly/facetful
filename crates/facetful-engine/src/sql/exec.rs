@@ -8,7 +8,7 @@
 //! per-lane accessors — still no per-row tree walks or Val allocations.
 
 use super::ast::{BinOp, SortDir, UnOp};
-use super::binder::{Bound, BoundQuery, FuncKind, Ty};
+use super::binder::{Bound, BoundQuery, FuncKind, Sig, Ty};
 use crate::format::read::ReadAt;
 use crate::format::{ColumnType, FormatError};
 use crate::mask_cache::LikeKey;

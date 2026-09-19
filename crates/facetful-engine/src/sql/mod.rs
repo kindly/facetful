@@ -150,7 +150,14 @@ fn exec_query<S: ReadAt>(
     let run = |t: &mut Table<S>| -> Result<(binder::BoundQuery, exec::QueryResult), Diagnostic> {
         let schema = t.catalog().schema.clone();
         let bound = binder::Binder::new(&schema).bind_query(q)?;
+        crate::udf::take_error();
         let r = exec::execute(t, &bound).map_err(exec_err)?;
+        // a user-defined function body failed mid-scan: the query fails, and
+        // nothing evaluated with it may stay cached
+        if let Some(e) = crate::udf::take_error() {
+            t.masks().clear();
+            return Err(Diagnostic::new(format!("user-defined function failed: {e}"), q.span));
+        }
         Ok((bound, r))
     };
     match target {

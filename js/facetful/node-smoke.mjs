@@ -136,4 +136,46 @@ try {
   console.log("sql join: OK (materialized join", joined.rows, "rows)");
 }
 
+// user-defined functions (design.sv d49): regexp() vectorized over lanes with a
+// per-pattern RegExp cache, a per-row function, text out, NULLs, an error body
+{
+  engine.registerFunction("regexp", { params: ["text", "text"], returns: "bool" }, (() => {
+    const cache = new Map();
+    return (args, len, out) => {
+      const [s, p] = args;
+      const pat = p.values[0];
+      let re = cache.get(pat);
+      if (!re) cache.set(pat, (re = new RegExp(pat)));
+      for (let i = 0; i < len; i++) out.values[i] = re.test(s.values[i]) ? 1 : 0;
+    };
+  })());
+  engine.registerFunction("tag", { params: ["text", "int"], returns: "text", perRow: true }, (c, n) => `${c.toUpperCase()}#${n % 3}`);
+  engine.registerFunction("half", { params: ["float"], returns: "float", perRow: true }, (x) => x / 2);
+  engine.registerFunction("boom", { params: ["int"], returns: "int", perRow: true }, () => { throw new Error("kaboom"); });
+
+  let r = engine.query(handle, "select count(*) as n from t where regexp(country, '^country_1[0-9]$')");
+  const n1 = r.columns[0].values[0];
+  r = engine.query(handle, "select count(*) as n from t where country like 'country_1_'");
+  if (n1 !== r.columns[0].values[0] || n1 === 0) throw new Error(`regexp count ${n1} != between count ${r.columns[0].values[0]}`);
+  // the same predicate again: served from the mask cache
+  const t0 = performance.now();
+  engine.query(handle, "select count(*) as n from t where regexp(country, '^country_1[0-9]$')");
+  const cached = performance.now() - t0;
+  // text out with a NULL-preserving strict path (capacity has NULLs; id never)
+  r = engine.query(handle, "select tag(country, id) as g, count(*) as n from t where id < 6 group by g order by g");
+  if (r.rowCount !== 6 || !/^COUNTRY_\d+#[0-2]$/.test(text(r.columns[0], 0))) throw new Error(`tag(): ${r.rowCount} rows, first ${text(r.columns[0], 0)}`);
+  r = engine.query(handle, "select count(half(capacity)) as c, count(*) as n from t");
+  const [c, total] = [r.columns[0].values[0], r.columns[1].values[0]];
+  r = engine.query(handle, "select count(capacity) from t");
+  if (c !== r.columns[0].values[0] || c === total) throw new Error("strict NULL handling: half() must be NULL where capacity is");
+  let failed = false;
+  try { engine.query(handle, "select boom(id) from t limit 1"); } catch (e) { failed = e instanceof QueryError && /kaboom/.test(e.message); }
+  if (!failed) throw new Error("a throwing UDF must fail the query with its message");
+  let typed = false;
+  try { engine.query(handle, "select half(country) from t limit 1"); } catch (e) { typed = e instanceof QueryError && /argument 1 needs float/.test(e.message); }
+  if (!typed) throw new Error("UDF argument types are checked at bind time");
+  if (!engine.unregisterFunction("boom") || engine.unregisterFunction("boom")) throw new Error("unregister");
+  console.log(`udf: OK (regexp matched ${n1} rows; cached rerun ${cached.toFixed(2)} ms)`);
+}
+
 console.log("js protocol smoke: OK");

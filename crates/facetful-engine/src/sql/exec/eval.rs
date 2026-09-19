@@ -54,7 +54,10 @@ pub(super) fn eval_vec(b: &Bound, ctx: &GroupCtx) -> VV {
             let b2 = eval_vec(rhs, ctx);
             eval_binary_vec(*op, a, b2, *ty, rows)
         }
-        Bound::Call { func, args, ty } => eval_call_vec(func.name, args, *ty, ctx),
+        Bound::Call { func, args, ty } => match func.sig {
+            Sig::Udf { id, strict, .. } => udf_call_vec(id, strict, args, *ty, ctx),
+            _ => eval_call_vec(func.name, args, *ty, ctx),
+        },
     }
 }
 
@@ -725,6 +728,191 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
             })
         }
     }
+}
+
+/// A user-defined function over whole lanes (crate::udf). Arguments are
+/// evaluated as vectors and handed to the host as they are: numbers as f64,
+/// text as offsets + bytes, literals broadcast. When one argument is a
+/// dictionary column and every other is a literal, the call runs over the
+/// dictionary and the result is gathered through the codes — a 4M-row
+/// column costs one pass over its distinct values.
+fn udf_call_vec(id: u32, strict: bool, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
+    use crate::udf::{Arg, Kind, Lane, Out, Output};
+    let rows = ctx.rows;
+    let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+    // the dictionary path
+    let dict_arg = items.iter().position(|v| matches!(v.data, Data::Codes { .. }));
+    let over_dict = dict_arg.is_some_and(|d| {
+        items.iter().enumerate().all(|(i, v)| i == d || matches!(v.data, Data::Const(_)))
+    });
+    let len = if over_dict {
+        match &items[dict_arg.unwrap()].data {
+            Data::Codes { dict, .. } => dict.len(),
+            _ => unreachable!(),
+        }
+    } else {
+        rows
+    };
+    // owned buffers the lanes borrow from
+    let mut nums: Vec<Vec<f64>> = Vec::new();
+    let mut texts: Vec<(Vec<u32>, Vec<u8>)> = Vec::new();
+    let mut valids: Vec<Vec<u8>> = Vec::new();
+    let mut plan: Vec<(Kind, usize, Option<usize>, bool)> = Vec::new(); // (kind, buffer index, validity index, broadcast)
+    let mut null_any: Option<Vec<u8>> = None; // strict: rows with any NULL input (row space)
+    for (ai, v) in items.iter().enumerate() {
+        let aty = args[ai].ty();
+        let kind = Kind::of(aty);
+        let mut broadcast = false;
+        let valid_idx = match &v.data {
+            Data::Const(Val::Null) => None,
+            Data::Const(_) => None,
+            _ if over_dict && Some(ai) != dict_arg => None,
+            _ => v.valid.as_ref().map(|b| {
+                valids.push(b.to_vec());
+                valids.len() - 1
+            }),
+        };
+        if strict && !over_dict {
+            if let Some(b) = &v.valid {
+                let m = null_any.get_or_insert_with(|| vec![0u8; (rows + 7) / 8]);
+                for (x, y) in m.iter_mut().zip(b.iter()) {
+                    *x |= !y;
+                }
+            }
+        }
+        let buf = match &v.data {
+            Data::I64(x) => {
+                nums.push(x.iter().map(|&i| i as f64).collect());
+                (Kind::of(aty), nums.len() - 1)
+            }
+            Data::F64(x) => {
+                nums.push(x.to_vec());
+                (Kind::Float, nums.len() - 1)
+            }
+            Data::Bool(x) => {
+                nums.push(x.iter().map(|&b| b as f64).collect());
+                (Kind::Bool, nums.len() - 1)
+            }
+            Data::Text(strs) => {
+                texts.push(pack_text(strs.iter().map(|s| s.as_str())));
+                (Kind::Text, texts.len() - 1)
+            }
+            Data::Codes { codes, dict } => {
+                if over_dict {
+                    texts.push(pack_text(dict.iter().map(|s| s.as_str())));
+                } else {
+                    texts.push(pack_text(codes.iter().map(|&c| dict.get(c as usize).map_or("", |s| s.as_str()))));
+                }
+                (Kind::Text, texts.len() - 1)
+            }
+            Data::Const(c) => {
+                broadcast = true;
+                match c {
+                    Val::Text(s) => {
+                        texts.push(pack_text(std::iter::once(s.as_str())));
+                        (Kind::Text, texts.len() - 1)
+                    }
+                    Val::Null => {
+                        // a NULL literal: one invalid value of the declared kind
+                        valids.push(vec![0u8]);
+                        let vi = valids.len() - 1;
+                        if kind == Kind::Text {
+                            texts.push((vec![0, 0], Vec::new()));
+                            plan.push((Kind::Text, texts.len() - 1, Some(vi), true));
+                        } else {
+                            nums.push(vec![0.0]);
+                            plan.push((kind, nums.len() - 1, Some(vi), true));
+                        }
+                        continue;
+                    }
+                    other => {
+                        nums.push(vec![other.as_f64().unwrap_or(0.0)]);
+                        (kind, nums.len() - 1)
+                    }
+                }
+            }
+        };
+        plan.push((buf.0, buf.1, valid_idx, broadcast));
+    }
+    let lanes: Vec<Arg> = plan
+        .iter()
+        .map(|&(kind, bi, vi, broadcast)| Arg {
+            kind,
+            lane: match kind {
+                Kind::Text => Lane::Text { offsets: &texts[bi].0, bytes: &texts[bi].1 },
+                Kind::Bool => {
+                    // bools travel as f64 too (one numeric view in JS)
+                    Lane::Num(&nums[bi])
+                }
+                _ => Lane::Num(&nums[bi]),
+            },
+            valid: vi.map(|i| valids[i].as_slice()),
+            broadcast,
+        })
+        .collect();
+    let mut out = Output::new(Kind::of(ty), len);
+    if let Err(e) = crate::udf::call(id, &lanes, len, &mut out) {
+        // the binder accepted the call; a failing body is a runtime error the
+        // driver cannot surface mid-scan yet — an all-NULL lane with the
+        // message logged is the honest fallback (design.sv d49: revisit)
+        crate::udf::note_error(e);
+        out.valid.iter_mut().for_each(|b| *b = 0);
+    }
+    // back into a vector: dictionary results gather through the codes
+    let gather: Option<&Rc<Vec<u16>>> = if over_dict {
+        match &items[dict_arg.unwrap()].data {
+            Data::Codes { codes, .. } => Some(codes),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let n = rows;
+    let mut valid = vec![0u8; (n + 7) / 8];
+    let bit_of = |bits: &[u8], i: usize| bits[i / 8] >> (i % 8) & 1 == 1;
+    let src = |i: usize| -> Option<usize> {
+        match gather {
+            Some(codes) => {
+                if items[dict_arg.unwrap()].is_valid(i) { Some(codes[i] as usize) } else { None }
+            }
+            None => Some(i),
+        }
+    };
+    for i in 0..n {
+        let ok = src(i).is_some_and(|s| bit_of(&out.valid, s))
+            && null_any.as_ref().map_or(true, |m| !bit_of(m, i));
+        if ok {
+            valid[i / 8] |= 1 << (i % 8);
+        }
+    }
+    let data = match out.out {
+        Out::Num(v) => match ty {
+            Ty::Float => Data::F64(Rc::new((0..n).map(|i| src(i).map_or(0.0, |s| v[s])).collect())),
+            _ => Data::I64(Rc::new((0..n).map(|i| src(i).map_or(0, |s| v[s] as i64)).collect())),
+        },
+        Out::Bool(v) => Data::Bool(Rc::new((0..n).map(|i| src(i).map_or(0, |s| v[s])).collect())),
+        Out::Text { offsets, bytes } => {
+            let strs: Vec<VStr> = (0..len)
+                .map(|s| {
+                    let (a, b) = (offsets[s] as usize, offsets[s + 1] as usize);
+                    Rc::new(String::from_utf8_lossy(&bytes[a.min(bytes.len())..b.min(bytes.len())]).into_owned())
+                })
+                .collect();
+            let empty = Rc::new(String::new());
+            Data::Text(Rc::new((0..n).map(|i| src(i).map_or_else(|| empty.clone(), |s| strs[s].clone())).collect()))
+        }
+    };
+    VV { data, valid: Some(Rc::new(valid)) }
+}
+
+fn pack_text<'a>(it: impl Iterator<Item = &'a str>) -> (Vec<u32>, Vec<u8>) {
+    let mut offsets = vec![0u32];
+    let mut bytes = Vec::new();
+    for s in it {
+        bytes.extend_from_slice(s.as_bytes());
+        offsets.push(bytes.len() as u32);
+    }
+    (offsets, bytes)
 }
 
 pub(super) fn lane_val(v: &VV, i: usize) -> Val {

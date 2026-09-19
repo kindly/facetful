@@ -11,6 +11,7 @@ pub mod mask_cache;
 pub mod join;
 pub mod materialize;
 pub mod text;
+pub mod udf;
 
 pub mod sql;
 

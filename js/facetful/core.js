@@ -10,10 +10,12 @@ const KINDS = { 1: "int", 2: "float", 3: "bool", 4: "text", 5: "date", 6: "times
 // Re-interpret as unsigned before building any view over memory.
 const u32 = (n) => n >>> 0;
 
-// The wasm module declares one import: env.opfs_read(fileId, offset, len, destPtr)
-// -> bytes read. The browser worker supplies a real implementation over OPFS
-// sync access handles; environments without OPFS (Node smoke test) get a stub
-// that fails any read (memory-backed tables never call it).
+// The wasm module declares two imports. env.opfs_read(fileId, offset, len,
+// destPtr) -> bytes read: the browser worker supplies a real implementation
+// over OPFS sync access handles; environments without OPFS (Node smoke test)
+// get a stub that fails any read (memory-backed tables never call it).
+// env.udf_call(id, argc, argsPtr, outPtr, len) evaluates a registered
+// user-defined function over whole lanes (see Engine.registerFunction).
 export async function instantiate(wasmBytes, opfsRead) {
   let engine = null;
   const env = {
@@ -22,11 +24,18 @@ export async function instantiate(wasmBytes, opfsRead) {
       // the view must be built per call: memory.buffer detaches on growth
       return opfsRead(fileId, offset, new Uint8Array(engine.mem(), u32(destPtr), u32(len)));
     },
+    udf_call: (id, argc, argsPtr, outPtr, len) => engine._udfCall(id, argc, u32(argsPtr), u32(outPtr), len),
   };
   const { instance } = await WebAssembly.instantiate(wasmBytes, { env });
   engine = new Engine(instance.exports);
   return engine;
 }
+
+/** Lane kinds on the UDF wire (the numbers are the ABI). */
+export const KIND = { int: 0, float: 1, bool: 2, text: 3, date: 4, timestamp: 5 };
+const KIND_NAMES = Object.keys(KIND);
+// descriptor words: see facetful-wasm `WasmHost`
+const D_KIND = 0, D_LEN = 1, D_FLAGS = 2, D_DATA = 3, D_AUX = 4, D_VALID = 5, D_BYTES = 6, D_ERR = 7, D_WORDS = 8;
 
 export class Engine {
   constructor(exports) {
@@ -34,6 +43,132 @@ export class Engine {
     this.scratch = u32(this.w.alloc(4096));
     this.enc = new TextEncoder();
     this.dec = new TextDecoder();
+    /** id -> { fn, sig, name } for registered user-defined functions */
+    this.udfs = new Map();
+  }
+
+  /**
+   * Register a user-defined scalar function (design.sv d49). `sig` is
+   * `{ params: kind[], returns: kind, strict?, variadic?, perRow? }` with kinds
+   * from KIND (by name). The function is called ONCE per lane —
+   * `fn(args, len, out)` where each arg is `{ kind, values, valid, broadcast }`
+   * (`values` a Float64Array for numbers/dates/bools, `string[]` for text;
+   * `broadcast` = a literal, one value; `valid` a bitmap or null) and `out` is
+   * `{ values, valid }` to fill (`values` a typed array or `string[]`; set a
+   * result to null to make it NULL). With `perRow: true` the function is
+   * instead called per row with plain values and returns one (or null).
+   * Strict (the default) skips NULL inputs and NULL-fills those outputs.
+   */
+  registerFunction(name, sig, fn) {
+    const kinds = (sig.params || []).map(kindOf);
+    const ret = kindOf(sig.returns);
+    const nameB = this.enc.encode(name);
+    const p = u32(this.w.alloc(nameB.byteLength + kinds.length + 1));
+    new Uint8Array(this.mem(), p, nameB.byteLength).set(nameB);
+    new Uint8Array(this.mem(), p + nameB.byteLength, kinds.length).set(kinds);
+    const flags = (sig.strict === false ? 0 : 1) | (sig.variadic ? 2 : 0);
+    const id = this.w.udf_register(p, nameB.byteLength, p + nameB.byteLength, kinds.length, ret, flags);
+    this.w.dealloc(p, nameB.byteLength + kinds.length + 1);
+    if (!id) {
+      const n = this.w.udf_error(this.scratch, 4096);
+      throw new Error(`registerFunction('${name}'): ${this.dec.decode(new Uint8Array(this.mem(), this.scratch, n))}`);
+    }
+    for (const [k, v] of this.udfs) if (v.name === name) this.udfs.delete(k);
+    this.udfs.set(id, { fn, sig: { ...sig, strict: sig.strict !== false }, name });
+    return id;
+  }
+
+  unregisterFunction(name) {
+    const b = this.enc.encode(name);
+    const p = u32(this.w.alloc(b.byteLength));
+    new Uint8Array(this.mem(), p, b.byteLength).set(b);
+    const ok = this.w.udf_unregister(p, b.byteLength) !== 0;
+    this.w.dealloc(p, b.byteLength);
+    for (const [k, v] of this.udfs) if (v.name === name) this.udfs.delete(k);
+    return ok;
+  }
+
+  /** The udf_call import: lanes in wasm memory -> the registered function -> the output lane. */
+  _udfCall(id, argc, argsPtr, outPtr, len) {
+    const entry = this.udfs.get(id);
+    try {
+      if (!entry) throw new Error(`no function registered under id ${id}`);
+      const mem = this.mem();
+      const args = [];
+      for (let i = 0; i < argc; i++) {
+        const d = new Uint32Array(mem, argsPtr + i * D_WORDS * 4, D_WORDS);
+        const n = d[D_LEN];
+        const kind = KIND_NAMES[d[D_KIND]];
+        const valid = d[D_VALID] ? new Uint8Array(mem, d[D_VALID], (n + 7) >> 3) : null;
+        let values;
+        if (kind === "text") {
+          values = this._decodeLane(new Uint8Array(mem, d[D_DATA], d[D_BYTES]), new Uint32Array(mem, d[D_AUX], n + 1), n);
+        } else {
+          values = new Float64Array(mem, d[D_DATA], n);
+        }
+        args.push({ kind, values, valid, broadcast: (d[D_FLAGS] & 1) !== 0 });
+      }
+      const od = new Uint32Array(mem, outPtr, D_WORDS);
+      const retKind = KIND_NAMES[od[D_KIND]];
+      const outValid = new Uint8Array(mem, od[D_VALID], (len + 7) >> 3);
+      const out = {
+        values: retKind === "text" ? new Array(len).fill("") : retKind === "bool" ? new Uint8Array(mem, od[D_DATA], len) : new Float64Array(mem, od[D_DATA], len),
+        valid: outValid,
+      };
+      const { fn, sig } = entry;
+      if (sig.perRow) {
+        const at = (a, i) => {
+          const j = a.broadcast ? 0 : i;
+          if (a.valid && !((a.valid[j >> 3] >> (j & 7)) & 1)) return null;
+          return a.values[j];
+        };
+        for (let i = 0; i < len; i++) {
+          const row = args.map((a) => at(a, i));
+          if (sig.strict && row.includes(null)) { outValid[i >> 3] &= ~(1 << (i & 7)); continue; }
+          const v = fn(...row);
+          if (v === null || v === undefined) outValid[i >> 3] &= ~(1 << (i & 7));
+          else out.values[i] = v;
+        }
+      } else {
+        fn(args, len, out);
+        // null results in a plain array mark NULL
+        if (retKind === "text") for (let i = 0; i < len; i++) if (out.values[i] == null) { outValid[i >> 3] &= ~(1 << (i & 7)); out.values[i] = ""; }
+      }
+      if (retKind === "text") {
+        const parts = out.values.map((s) => this.enc.encode(typeof s === "string" ? s : String(s)));
+        let total = 0;
+        for (const q of parts) total += q.byteLength;
+        const bp = total ? u32(this.w.alloc(total)) : 0;
+        const bytes = new Uint8Array(this.mem(), bp, total);
+        const offs = new Uint32Array(this.mem(), od[D_AUX], len + 1);
+        let pos = 0;
+        offs[0] = 0;
+        for (let i = 0; i < len; i++) { bytes.set(parts[i], pos); pos += parts[i].byteLength; offs[i + 1] = pos; }
+        const od2 = new Uint32Array(this.mem(), outPtr, D_WORDS);
+        od2[D_DATA] = bp;
+        od2[D_BYTES] = total;
+      }
+      return 0;
+    } catch (e) {
+      const msg = this.enc.encode(`${entry ? entry.name : "udf"}(): ${e && e.message ? e.message : e}`);
+      const p = u32(this.w.alloc(msg.byteLength));
+      new Uint8Array(this.mem(), p, msg.byteLength).set(msg);
+      new Uint32Array(this.mem(), outPtr, D_WORDS)[D_ERR] = p;
+      return -msg.byteLength;
+    }
+  }
+
+  /** A text lane to string[]: one decode when the bytes are ASCII (decoded
+   *  length == byte length, so byte offsets are char offsets), else per string. */
+  _decodeLane(bytes, offsets, n) {
+    const whole = this.dec.decode(bytes);
+    const out = new Array(n);
+    if (whole.length === bytes.byteLength) {
+      for (let i = 0; i < n; i++) out[i] = whole.slice(offsets[i], offsets[i + 1]);
+    } else {
+      for (let i = 0; i < n; i++) out[i] = this.dec.decode(bytes.subarray(offsets[i], offsets[i + 1]));
+    }
+    return out;
   }
   mem() {
     return this.w.memory.buffer;
@@ -225,4 +360,10 @@ export function transferables(result) {
     }
   }
   return t;
+}
+
+function kindOf(k) {
+  if (typeof k === "number") return k;
+  if (k in KIND) return KIND[k];
+  throw new Error(`unknown lane kind '${k}' (expected one of ${Object.keys(KIND).join(", ")})`);
 }

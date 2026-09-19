@@ -32,6 +32,7 @@ fn retain_heap() {}
 
 fn main() {
     retain_heap();
+    native_udfs();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("convert") => convert(&args[1..]),
@@ -588,4 +589,53 @@ fn join(args: &[String]) {
         image.len(),
         t0.elapsed().as_secs_f64() * 1e3
     );
+}
+
+// ---------------- user-defined functions, native ----------------
+
+/// The native side of the UDF host (design.sv d49): `regexp(text, pattern)`
+/// through the `regex` crate, compiled once per pattern. The browser gets the
+/// same function from JS `RegExp`; the CLI is where the differential runs.
+fn native_udfs() {
+    use facetful_engine::sql::binder::Ty;
+    use facetful_engine::udf::{self, Arg, Host, Lane, Out, Output};
+    struct NativeHost {
+        regexp: u32,
+        cache: std::collections::HashMap<String, regex::Regex>,
+    }
+    impl Host for NativeHost {
+        fn call(&mut self, id: u32, args: &[Arg], len: usize, out: &mut Output) -> Result<(), String> {
+            if id != self.regexp {
+                return Err(format!("unknown native function id {id}"));
+            }
+            let text = |a: &Arg, i: usize| -> String {
+                let Lane::Text { offsets, bytes } = &a.lane else { unreachable!() };
+                let i = if a.broadcast { 0 } else { i };
+                String::from_utf8_lossy(&bytes[offsets[i] as usize..offsets[i + 1] as usize]).into_owned()
+            };
+            let valid = |a: &Arg, i: usize| -> bool {
+                let i = if a.broadcast { 0 } else { i };
+                a.valid.map_or(true, |b| b[i / 8] >> (i % 8) & 1 == 1)
+            };
+            let Out::Bool(o) = &mut out.out else { unreachable!() };
+            for i in 0..len {
+                if !valid(&args[0], i) || !valid(&args[1], i) {
+                    out.valid[i / 8] &= !(1 << (i % 8));
+                    continue;
+                }
+                let pat = text(&args[1], i);
+                let re = match self.cache.get(&pat) {
+                    Some(r) => r,
+                    None => {
+                        let r = regex::Regex::new(&pat).map_err(|e| format!("regexp: {e}"))?;
+                        self.cache.entry(pat.clone()).or_insert(r)
+                    }
+                };
+                o[i] = re.is_match(&text(&args[0], i)) as u8;
+            }
+            Ok(())
+        }
+    }
+    let regexp = udf::register("regexp", &[Ty::Text, Ty::Text], Ty::Bool, true, false).expect("regexp registers");
+    udf::set_host(Box::new(NativeHost { regexp, cache: Default::default() }));
 }

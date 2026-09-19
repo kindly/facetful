@@ -104,6 +104,38 @@ for the join once. Correlated subqueries beyond `inner.k = outer.k` equalities,
 `NOT IN` follows SQL's NULL rule (a NULL in the set makes it select nothing);
 `NOT EXISTS` doesn't, and is usually what you mean.
 
+## User-defined functions
+
+```js
+// vectorized: called once per lane (a row group, a group table, or — for a
+// dictionary column — the dictionary itself); `out.values` is the result lane
+await db.registerFunction("regexp", { params: ["text", "text"], returns: "bool" }, (() => {
+  const cache = new Map();
+  return (args, len, out) => {
+    const [s, pattern] = args;                 // pattern is a literal: broadcast, one value
+    let re = cache.get(pattern.values[0]);
+    if (!re) cache.set(pattern.values[0], (re = new RegExp(pattern.values[0])));
+    for (let i = 0; i < len; i++) out.values[i] = re.test(s.values[i]) ? 1 : 0;
+  };
+})());
+await db.query("select fuel, count(*) from t where regexp(plant_name, '^(Big|Little) ') group by fuel");
+
+// per row: simpler, ~10x slower on large lanes
+await db.registerFunction("mw_to_gw", { params: ["float"], returns: "float", perRow: true }, (mw) => mw / 1000);
+```
+
+Kinds: `int`, `float`, `bool`, `text`, `date`, `timestamp` (dates and timestamps
+arrive as days / ms numbers). Functions bind like built-ins — wrong argument
+types are caret-diagnosed, the declared return type is the column's type — and
+their results go through the same caches, so a `regexp()` filter is evaluated
+once per pattern and served from the mask cache after. `strict` (default)
+gives NULL out for NULL in without calling you; `variadic` repeats the last
+parameter; `unregisterFunction(name)` removes one. The function runs in the
+worker: pass a self-contained function (its source is sent — an IIFE for
+state, as above — no closures over your variables) or `{ moduleUrl }`. A
+throwing function fails the query with its message. The native CLI ships
+`regexp()` built in (the `regex` crate) for the same SQL.
+
 ## Parquet support
 
 Reading uses [hyparquet](https://github.com/hyparam/hyparquet) (~20 KB gz),
@@ -122,7 +154,8 @@ browser transcoder (the native CLI has no such limit).
 SELECT-only, SQLite semantics (3-valued logic, null-skipping aggregates,
 truncating integer division, NULL-first ascending sorts). Idioms: `IN`,
 `BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE`, `CASE WHEN`, `CAST`,
-`COUNT(DISTINCT x)`, `||`, `select *`, `JOIN`/`WITH`/subqueries as above. Aggregates: count, sum, avg, min, max,
+`COUNT(DISTINCT x)`, `||`, `select *`, `JOIN`/`WITH`/subqueries and
+user-defined functions as above. Aggregates: count, sum, avg, min, max,
 count(distinct), median, stddev, group_concat. Scalars: math (abs, round,
 floor, ceil, sqrt, pow, exp, ln, sign), text (lower, upper, length, substr,
 trim/ltrim/rtrim, replace, instr, concat), null handling (coalesce, ifnull,

@@ -85,6 +85,29 @@ export class Facetful {
     return this._call({ cmd: "materialize", name, sql, table, persist });
   }
 
+  /**
+   * Register a user-defined scalar function, callable from any query.
+   * `signature` = { params: kind[], returns: kind, strict?, variadic?, perRow? }
+   * with kinds "int" | "float" | "bool" | "text" | "date" | "timestamp".
+   * `fn` runs in the worker, so pass a self-contained function (its source is
+   * sent — no closures over your variables) or `{ moduleUrl }` whose default
+   * export is the function. Vectorized by default: fn(args, len, out) is
+   * called once per lane (see core.js Engine.registerFunction); with
+   * `perRow: true` it is called per row with plain values and returns one.
+   */
+  async registerFunction(name, signature, fn) {
+    const msg = { cmd: "registerFunction", name, signature };
+    if (typeof fn === "function") msg.source = fn.toString();
+    else if (fn && fn.moduleUrl) msg.moduleUrl = fn.moduleUrl;
+    else if (typeof fn === "string") msg.source = fn;
+    else throw new Error("registerFunction: pass a function, its source text, or { moduleUrl }");
+    return this._call(msg);
+  }
+
+  async unregisterFunction(name) {
+    return this._call({ cmd: "unregisterFunction", name });
+  }
+
   /** Persist a .facetful image into OPFS at `path` (e.g. "facetful/plants.facetful"). */
   async storeOpfs(path, buffer) {
     return this._call({ cmd: "storeOpfs", path, buffer }, [buffer]);

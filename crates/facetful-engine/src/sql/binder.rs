@@ -148,6 +148,9 @@ pub enum Sig {
     Temporal(Ty),
     /// all args same type as first, returns that type
     SameAsFirst,
+    /// a user-defined function (crate::udf): declared parameter types (the
+    /// last repeats when variadic) and return type; `strict` = NULL in, NULL out
+    Udf { id: u32, params: &'static [Ty], ret: Ty, strict: bool },
 }
 
 pub static FUNCS: &[FuncDef] = &[
@@ -208,7 +211,7 @@ pub static FUNCS: &[FuncDef] = &[
 ];
 
 fn lookup_func(name: &str) -> Option<&'static FuncDef> {
-    FUNCS.iter().find(|f| f.name == name)
+    FUNCS.iter().find(|f| f.name == name).or_else(|| crate::udf::lookup(name))
 }
 
 // ---------------- binder ----------------
@@ -434,7 +437,7 @@ impl<'a> Binder<'a> {
     ) -> Result<Bound, Diagnostic> {
         let Some(func) = lookup_func(name) else {
             let mut d = Diagnostic::new(format!("unknown function '{name}'"), span);
-            if let Some(s) = suggest(name, FUNCS.iter().map(|f| f.name)) {
+            if let Some(s) = suggest(name, FUNCS.iter().map(|f| f.name).chain(crate::udf::names())) {
                 d = d.with_hint(format!("did you mean '{s}()'?"));
             }
             return Err(d);
@@ -505,6 +508,18 @@ impl<'a> Binder<'a> {
         let arg_span = |i: usize| exprs.get(i).map(|e| e.span()).unwrap_or(span);
         match func.sig {
             Sig::Any(ret) => Ok(ret),
+            Sig::Udf { params, ret, .. } => {
+                for (i, b) in bound.iter().enumerate() {
+                    let want = params[i.min(params.len() - 1)];
+                    if !b.ty().coerces_to(want) {
+                        return Err(Diagnostic::new(
+                            format!("{}() argument {} needs {}, this is {}", func.name, i + 1, want.name(), b.ty().name()),
+                            arg_span(i),
+                        ));
+                    }
+                }
+                Ok(ret)
+            }
             Sig::NumericToFloat | Sig::NumericSame | Sig::NumericToInt => {
                 let mut widest = Ty::Int;
                 for (i, b) in bound.iter().enumerate() {

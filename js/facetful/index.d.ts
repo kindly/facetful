@@ -51,6 +51,33 @@ export declare class Result {
   rows(): Generator<Record<string, CellValue>>;
 }
 
+export type LaneKind = "int" | "float" | "bool" | "text" | "date" | "timestamp";
+export interface UdfSignature {
+  params: LaneKind[];
+  returns: LaneKind;
+  /** NULL in → NULL out without calling the function for that row (default true) */
+  strict?: boolean;
+  /** the last parameter type repeats */
+  variadic?: boolean;
+  /** call per row with plain values instead of once per lane */
+  perRow?: boolean;
+}
+export interface UdfLane {
+  kind: LaneKind;
+  /** Float64Array for int/float/bool/date/timestamp, string[] for text */
+  values: Float64Array | string[];
+  /** validity bitmap (bit set = present), or null when all present */
+  valid: Uint8Array | null;
+  /** a literal argument: one value, applies to every row */
+  broadcast: boolean;
+}
+export type UdfVectorFn = (
+  args: UdfLane[],
+  len: number,
+  out: { values: Float64Array | Uint8Array | (string | null)[]; valid: Uint8Array },
+) => void;
+export type UdfRowFn = (...values: (number | string | null)[]) => number | string | boolean | null;
+
 export interface LoadResult {
   name: string;
   rows: number;
@@ -104,6 +131,18 @@ export declare class Facetful {
     options?: { table?: string; persist?: string },
   ): Promise<{ rows: number; bytes: number; elapsedMs: number }>;
   storeOpfs(path: string, buffer: ArrayBuffer): Promise<{ bytes: number }>;
+  /**
+   * Register a user-defined scalar function (runs in the worker; pass a
+   * self-contained function, its source, or `{ moduleUrl }`). Vectorized by
+   * default — `fn(args, len, out)` once per lane; `perRow: true` calls
+   * `fn(...values)` per row, returning a value or null.
+   */
+  registerFunction(
+    name: string,
+    signature: UdfSignature,
+    fn: UdfVectorFn | UdfRowFn | string | { moduleUrl: string },
+  ): Promise<{ ok: true }>;
+  unregisterFunction(name: string): Promise<{ ok: boolean }>;
 
   /**
    * Open a table over an OPFS file: metadata reads now, column segments load

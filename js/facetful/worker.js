@@ -186,6 +186,17 @@ self.onmessage = async (e) => {
       const { handle, rows } = engine.openImage(img);
       setTable(e.data.name, handle);
       reply({ ok: true, rows, bytes, elapsedMs: performance.now() - t0 });
+    } else if (cmd === "registerFunction") {
+      // functions don't cross postMessage: `source` is the function's text (an
+      // expression — an arrow function, or an IIFE returning one for state)
+      const fn = e.data.moduleUrl
+        ? (await import(e.data.moduleUrl)).default
+        : new Function(`return (${e.data.source});`)();
+      if (typeof fn !== "function") throw new Error(`registerFunction('${e.data.name}'): source is not a function`);
+      engine.registerFunction(e.data.name, e.data.signature, fn);
+      reply({ ok: true });
+    } else if (cmd === "unregisterFunction") {
+      reply({ ok: engine.unregisterFunction(e.data.name) });
     } else if (cmd === "storeOpfs") {
       await opfsWrite(e.data.path, new Uint8Array(e.data.buffer));
       reply({ ok: true, bytes: e.data.buffer.byteLength });
