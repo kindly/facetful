@@ -549,35 +549,6 @@ pub extern "C" fn table_materialize(
     Box::into_raw(Box::new(outcome)) as usize
 }
 
-/// Join two tables (design.sv d41 step 3, the one-shot form): `spec` is the
-/// text form `join::parse_spec` reads. The outcome is `Image` or `Err`.
-#[no_mangle]
-pub extern "C" fn table_join(
-    left: usize,
-    right: usize,
-    spec_ptr: *const u8,
-    spec_len: usize,
-    group_target: u32,
-) -> usize {
-    let outcome = if left == right {
-        Outcome::Err("join: a table cannot be joined to itself yet".into())
-    } else {
-        let l = unsafe { &mut *(left as *mut T) };
-        let r = unsafe { &mut *(right as *mut T) };
-        let spec = unsafe { core::slice::from_raw_parts(spec_ptr, spec_len) };
-        match core::str::from_utf8(spec).map_err(|_| "join spec is not valid UTF-8".to_string()) {
-            Err(e) => Outcome::Err(e),
-            Ok(spec) => match facetful_engine::join::parse_spec(spec)
-                .and_then(|s| facetful_engine::join::join(l, r, &s, group_target))
-            {
-                Ok(image) => Outcome::Image(image),
-                Err(e) => Outcome::Err(e),
-            },
-        }
-    };
-    Box::into_raw(Box::new(outcome)) as usize
-}
-
 /// Move a materialized image out of its outcome as an image handle
 /// (0 when the outcome is not an image).
 #[no_mangle]

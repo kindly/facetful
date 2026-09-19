@@ -459,28 +459,3 @@ impl Col {
         }
     }
 }
-
-/// The FFI/CLI spec: line 1 `left`|`inner`; line 2 key pairs `l\x1er`
-/// separated by `\x1f`; line 3 right columns separated by `\x1f` (may be empty).
-pub fn parse_spec(text: &str) -> Result<JoinSpec, String> {
-    let mut lines = text.split('\n');
-    let kind = match lines.next().map(str::trim) {
-        Some("left") => JoinKind::Left,
-        Some("inner") => JoinKind::Inner,
-        _ => return Err("join: kind must be 'left' or 'inner'".into()),
-    };
-    let keys: Vec<(String, String)> = lines
-        .next()
-        .unwrap_or("")
-        .split('\x1f')
-        .filter(|s| !s.is_empty())
-        .map(|p| {
-            let (l, r) = p.split_once('\x1e').unwrap_or((p, p));
-            (l.to_string(), r.to_string())
-        })
-        .collect();
-    let columns: Vec<String> =
-        lines.next().unwrap_or("").split('\x1f').filter(|s| !s.is_empty()).map(str::to_string).collect();
-    let columns = if columns.is_empty() { None } else { Some(columns) };
-    Ok(JoinSpec { keys, left_columns: None, columns, renames: Vec::new(), kind, matched: true })
-}

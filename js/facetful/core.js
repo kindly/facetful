@@ -145,33 +145,6 @@ export class Engine {
     }
   }
 
-  /**
-   * One-shot hash join (provisional shape; SQL JOIN syntax is the intended
-   * surface — see design.sv d41). `spec` = { on: [[l, r], …] | "col" | ["a","b"],
-   * columns?: [...], type?: "left" | "inner" }. Returns an image handle.
-   */
-  join(leftHandle, rightHandle, spec) {
-    const on = Array.isArray(spec.on) ? spec.on : [spec.on];
-    const pairs = on.map((p) => (Array.isArray(p) ? `${p[0]}\x1e${p[1]}` : `${p}\x1e${p}`));
-    const text = `${spec.type ?? "left"}\n${pairs.join("\x1f")}\n${(spec.columns ?? []).join("\x1f")}`;
-    const b = this.enc.encode(text);
-    const p = u32(this.w.alloc(b.byteLength));
-    new Uint8Array(this.mem(), p, b.byteLength).set(b);
-    const h = this.w.table_join(leftHandle, rightHandle, p, b.byteLength, spec.groupTarget ?? 65536);
-    try {
-      if (this.w.outcome_is_err(h)) {
-        const n = this.w.outcome_error(h, this.scratch, 4096);
-        throw new QueryError(this.dec.decode(new Uint8Array(this.mem(), this.scratch, n)));
-      }
-      const img = this.w.outcome_image(h);
-      if (!img) throw new Error("join produced no image");
-      return img;
-    } finally {
-      this.w.dealloc(p, b.byteLength);
-      this.w.outcome_free(h);
-    }
-  }
-
   /** Copy a compiled image's bytes out (for OPFS persistence). */
   imageBytes(img) {
     return new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), u32(this.w.image_len(img))).slice();
