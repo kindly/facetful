@@ -32,7 +32,6 @@ fn retain_heap() {}
 
 fn main() {
     retain_heap();
-    native_udfs();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("convert") => convert(&args[1..]),
@@ -539,101 +538,4 @@ fn join(args: &[String]) {
         image.len(),
         t0.elapsed().as_secs_f64() * 1e3
     );
-}
-
-// ---------------- user-defined functions, native ----------------
-
-/// The native side of the UDF host (design.sv d49): `regexp(text, pattern)`
-/// through the `regex` crate, compiled once per pattern. The browser gets the
-/// same function from JS `RegExp`; the CLI is where the differential runs.
-fn native_udfs() {
-    use facetful_engine::sql::binder::Ty;
-    use facetful_engine::udf::{self, Arg, Host, Lane, Out, Output};
-    struct NativeHost {
-        regexp: u32,
-        extract: u32,
-        replace: u32,
-        cache: std::collections::HashMap<String, regex::Regex>,
-    }
-    fn text(a: &Arg, i: usize) -> String {
-        let Lane::Text { offsets, bytes } = &a.lane else { unreachable!() };
-        let i = if a.broadcast { 0 } else { i };
-        String::from_utf8_lossy(&bytes[offsets[i] as usize..offsets[i + 1] as usize]).into_owned()
-    }
-    fn num(a: &Arg, i: usize) -> f64 {
-        let Lane::Num(v) = &a.lane else { unreachable!() };
-        v[if a.broadcast { 0 } else { i }]
-    }
-    fn valid(a: &Arg, i: usize) -> bool {
-        let i = if a.broadcast { 0 } else { i };
-        a.valid.map_or(true, |b| b[i / 8] >> (i % 8) & 1 == 1)
-    }
-    impl NativeHost {
-        fn re(&mut self, pat: &str, flags: &str) -> Result<&regex::Regex, String> {
-            let key = format!("{pat}\u{0}{flags}");
-            if !self.cache.contains_key(&key) {
-                // JS flag letters that regex spells as inline flags
-                let inline: String = flags.chars().filter(|c| matches!(c, 'i' | 'm' | 's' | 'x')).collect();
-                let src = if inline.is_empty() { pat.to_string() } else { format!("(?{inline}){pat}") };
-                let r = regex::Regex::new(&src).map_err(|e| format!("regexp: {e}"))?;
-                self.cache.insert(key.clone(), r);
-            }
-            Ok(&self.cache[&key])
-        }
-    }
-    impl Host for NativeHost {
-        fn call(&mut self, id: u32, args: &[Arg], len: usize, out: &mut Output) -> Result<(), String> {
-            let flags_at = |k: usize, i: usize| -> String { args.get(k).map_or(String::new(), |a| text(a, i)) };
-            if id == self.regexp {
-                let Out::Bool(o) = &mut out.out else { unreachable!() };
-                for i in 0..len {
-                    if !valid(&args[0], i) || !valid(&args[1], i) {
-                        out.valid[i / 8] &= !(1 << (i % 8));
-                        continue;
-                    }
-                    let (pat, flags) = (text(&args[1], i), flags_at(2, i));
-                    o[i] = self.re(&pat, &flags)?.is_match(&text(&args[0], i)) as u8;
-                }
-                return Ok(());
-            }
-            let Out::Text { offsets, bytes } = &mut out.out else { unreachable!() };
-            for i in 0..len {
-                let mut value: Option<String> = None;
-                if valid(&args[0], i) && valid(&args[1], i) {
-                    let s = text(&args[0], i);
-                    let pat = text(&args[1], i);
-                    if id == self.extract {
-                        let re = self.re(&pat, "")?;
-                        value = re.captures(&s).and_then(|c| {
-                            match args.get(2) {
-                                None => c.get(0),
-                                Some(g) if matches!(g.kind, udf::Kind::Text) => c.name(&text(g, i)),
-                                Some(g) => c.get(num(g, i) as usize),
-                            }
-                            .map(|m| m.as_str().to_string())
-                        });
-                    } else if id == self.replace {
-                        // JS spells a named reference $<name>; regex wants ${name}
-                        let repl = text(&args[2], i).replace("$<", "${").replace('>', "}");
-                        let flags = flags_at(3, i);
-                        let re = self.re(&pat, &flags)?;
-                        value = Some(re.replace_all(&s, repl.as_str()).into_owned());
-                    } else {
-                        return Err(format!("unknown native function id {id}"));
-                    }
-                }
-                match value {
-                    Some(v) => bytes.extend_from_slice(v.as_bytes()),
-                    None => out.valid[i / 8] &= !(1 << (i % 8)),
-                }
-                offsets[i + 1] = bytes.len() as u32;
-            }
-            Ok(())
-        }
-    }
-    // the same signatures as udfs.js: optional flags / group / flags arguments
-    let regexp = udf::register("regexp", &[Ty::Text, Ty::Text, Ty::Text], Ty::Bool, true, false, 1).expect("regexp registers");
-    let extract = udf::register("regexp_extract", &[Ty::Text, Ty::Text, Ty::Null], Ty::Text, true, false, 1).expect("registers");
-    let replace = udf::register("regexp_replace", &[Ty::Text, Ty::Text, Ty::Text, Ty::Text], Ty::Text, true, false, 1).expect("registers");
-    udf::set_host(Box::new(NativeHost { regexp, extract, replace, cache: Default::default() }));
 }

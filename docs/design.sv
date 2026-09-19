@@ -1150,3 +1150,15 @@ d51 built. The converter first, because everything else sits on it.
 
 **Left, named**: an OPFS streaming sink for browser CSVs; `inspect` and `--bench` in the Node command (the native CLI keeps them); the `cargo install` / GitHub Release binary for the non-Node audience; then 0.5's napi addon behind the same command. This closes 0.4's feature list.
 </sv-prose>
+
+<sv-prose id="d53">
+## Position — the Rust CLI is a development tool; versions (2026-09-20, discussion with David)
+
+**The evidence was the code.** `regexp_extract`/`regexp_replace` took ten lines each in `udfs.js` and forty in the native CLI's host — a second implementation, a `$<name>`→`${name}` rewrite, flag-letter translation — whose only purpose was that the Rust binary could answer SQL the Node command already answers. David: the native version "is a bit of a waste of time now … the only real benefit is profiling and having something to compare against." Correct. What the Rust CLI uniquely does is development work: the SQLite differential, `--bench` and the perf baseline, `inspect`, a place to profile. Native conversion is 1.6× the wasm-under-Node time (2.65 vs 4.2 s on 3M rows), which no user will notice.
+
+**Decision.** The `facetful` npm command is *the* CLI. The Rust CLI is a development tool: the native UDF host, the `regex` dependency and its test are removed; it knows no user-defined functions, and the "same SQL on both sides" promise is retired for it — it was only ever made for its own benefit. The root README says so. The `cargo install` / GitHub-Release binary idea is dropped. Native `convert` stays (the same `stream` module with a `File` around it; the bench suite needs images). Native speed for users arrives, if it is ever needed, as the napi addon inside the npm package — never as a separate binary.
+
+**Signature note from the same day**: "variadic = the last parameter repeats" could not express `regexp_extract(s, pattern[, group])` with `group` a number *or* a name. Signatures gained `optional: n` (trailing parameters that may be omitted) and a parameter kind `any` (`Ty::Null` in the engine; the lane still carries its real kind). `country_name`, `regexp`, `regexp_extract`, `regexp_replace` use them. List-shaped results (`regexp_extract_all`, `regexp_split`) wait for a native list type rather than being faked as JSON text.
+
+**Versions.** 0.4.0 is what is staged on npm: joins, CTEs, subqueries, EXISTS. **0.5.0 is everything since**: the Tier 1 UDF ABI and the thirteen default functions, the streaming converter, the `facetful` command, `loadCsv`, one `npm install`. **0.6** is the napi addon behind the same command. Tier 2 stays parked.
+</sv-prose>

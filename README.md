@@ -64,20 +64,21 @@ npx facetful query data.facetful              # REPL; or one-shot with a SQL arg
 ```
 
 The command is the wasm engine under Node — the same module the browser
-loads, so images and SQL are identical wherever they run. The native Rust CLI
-is the reference implementation and the development tool:
+loads, so images, SQL and user-defined functions are identical wherever they
+run. Conversion streams (`facetful-format::stream`): two passes over the
+input, row groups written as they finish, bounded memory whatever the file
+size, byte-identical to what the browser's own `loadCsv`/`openParquet` build.
+
+The Rust CLI (`crates/facetful-cli`) is a **development tool**, not a user
+path: benchmarks, the SQLite differential, `inspect`, native profiling. It
+knows no user-defined functions — those live in JavaScript by design
+(`docs/design.sv` d51–d53).
 
 ```
 cargo build --release -p facetful-cli
-facetful convert data.csv data.facetful     # the same streaming converter, native speed
-facetful inspect data.facetful
 facetful query data.facetful --bench qs.sql # 3 warmups + 10 runs, medians
+facetful inspect data.facetful
 ```
-
-Both drive one converter (`facetful-format::stream`): two passes over the
-input, row groups written as they finish, ~20 MB of memory whatever the file
-size — and byte-identical output to the browser's Parquet transcoder for the
-same data.
 
 ## Workspace
 

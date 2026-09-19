@@ -12,6 +12,3 @@ path = "src/main.rs"
 [dependencies]
 facetful-format = { path = "../facetful-format" }
 facetful-engine = { path = "../facetful-engine" }
-# native regexp(): the full crate — no size budget here, linear-time by
-# construction, and a second engine beside the browser's RegExp (design.sv d49)
-regex = "1"
