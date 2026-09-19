@@ -17,6 +17,9 @@ browser** — facet counts, pivots, top-k, filters — at interaction speed.
 - **Filter-mask cache**: WHERE conjuncts are cached as per-row-group bitmaps,
   so facet bursts sharing a filter evaluate it once, and a `LIKE '%needle%'`
   extending a cached needle verifies only the rows the shorter one matched.
+- **Joins, CTEs and subqueries as cached materializations**: `JOIN`, `WITH`,
+  `FROM (select …)`, `IN (select …)`, `EXISTS` all build a derived table once
+  and serve every later facet from it — no per-query join cost.
 - Dates, medians, stddev, group_concat, `select *`, LIKE fast paths — the
   boring things work.
 
@@ -76,6 +79,31 @@ against the rollup; every SELECT item needs a distinct name. Row order is the
 query's output order, so a materialized `ORDER BY` is recorded as the table's
 sort. The CLI has the same verb: `facetful materialize in.facetful "select …" out.facetful`.
 
+## Joins, CTEs, subqueries
+
+Every table the worker holds — loaded, opened from Parquet, or materialized —
+is registered under its name, and any query can name it:
+
+```js
+await db.materialize("plants", "select plant_id, state, count(*) as n_gens from t group by plant_id, state");
+await db.query(`
+  select t.fuel, p.state, sum(t.mwh) as mwh
+  from t left join plants p on t.plant_id = p.plant_id
+  where p.n_gens >= 3 group by t.fuel, p.state order by mwh desc`);
+```
+
+`[INNER|LEFT] JOIN … ON a.k = b.k [AND …]` and `USING (k)`; the right side's
+join key must be unique (a dimension). `WITH name AS (…)`, `FROM (select …) s`,
+`x IN (select …)`, `(a, b) IN (select …)`, `EXISTS (select … where d.k = t.k)`.
+All of these are **materializations, not query-time operators**: the first
+query builds the joined or derived table (milliseconds for a fact table
+against a dimension), and it lives in a per-table cache (64 MB default) that
+every later query with the same shape reuses — a facet burst over a join pays
+for the join once. Correlated subqueries beyond `inner.k = outer.k` equalities,
+`FULL`/`RIGHT` joins and non-unique right keys are refused with a clear error.
+`NOT IN` follows SQL's NULL rule (a NULL in the set makes it select nothing);
+`NOT EXISTS` doesn't, and is usually what you mean.
+
 ## Parquet support
 
 Reading uses [hyparquet](https://github.com/hyparam/hyparquet) (~20 KB gz),
@@ -91,10 +119,10 @@ browser transcoder (the native CLI has no such limit).
 
 ## SQL dialect, briefly
 
-SELECT-only, single table, SQLite semantics (3-valued logic, null-skipping
-aggregates, truncating integer division, NULL-first ascending sorts).
-Idioms: `IN`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE`, `CASE WHEN`, `CAST`,
-`COUNT(DISTINCT x)`, `||`, `select *`. Aggregates: count, sum, avg, min, max,
+SELECT-only, SQLite semantics (3-valued logic, null-skipping aggregates,
+truncating integer division, NULL-first ascending sorts). Idioms: `IN`,
+`BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE`, `CASE WHEN`, `CAST`,
+`COUNT(DISTINCT x)`, `||`, `select *`, `JOIN`/`WITH`/subqueries as above. Aggregates: count, sum, avg, min, max,
 count(distinct), median, stddev, group_concat. Scalars: math (abs, round,
 floor, ceil, sqrt, pow, exp, ln, sign), text (lower, upper, length, substr,
 trim/ltrim/rtrim, replace, instr, concat), null handling (coalesce, ifnull,
