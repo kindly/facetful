@@ -16,7 +16,10 @@
     "./worker": "./worker.js",
     "./parquet": "./parquet.js",
     "./facetful_wasm.wasm": "./facetful_wasm.wasm",
-    "./udfs": "./udfs.js"
+    "./udfs": {
+      "types": "./udfs.d.ts",
+      "default": "./udfs.js"
+    }
   },
   "files": [
     "index.js",
@@ -25,6 +28,7 @@
     "worker.js",
     "parquet.js",
     "udfs.js",
+    "udfs.d.ts",
     "bin/facetful.mjs",
     "facetful_wasm.wasm",
     "README.md",

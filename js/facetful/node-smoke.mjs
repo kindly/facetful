@@ -196,6 +196,7 @@ try {
 // the ready-made UDF module: JSON, Intl time zones and names, temporal long tail, Unicode, URLs
 {
   const { udfs } = await import("./udfs.js");
+  engine.unregisterFunction("regexp"); // the smoke's own copy above; the module's takes over
   for (const u of udfs) engine.registerFunction(u.name, u.signature, u.fn);
   const one = (sql) => { const r = engine.query(handle, sql + " from t limit 1"); const c = r.columns[0]; return c.kind === "text" ? text(c, 0) : c.values[0]; };
   const checks = [
@@ -210,6 +211,8 @@ try {
     ["select unaccent('Zürich São Tomé')", "Zurich Sao Tome"],
     ["select url_host('https://www.eia.gov/x?y=1')", "www.eia.gov"],
     ["select url_host('not a url')", undefined],
+    ["select regexp('Coal Creek', '^coal', 'i')", 1],
+    ["select regexp('Coal Creek', '^coal')", 0],
   ];
   for (const [sql, want] of checks) {
     const got = one(sql);

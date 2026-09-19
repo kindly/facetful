@@ -12,6 +12,16 @@ cp "$WASM" js/facetful/facetful_wasm.wasm
 node js/facetful/node-smoke.mjs
 node js/facetful/node-parquet-diff.mjs
 
+# the command itself: a streamed conversion must reproduce the checked-in image,
+# and a query with a ready-made function must run without flags
+SPIKE=spikes/facet-spike
+node js/facetful/bin/facetful.mjs convert $SPIKE/data-200000.csv "${TMPDIR:-/tmp}/gate.facetful" 2>/dev/null
+cmp "${TMPDIR:-/tmp}/gate.facetful" $SPIKE/data-200000.facetful
+node js/facetful/bin/facetful.mjs query "${TMPDIR:-/tmp}/gate.facetful" \
+  "select count(*) as n from t where regexp(country, '^country_1[0-9]$')" | grep -q "^25947" || { echo "FAIL: facetful command"; exit 1; }
+rm -f "${TMPDIR:-/tmp}/gate.facetful"
+echo "facetful command: OK"
+
 mkdir -p dist
 (cd js/facetful && npm pack --cache "${TMPDIR:-/tmp}/npm-cache" --pack-destination ../../dist)
 echo "packed:"

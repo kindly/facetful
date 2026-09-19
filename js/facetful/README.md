@@ -159,7 +159,8 @@ await db.registerFunction("mw_to_gw", { params: ["float"], returns: "float", per
 ```
 
 **Ready-made functions**, registered by default (`Facetful.open({ udfs: false })`
-opts out; the list is importable from `facetful/udfs`): `json_extract(doc, '$.a.b[0]')`, `to_tz(ts, 'Europe/London')`
+opts out; the list is importable from `facetful/udfs`): `regexp(s, pattern[, flags])`,
+`json_extract(doc, '$.a.b[0]')`, `to_tz(ts, 'Europe/London')`
 (Intl's time-zone tables — hundreds of KB the wasm never has to carry),
 `date_trunc('month', ts)`, `date_add(d, 1, 'month')`, `weekday`, `quarter`,
 `country_name('DE')`, `format_number(x, 'en-US:compact')`, `unaccent('Zürich')`,
@@ -175,8 +176,9 @@ gives NULL out for NULL in without calling you; `variadic` repeats the last
 parameter; `unregisterFunction(name)` removes one. The function runs in the
 worker: pass a self-contained function (its source is sent — an IIFE for
 state, as above — no closures over your variables) or `{ moduleUrl }`. A
-throwing function fails the query with its message. The native CLI ships
-`regexp()` built in (the `regex` crate) for the same SQL.
+throwing function fails the query with its message. `regexp()` is the
+browser's `RegExp` here and the `regex` crate in the native CLI — the same SQL
+on both sides.
 
 ## Parquet support
 

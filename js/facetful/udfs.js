@@ -14,6 +14,23 @@
 const DAY = 86400000;
 
 export const udfs = [
+  // --- regular expressions ---------------------------------------------------
+  // regexp(s, pattern[, flags]) -> bool, the browser's RegExp (JIT-compiled, cached per
+  // pattern); the native CLI answers the same SQL through the `regex` crate
+  {
+    name: "regexp",
+    signature: { params: ["text", "text"], returns: "bool", variadic: true },
+    fn: (() => {
+      const cache = new Map();
+      return (args, len, out) => {
+        const [s, p] = args;
+        const key = p.values[0] + "\u0000" + (args[2] ? args[2].values[0] : "");
+        let re = cache.get(key);
+        if (!re) cache.set(key, (re = new RegExp(p.values[0], args[2] ? args[2].values[0] : "")));
+        for (let i = 0; i < len; i++) out.values[i] = re.test(s.values[i]) ? 1 : 0;
+      };
+    })(),
+  },
   // --- JSON ---------------------------------------------------------------
   // json_extract(doc, '$.a.b[0]') -> text (numbers/bools stringified, null for missing)
   {
