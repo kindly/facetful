@@ -8,7 +8,7 @@
 //! quotes, escaped quotes, CRLF).
 
 use facetful_format as fmt;
-use fmt::compile;
+
 use fmt::Stats;
 use std::process::exit;
 
@@ -271,106 +271,14 @@ fn query(args: &[String]) {
 
 // ---------------- CSV ----------------
 
-fn parse_csv(data: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut row: Vec<String> = Vec::new();
-    let mut field = String::new();
-    let mut in_quotes = false;
-    let mut chars = data.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_quotes {
-            match c {
-                '"' => {
-                    if chars.peek() == Some(&'"') {
-                        chars.next();
-                        field.push('"');
-                    } else {
-                        in_quotes = false;
-                    }
-                }
-                _ => field.push(c),
-            }
-        } else {
-            match c {
-                '"' => in_quotes = true,
-                ',' => row.push(std::mem::take(&mut field)),
-                '\r' => {}
-                '\n' => {
-                    row.push(std::mem::take(&mut field));
-                    rows.push(std::mem::take(&mut row));
-                }
-                _ => field.push(c),
-            }
-        }
-    }
-    if !field.is_empty() || !row.is_empty() {
-        row.push(field);
-        rows.push(row);
-    }
-    let header = rows.remove(0);
-    (header, rows)
-}
-
-// ---------------- inference ----------------
-
-/// String cells -> a typed input column for the shared baseline compiler.
-/// Empty cells are nulls for numeric columns; for string columns the empty
-/// string is just a value (facet UIs show a "(blank)" bucket).
-fn infer_column(values: Vec<String>) -> compile::InCol {
-    let mut all_int = true;
-    let mut all_float = true;
-    let mut non_empty = 0usize;
-    for v in &values {
-        if v.is_empty() {
-            continue;
-        }
-        non_empty += 1;
-        if all_int && v.parse::<i64>().is_err() {
-            all_int = false;
-        }
-        if all_float && v.parse::<f64>().is_err() {
-            all_float = false;
-        }
-        if !all_int && !all_float {
-            break;
-        }
-    }
-    let has_nulls = non_empty < values.len();
-    let valids = || -> Option<Vec<bool>> {
-        if has_nulls { Some(values.iter().map(|v| !v.is_empty()).collect()) } else { None }
-    };
-    if all_int && non_empty > 0 {
-        let v = values.iter().map(|s| if s.is_empty() { 0 } else { s.parse().unwrap() }).collect();
-        return compile::InCol::Int { v, valid: valids() };
-    }
-    if all_float && non_empty > 0 {
-        let v =
-            values.iter().map(|s| if s.is_empty() { 0.0 } else { s.parse().unwrap() }).collect();
-        return compile::InCol::Float { v, valid: valids() };
-    }
-    // ISO dates ("YYYY-MM-DD") / datetimes -> real temporal columns
-    if non_empty > 0 && values.iter().all(|s| s.is_empty() || fmt::time::parse_date(s).is_some()) {
-        let v = values
-            .iter()
-            .map(|s| if s.is_empty() { 0 } else { fmt::time::parse_date(s).unwrap() as i32 })
-            .collect();
-        return compile::InCol::Date { v, valid: valids() };
-    }
-    if non_empty > 0
-        && values.iter().all(|s| s.is_empty() || fmt::time::parse_timestamp(s).is_some())
-    {
-        let v = values
-            .iter()
-            .map(|s| if s.is_empty() { 0 } else { fmt::time::parse_timestamp(s).unwrap() })
-            .collect();
-        return compile::InCol::Timestamp { v, valid: valids() };
-    }
-    compile::InCol::Text { v: values, valid: None }
-}
-
-// ---------------- convert ----------------
-
+/// Two passes over the file through the streaming converter
+/// (`facetful_format::stream`, design.sv d51): sniff types and dictionaries,
+/// then encode row groups straight to the output. Memory is bounded by the
+/// distinct values on dictionary candidates plus one row group, whatever the
+/// file size.
 fn convert(args: &[String]) {
+    use fmt::stream::{CsvReader, Encoder, Sniffer};
+    use std::io::{Read, Write};
     let (mut input, mut output, mut group_size) = (None, None, 65536u32);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -393,39 +301,81 @@ fn convert(args: &[String]) {
             exit(2);
         }
     };
-
-    let data = std::fs::read_to_string(&input).unwrap_or_else(|e| {
-        eprintln!("cannot read {input}: {e}");
-        exit(1);
-    });
-    let (header, rows) = parse_csv(&data);
-    let nrows = rows.len();
-    let ncols = header.len();
-    eprintln!("{input}: {nrows} rows, {ncols} columns");
-
-    // column-major
-    let mut cols: Vec<Vec<String>> = vec![Vec::with_capacity(nrows); ncols];
-    for r in rows {
-        assert_eq!(r.len(), ncols, "ragged CSV row");
-        for (i, v) in r.into_iter().enumerate() {
-            cols[i].push(v);
+    const CHUNK: usize = 1 << 20;
+    // feed a whole file through a CsvReader
+    let feed = |path: &str, on_row: &mut dyn FnMut(&[String]) -> Result<(), String>| -> Result<(), String> {
+        let mut f = std::fs::File::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let mut reader = CsvReader::new();
+        let mut buf = vec![0u8; CHUNK];
+        let mut err: Option<String> = None;
+        loop {
+            let n = f.read(&mut buf).map_err(|e| format!("read {path}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            reader.push(&buf[..n], |row| {
+                if err.is_none() {
+                    if let Err(e) = on_row(row) {
+                        err = Some(e);
+                    }
+                }
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
         }
-    }
-
-    let in_cols: Vec<compile::InCol> = cols.into_iter().map(infer_column).collect();
-    let (bytes, schema) = compile::compile(&header, in_cols, group_size).unwrap_or_else(|e| {
-        eprintln!("compile failed: {e}");
-        exit(1);
-    });
-    for (c, kind) in schema.columns.iter().zip(compile::describe(&schema)) {
+        reader.finish(|row| {
+            if err.is_none() {
+                if let Err(e) = on_row(row) {
+                    err = Some(e);
+                }
+            }
+        });
+        err.map_or(Ok(()), Err)
+    };
+    let fail = |e: String| -> ! {
+        eprintln!("{e}");
+        exit(1)
+    };
+    // pass 1
+    let mut sniffer: Option<Sniffer> = None;
+    feed(&input, &mut |row| {
+        match &mut sniffer {
+            None => sniffer = Some(Sniffer::new(row.to_vec())),
+            Some(s) => s.row(row)?,
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|e| fail(e));
+    let plan = sniffer.unwrap_or_else(|| fail("empty input".into())).finish();
+    eprintln!("{input}: {} rows, {} columns", plan.rows, plan.names.len());
+    // pass 2
+    let mut enc = Encoder::new(plan, group_size).unwrap_or_else(|e| fail(e));
+    for (c, kind) in enc.schema().columns.iter().zip(fmt::compile::describe(enc.schema())) {
         eprintln!("  {}: {kind}", c.name);
     }
-    std::fs::write(&output, &bytes).unwrap();
-    eprintln!(
-        "{output}: {} bytes ({} row groups)",
-        bytes.len(),
-        (nrows as u32).div_ceil(group_size)
-    );
+    let mut out = std::fs::File::create(&output).unwrap_or_else(|e| fail(format!("cannot write {output}: {e}")));
+    let mut written = 0u64;
+    let mut first = true;
+    feed(&input, &mut |row| {
+        if first {
+            first = false;
+            return Ok(());
+        }
+        enc.row(row)?;
+        let bytes = enc.take_output();
+        if !bytes.is_empty() {
+            out.write_all(&bytes).map_err(|e| format!("write {output}: {e}"))?;
+            written += bytes.len() as u64;
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|e| fail(e));
+    let rows = enc.rows();
+    let tail = enc.finish().unwrap_or_else(|e| fail(e));
+    out.write_all(&tail).unwrap_or_else(|e| fail(format!("write {output}: {e}")));
+    written += tail.len() as u64;
+    eprintln!("{output}: {written} bytes ({} row groups)", (rows as u32).div_ceil(group_size));
 }
 
 // ---------------- inspect ----------------

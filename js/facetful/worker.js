@@ -186,6 +186,19 @@ self.onmessage = async (e) => {
       const { handle, rows } = engine.openImage(img);
       setTable(e.data.name, handle);
       reply({ ok: true, rows, bytes, elapsedMs: performance.now() - t0 });
+    } else if (cmd === "loadCsv") {
+      // a File/Blob streams twice through the converter; a buffer is one chunk
+      const src = e.data.source;
+      const chunks = typeof src.stream === "function"
+        ? () => src.stream()
+        : async function* () { yield new Uint8Array(src); };
+      const t0 = performance.now();
+      const { bytes, rows, schema } = await engine.convertCsv(chunks, { groupTarget: e.data.groupTarget });
+      if (e.data.persist) await opfsWrite(e.data.persist, bytes);
+      const { handle } = engine.openTable(bytes);
+      setTable(e.data.name, handle);
+      lastTable = handle;
+      reply({ ok: true, rows, bytes: bytes.byteLength, schema, elapsedMs: performance.now() - t0 });
     } else if (cmd === "registerFunction") {
       // functions don't cross postMessage: `source` is the function's text (an
       // expression — an arrow function, or an IIFE returning one for state)

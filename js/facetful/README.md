@@ -25,6 +25,20 @@ browser** — facet counts, pivots, top-k, filters — at interaction speed.
 
 ## Quickstart
 
+One install gives the browser library **and** the `facetful` command:
+
+```
+npm install facetful
+npx facetful convert data.csv data.facetful        # streaming: any file size, ~20 MB of memory
+npx facetful query data.facetful "select country, count(*) as n from t group by country order by n desc limit 5"
+```
+
+The command runs the same wasm engine the browser does (Node is the second
+runtime), so a `.facetful` built here is exactly what `openParquet` would have
+built, and SQL — including your registered functions, via `--udf module.mjs` —
+behaves identically in both places. CSV can also be opened directly in the
+browser with `loadCsv` (below).
+
 ```js
 import { Facetful } from "facetful";
 
@@ -53,12 +67,31 @@ The SQL table is always named `t`. Multiple tables coexist:
 | method | use when |
 |---|---|
 | `openParquet(name, buf)` | the default: Parquet in, OPFS-cached compiled image, instant repeat visits |
-| `load(name, buf)` | you already have a `.facetful` image (built by the native CLI) |
+| `load(name, buf)` | you already have a `.facetful` image (built by `facetful convert`) |
+| `loadCsv(name, fileOrBuffer, {persist})` | a CSV: streamed through the converter in the worker, types inferred, optionally persisted |
 | `loadOpfs(name, path, {cacheBytes})` | the file is in OPFS; open lazily, spill-over for big data |
 
 Persistence is always explicit (`storeOpfs`), never write-behind. OPFS needs a
 secure context (https or localhost); everything degrades to memory-only
 without one.
+
+## The `facetful` command
+
+```
+facetful convert in.csv out.facetful [--row-group-size N]
+facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
+facetful materialize in.facetful "select …" out.facetful [--table …] [--udf …]
+```
+
+`convert` streams: two passes over the CSV (types and dictionaries, then
+encoding), row groups written as they finish, memory bounded by the distinct
+values plus one row group — a 200 MB / 3M-row CSV converts in ~4 s at ~70 MB
+of process memory (Node included). Types: int (narrowed), float, ISO date and
+datetime, text; repeated text is dictionary-encoded. `query` without SQL is a
+REPL; tables open lazily, so large files don't load into memory. A `--udf`
+module's default export is an array of `{ name, signature, fn }` — the shape
+`facetful/udfs` exports, so `--udf node_modules/facetful/udfs.js` registers
+the ready-made set.
 
 ## Derived tables: `materialize`
 
@@ -123,6 +156,14 @@ await db.query("select fuel, count(*) from t where regexp(plant_name, '^(Big|Lit
 // per row: simpler, ~10x slower on large lanes
 await db.registerFunction("mw_to_gw", { params: ["float"], returns: "float", perRow: true }, (mw) => mw / 1000);
 ```
+
+**Ready-made functions** — `import { udfs } from "facetful/udfs"` and register
+the ones you want: `json_extract(doc, '$.a.b[0]')`, `to_tz(ts, 'Europe/London')`
+(Intl's time-zone tables — hundreds of KB the wasm never has to carry),
+`date_trunc('month', ts)`, `date_add(d, 1, 'month')`, `weekday`, `quarter`,
+`country_name('DE')`, `format_number(x, 'en-US:compact')`, `unaccent('Zürich')`,
+`url_host(url)`. Each is a few lines of ordinary JavaScript over what the
+browser already ships; they're as much a set of patterns as a library.
 
 Kinds: `int`, `float`, `bool`, `text`, `date`, `timestamp` (dates and timestamps
 arrive as days / ms numbers). Functions bind like built-ins — wrong argument

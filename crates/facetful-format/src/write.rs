@@ -38,7 +38,10 @@ pub struct Writer {
     schema: Schema,
     sorted_by: Vec<SortKey>,
     row_group_target: u32,
+    /// bytes not yet handed out by `take_output`
     buf: Vec<u8>,
+    /// bytes already handed out — `buf` starts at this file position
+    flushed: u64,
     groups: Vec<GroupMeta>,
     total_rows: u64,
 }
@@ -61,6 +64,7 @@ impl Writer {
             sorted_by,
             row_group_target,
             buf: Vec::new(),
+            flushed: 0,
             groups: Vec::new(),
             total_rows: 0,
         };
@@ -140,7 +144,7 @@ impl Writer {
         assert_eq!(cols.len(), self.schema.columns.len(), "column count mismatch");
         assert!(row_count > 0, "empty row group");
 
-        let group_offset = self.buf.len() as u64;
+        let group_offset = self.flushed + self.buf.len() as u64;
 
         let mut metas: Vec<ColMeta> = Vec::with_capacity(cols.len());
         let mut payloads: Vec<[Option<&[u8]>; MAX_SEGS]> = Vec::with_capacity(cols.len());
@@ -228,7 +232,21 @@ impl Writer {
         self.groups.push(GroupMeta { offset: group_offset, row_count, cols: metas });
     }
 
-    /// Write the footer and return the finished file bytes.
+    /// Hand out the bytes written so far (pull-model streaming: a caller
+    /// appends them to a file or drains them across the wasm boundary after
+    /// each group). Callers that never take keep getting the whole file
+    /// from `finish`.
+    pub fn take_output(&mut self) -> Vec<u8> {
+        self.flushed += self.buf.len() as u64;
+        core::mem::take(&mut self.buf)
+    }
+
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Write the footer and return the finished file bytes (the remainder,
+    /// after any `take_output`).
     pub fn finish(mut self) -> Vec<u8> {
         self.pad();
         let footer_start = self.buf.len();

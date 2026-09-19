@@ -178,4 +178,50 @@ try {
   console.log(`udf: OK (regexp matched ${n1} rows; cached rerun ${cached.toFixed(2)} ms)`);
 }
 
+// streaming CSV conversion through the wasm: chunked feeds, byte-identical to the CLI image
+{
+  const csv = readFileSync(new URL("spikes/facet-spike/data-200000.csv", root));
+  const chunks = () => (async function* () { for (let i = 0; i < csv.byteLength; i += 700_001) yield csv.subarray(i, Math.min(i + 700_001, csv.byteLength)); })();
+  const t0 = performance.now();
+  const { bytes, rows, schema } = await engine.convertCsv(chunks);
+  const ref = readFileSync(new URL("spikes/facet-spike/data-200000.facetful", root));
+  if (rows !== 200000 || bytes.byteLength !== ref.byteLength || Buffer.compare(Buffer.from(bytes), ref) !== 0) throw new Error(`convertCsv: ${rows} rows, ${bytes.byteLength} bytes, differs from the CLI image`);
+  if (schema.length !== 8 || schema[6].kind !== "float64") throw new Error(`convertCsv schema: ${JSON.stringify(schema)}`);
+  let bad = false;
+  try { await engine.convertCsv(() => (async function* () { yield new TextEncoder().encode("a,b\n1,2,3\n"); })()); } catch (e) { bad = /row 2 has 3 cells/.test(e.message); }
+  if (!bad) throw new Error("convertCsv must report ragged rows");
+  console.log(`csv convert: OK (${rows} rows, ${(performance.now() - t0).toFixed(0)} ms, byte-identical)`);
+}
+
+// the ready-made UDF module: JSON, Intl time zones and names, temporal long tail, Unicode, URLs
+{
+  const { udfs } = await import("./udfs.js");
+  for (const u of udfs) engine.registerFunction(u.name, u.signature, u.fn);
+  const one = (sql) => { const r = engine.query(handle, sql + " from t limit 1"); const c = r.columns[0]; return c.kind === "text" ? text(c, 0) : c.values[0]; };
+  const checks = [
+    ["select json_extract('{\"a\":{\"b\":[10,20]}}', '$.a.b[1]')", "20"],
+    ["select to_tz(timestamp('2024-07-01 12:00:00'), 'America/New_York')", "2024-07-01 08:00:00"],
+    ["select date_trunc('quarter', timestamp('2024-08-15 10:30:00'))", Date.UTC(2024, 6, 1)],
+    ["select date_add(date('2024-01-31'), 1, 'month')", Date.UTC(2024, 1, 29) / 86400000],
+    ["select weekday(date('2024-09-19'))", 3],
+    ["select quarter(date('2024-11-02'))", 4],
+    ["select country_name('de')", "Germany"],
+    ["select format_number(1234567.89, 'en-US:compact')", "1.2M"],
+    ["select unaccent('Zürich São Tomé')", "Zurich Sao Tome"],
+    ["select url_host('https://www.eia.gov/x?y=1')", "www.eia.gov"],
+    ["select url_host('not a url')", undefined],
+  ];
+  for (const [sql, want] of checks) {
+    const got = one(sql);
+    const r = engine.query(handle, sql + " from t limit 1");
+    const isNull = !((r.columns[0].validity[0]) & 1);
+    if (want === undefined ? !isNull : got !== want) throw new Error(`${sql}: got ${isNull ? "NULL" : JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+  }
+  // a text-returning UDF in GROUP BY, over a dictionary column (one call per dictionary)
+  const r = engine.query(handle, "select unaccent(upper(country)) as c, count(*) as n from t group by c order by n desc limit 2");
+  if (r.rowCount !== 2 || !/^COUNTRY_\d+$/.test(text(r.columns[0], 0))) throw new Error("udfs in GROUP BY");
+  for (const u of udfs) engine.unregisterFunction(u.name);
+  console.log(`udfs module: OK (${udfs.length} functions)`);
+}
+
 console.log("js protocol smoke: OK");

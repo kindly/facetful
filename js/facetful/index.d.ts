@@ -137,6 +137,12 @@ export declare class Facetful {
    * default — `fn(args, len, out)` once per lane; `perRow: true` calls
    * `fn(...values)` per row, returning a value or null.
    */
+  /** Stream a CSV (File/Blob or ArrayBuffer) into a table; two passes, bounded memory. */
+  loadCsv(
+    name: string,
+    source: Blob | ArrayBuffer,
+    options?: { persist?: string; groupTarget?: number },
+  ): Promise<{ rows: number; bytes: number; schema: { name: string; kind: string }[]; elapsedMs: number }>;
   registerFunction(
     name: string,
     signature: UdfSignature,

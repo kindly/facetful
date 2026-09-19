@@ -48,7 +48,7 @@ enum Planned {
     Text { v: Vec<String>, valid: Option<Vec<bool>> },
 }
 
-fn narrowest_int(min: i64, max: i64) -> ColumnType {
+pub(crate) fn narrowest_int(min: i64, max: i64) -> ColumnType {
     if min >= i8::MIN as i64 && max <= i8::MAX as i64 {
         ColumnType::Int8
     } else if min >= i16::MIN as i64 && max <= i16::MAX as i64 {
@@ -107,7 +107,7 @@ fn plan(col: InCol) -> Planned {
     }
 }
 
-fn utf8_offsets(strings: &[String]) -> (Vec<u32>, Vec<u8>) {
+pub(crate) fn utf8_offsets(strings: &[String]) -> (Vec<u32>, Vec<u8>) {
     let mut offsets = Vec::with_capacity(strings.len() + 1);
     let mut bytes = Vec::new();
     offsets.push(0u32);
@@ -119,7 +119,7 @@ fn utf8_offsets(strings: &[String]) -> (Vec<u32>, Vec<u8>) {
 }
 
 /// Bitmap for rows [start, end); None if that slice has no nulls.
-fn validity_bitmap(valids: &Option<Vec<bool>>, start: usize, end: usize) -> Option<(Vec<u8>, u32)> {
+pub(crate) fn validity_bitmap(valids: &Option<Vec<bool>>, start: usize, end: usize) -> Option<(Vec<u8>, u32)> {
     let valids = valids.as_ref()?;
     let slice = &valids[start..end];
     let nulls = slice.iter().filter(|&&v| !v).count() as u32;

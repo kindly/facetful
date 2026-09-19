@@ -292,6 +292,59 @@ export class Engine {
     return { handle, rows: this.w.table_total_rows(handle) };
   }
 
+  /**
+   * Stream a CSV into a .facetful image (design.sv d51): `chunks()` returns a
+   * fresh (async) iterable of Uint8Array chunks each time it is called — the
+   * converter reads the input twice (types and dictionaries, then encoding)
+   * in bounded memory; the image is assembled here. Returns
+   * { bytes, rows, schema: [{ name, kind }] }.
+   */
+  async convertCsv(chunks, { groupTarget = 65536 } = {}) {
+    const h = this.w.convert_begin(groupTarget);
+    const fail = () => {
+      const n = this.w.convert_error(h, this.scratch, 4096);
+      const msg = this.dec.decode(new Uint8Array(this.mem(), this.scratch, n));
+      this.w.convert_free(h);
+      throw new Error(`convert: ${msg}`);
+    };
+    const parts = [];
+    let total = 0;
+    const drain = () => {
+      const n = this.w.convert_output_len(h);
+      if (!n) return;
+      const p = u32(this.w.alloc(n));
+      this.w.convert_output_copy(h, p);
+      parts.push(new Uint8Array(this.mem(), p, n).slice());
+      this.w.dealloc(p, n);
+      total += n;
+    };
+    const feed = async () => {
+      for await (const c of chunks()) {
+        const bytes = c instanceof Uint8Array ? c : new Uint8Array(c);
+        const p = u32(this.w.alloc(bytes.byteLength));
+        new Uint8Array(this.mem(), p, bytes.byteLength).set(bytes);
+        const rc = this.w.convert_feed(h, p, bytes.byteLength);
+        this.w.dealloc(p, bytes.byteLength);
+        if (rc < 0) fail();
+        drain();
+      }
+    };
+    await feed();
+    if (this.w.convert_pass2(h) < 0) fail();
+    const n = this.w.convert_schema(h, this.scratch, 4096);
+    const schema = this.dec.decode(new Uint8Array(this.mem(), this.scratch, n)).trimEnd().split("\n")
+      .filter(Boolean).map((l) => { const [name, kind] = l.split("\t"); return { name, kind }; });
+    await feed();
+    if (this.w.convert_finish(h) < 0) fail();
+    drain();
+    const rows = this.w.convert_rows(h);
+    this.w.convert_free(h);
+    const bytes = new Uint8Array(total);
+    let pos = 0;
+    for (const q of parts) { bytes.set(q, pos); pos += q.byteLength; }
+    return { bytes, rows, schema };
+  }
+
   /** Make `handle` reachable by `name` from other tables' queries (FROM / JOIN). */
   catalogRegister(name, handle) {
     const b = this.enc.encode(name);

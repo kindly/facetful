@@ -55,18 +55,29 @@ The npm package lives in [`js/facetful`](js/facetful) — see its README for
 the full API (OPFS persistence, `warm()`, cache budgets, transferable column
 buffers).
 
-## Quickstart (native CLI)
+## Quickstart (the `facetful` command)
+
+```
+npm install facetful
+npx facetful convert data.csv data.facetful   # streaming, bounded memory, type inference
+npx facetful query data.facetful              # REPL; or one-shot with a SQL arg
+```
+
+The command is the wasm engine under Node — the same module the browser
+loads, so images and SQL are identical wherever they run. The native Rust CLI
+is the reference implementation and the development tool:
 
 ```
 cargo build --release -p facetful-cli
-facetful convert data.csv data.facetful     # type inference, dictionaries, stats
+facetful convert data.csv data.facetful     # the same streaming converter, native speed
 facetful inspect data.facetful
-facetful query data.facetful                # REPL; or one-shot with a SQL arg
 facetful query data.facetful --bench qs.sql # 3 warmups + 10 runs, medians
 ```
 
-The CLI compiler and the browser transcoder are the same Rust code path
-(`facetful-format::compile`), so images are identical wherever they're built.
+Both drive one converter (`facetful-format::stream`): two passes over the
+input, row groups written as they finish, ~20 MB of memory whatever the file
+size — and byte-identical output to the browser's Parquet transcoder for the
+same data.
 
 ## Workspace
 

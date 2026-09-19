@@ -86,6 +86,17 @@ export class Facetful {
   }
 
   /**
+   * Convert a CSV (a File/Blob, or an ArrayBuffer) into a table named `name`,
+   * streaming in bounded memory — two passes over the input, so a File is
+   * read twice. Types are inferred (int, float, date, timestamp, text;
+   * repeated text becomes a dictionary). Optionally persist the image to OPFS.
+   */
+  async loadCsv(name, source, { persist, groupTarget } = {}) {
+    const transfer = source instanceof ArrayBuffer ? [source] : [];
+    return this._call({ cmd: "loadCsv", name, source, persist, groupTarget }, transfer);
+  }
+
+  /**
    * Register a user-defined scalar function, callable from any query.
    * `signature` = { params: kind[], returns: kind, strict?, variadic?, perRow? }
    * with kinds "int" | "float" | "bool" | "text" | "date" | "timestamp".

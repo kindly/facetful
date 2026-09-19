@@ -1130,3 +1130,23 @@ d49 built as written, with two small deviations recorded below.
 
 **This closes 0.4.** UDFs (Tier 1), the streaming converter, the Node CLI on wasm, one install. Then 0.5: the napi addon, `date_trunc`-family in core, the derived-cache and `IN`-in-SELECT items, and Tier 2 only if a plug-in appears.
 </sv-prose>
+
+<sv-prose id="d52">
+## Build log 32 — the streaming converter, and `facetful` as an npm command (2026-09-19)
+
+d51 built. The converter first, because everything else sits on it.
+
+**`facetful-format::stream`** — sans-I/O, two passes. `CsvReader::push(bytes, on_row)` turns any chunking into rows (quotes and `""` escapes across chunk boundaries, CRLF, a leading BOM, an unterminated last row). `Sniffer::row()` runs the per-column state machine — int (with min/max for narrowing), float, date, timestamp, else text — and a first-appearance distinct map capped at 65,535 entries, dropped the moment it overflows; `finish()` applies `compile::plan`'s rules exactly (int → float → date → timestamp over non-empty cells; text is a dictionary when `distinct × 2 < rows`). `Encoder::row()` encodes against that plan into the current group and writes a group every `group_target` rows; `take_output()` hands finished bytes out; `finish()` writes the footer. The `Writer` gained `take_output()` — a `flushed` counter so group offsets stay absolute — and `finish()` is unchanged for existing callers. **The streamed image is byte-identical to the whole-column compiler's** for every chunk size and group size tested, which is the test: one oracle, no second opinion about the format.
+
+**Native CLI.** `convert` reads the file twice in 1 MB chunks and writes each group as it completes. Measured against the previous binary on the 200K-row spike CSV (13 MB): **165 MB → 22 MB** peak RSS, same bytes. On a 3M-row, 198 MB CSV: **2,361 MB → 22 MB**, and faster, 3.72 → 2.65 s — the old path's `Vec<String>` per cell was 12× the file resident; the new one is 0.1× and flat. That was the feature David wanted next, and it fell out of the packaging question.
+
+**wasm.** `convert_begin/feed/pass2/finish`, `convert_output_len/copy` to drain, `convert_schema`, `convert_error`, `convert_free` — the same state machine, fed from JS. **+7.4 KB gz (233.1 → 240.5, 78%)**, under d51's ~10 KB line, so it ships in the one browser module: a browser can now open a local CSV. `core.js` `convertCsv(chunksFactory)` drives the two passes over any async iterable (a `File.stream()` twice, or one buffer); the worker's `loadCsv(name, fileOrBuffer, {persist})` opens the result as a table. The image is assembled in JS memory for now — a streaming OPFS append sink is the obvious next step when a browser CSV outgrows that.
+
+**`facetful` the command** (`bin/facetful.mjs`, on the same wasm): `convert`, `query` (one-shot or REPL, `--table name=path`, `--udf module.mjs`), `materialize`. Tables open lazily — the browser's `opfs_read` import is `fs.readSync` here, so large files never load whole. Node conversion of the 3M-row CSV: 4.2 s, 74 MB RSS including Node itself, byte-identical to native. **Checked the way a user would**: `npm install ./facetful-0.4.0.tgz` into an empty project, `npx facetful convert`, `npx facetful query … --udf node_modules/facetful/udfs.js` — one install, library and command, 266 KB packed.
+
+**`facetful/udfs`** — ten ready-made functions as the d51 examples: `json_extract` (path over `JSON.parse`), `to_tz` (Intl's IANA tables), `date_trunc`, `date_add`, `weekday`, `quarter`, `country_name` (`Intl.DisplayNames`), `format_number` (compact/locale), `unaccent` (NFD + `\p{M}`), `url_host`. Each is a few lines over what the browser ships; the smoke test pins an answer for every one (`to_tz(… 'America/New_York')` = `08:00:00` for noon UTC in July, `date_add('2024-01-31', 1, 'month')` = Feb 29). One real semantics note from writing them: `variadic` means "the last parameter repeats", so an *optional* argument is declared as one required parameter plus `variadic: true` — `country_name('de')` and `country_name('de', 'fr')` both bind.
+
+**94 Rust tests, node-smoke, the Parquet differential, size and bench gates clean.** READMEs rewritten around the one-install story; the root README no longer presents `cargo build` as the quickstart.
+
+**Left, named**: an OPFS streaming sink for browser CSVs; `inspect` and `--bench` in the Node command (the native CLI keeps them); the `cargo install` / GitHub Release binary for the non-Node audience; then 0.5's napi addon behind the same command. This closes 0.4's feature list.
+</sv-prose>

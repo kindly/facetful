@@ -921,3 +921,208 @@ pub extern "C" fn image_open_table(h: usize) -> usize {
 pub extern "C" fn image_free(h: usize) {
     drop(unsafe { Box::from_raw(h as *mut Vec<u8>) });
 }
+
+// ---------------- streaming CSV conversion ----------------
+//
+// The sans-I/O converter (facetful_format::stream, design.sv d51) driven from
+// JS: feed chunks for pass 1, `convert_pass2`, feed the same bytes again,
+// drain finished groups with `convert_output_*` after each feed, `convert_finish`.
+// Memory stays bounded whatever the file size; the JS side owns the reading
+// (fs in Node, File.stream() in the browser) and the sink.
+
+enum Phase {
+    Sniff { sniffer: Option<facetful_engine::format::stream::Sniffer> },
+    Encode { enc: facetful_engine::format::stream::Encoder, header_seen: bool },
+    Done,
+}
+
+pub struct Converter {
+    reader: facetful_engine::format::stream::CsvReader,
+    phase: Phase,
+    group_target: u32,
+    pending: Vec<u8>,
+    error: Option<String>,
+    rows: u64,
+    schema: Option<facetful_engine::format::Schema>,
+}
+
+#[no_mangle]
+pub extern "C" fn convert_begin(group_target: u32) -> usize {
+    Box::into_raw(Box::new(Converter {
+        reader: facetful_engine::format::stream::CsvReader::new(),
+        phase: Phase::Sniff { sniffer: None },
+        group_target,
+        pending: Vec::new(),
+        error: None,
+        rows: 0,
+        schema: None,
+    })) as usize
+}
+
+fn converter(h: usize) -> &'static mut Converter {
+    unsafe { &mut *(h as *mut Converter) }
+}
+
+impl Converter {
+    fn feed(&mut self, bytes: &[u8], end: bool) {
+        if self.error.is_some() {
+            return;
+        }
+        let Converter { reader, phase, error, .. } = self;
+        let mut on_row = |row: &[String]| {
+            if error.is_some() {
+                return;
+            }
+            match phase {
+                Phase::Sniff { sniffer } => match sniffer {
+                    None => *sniffer = Some(facetful_engine::format::stream::Sniffer::new(row.to_vec())),
+                    Some(s) => {
+                        if let Err(e) = s.row(row) {
+                            *error = Some(e);
+                        }
+                    }
+                },
+                Phase::Encode { enc, header_seen } => {
+                    if !*header_seen {
+                        *header_seen = true;
+                        return;
+                    }
+                    if let Err(e) = enc.row(row) {
+                        *error = Some(e);
+                    }
+                }
+                Phase::Done => *error = Some("conversion already finished".into()),
+            }
+        };
+        if end {
+            reader.finish(&mut on_row);
+        } else {
+            reader.push(bytes, &mut on_row);
+        }
+        if let Phase::Encode { enc, .. } = &mut self.phase {
+            self.pending.extend(enc.take_output());
+            self.rows = enc.rows();
+        }
+    }
+}
+
+/// Feed a chunk (pass 1 or pass 2, by phase). Returns 0, or -1 with the
+/// message in `convert_error`.
+#[no_mangle]
+pub extern "C" fn convert_feed(h: usize, ptr: *const u8, len: usize) -> i32 {
+    let c = converter(h);
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    c.feed(bytes, false);
+    if c.error.is_some() { -1 } else { 0 }
+}
+
+/// End of pass 1: decide the plan, start encoding. Feed the same bytes again.
+#[no_mangle]
+pub extern "C" fn convert_pass2(h: usize) -> i32 {
+    let c = converter(h);
+    c.feed(&[], true);
+    if c.error.is_some() {
+        return -1;
+    }
+    let sniffer = match core::mem::replace(&mut c.phase, Phase::Done) {
+        Phase::Sniff { sniffer: Some(s) } => s,
+        Phase::Sniff { sniffer: None } => {
+            c.error = Some("empty input".into());
+            return -1;
+        }
+        _ => {
+            c.error = Some("convert_pass2 called twice".into());
+            return -1;
+        }
+    };
+    match facetful_engine::format::stream::Encoder::new(sniffer.finish(), c.group_target) {
+        Ok(enc) => {
+            c.schema = Some(enc.schema().clone());
+            c.reader = facetful_engine::format::stream::CsvReader::new();
+            c.phase = Phase::Encode { enc, header_seen: false };
+            0
+        }
+        Err(e) => {
+            c.error = Some(e);
+            -1
+        }
+    }
+}
+
+/// End of pass 2: the last group and the footer land in the output.
+#[no_mangle]
+pub extern "C" fn convert_finish(h: usize) -> i32 {
+    let c = converter(h);
+    c.feed(&[], true);
+    if c.error.is_some() {
+        return -1;
+    }
+    match core::mem::replace(&mut c.phase, Phase::Done) {
+        Phase::Encode { enc, .. } => {
+            c.rows = enc.rows();
+            match enc.finish() {
+                Ok(tail) => {
+                    c.pending.extend(tail);
+                    0
+                }
+                Err(e) => {
+                    c.error = Some(e);
+                    -1
+                }
+            }
+        }
+        _ => {
+            c.error = Some("convert_finish before convert_pass2".into());
+            -1
+        }
+    }
+}
+
+/// Bytes ready to be written; `convert_output_copy` copies and clears them.
+#[no_mangle]
+pub extern "C" fn convert_output_len(h: usize) -> u32 {
+    converter(h).pending.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn convert_output_copy(h: usize, dst: *mut u8) -> u32 {
+    let c = converter(h);
+    let n = c.pending.len();
+    unsafe { core::ptr::copy_nonoverlapping(c.pending.as_ptr(), dst, n) };
+    c.pending.clear();
+    n as u32
+}
+
+#[no_mangle]
+pub extern "C" fn convert_rows(h: usize) -> f64 {
+    converter(h).rows as f64
+}
+
+/// "name\tkind\n" per column, after `convert_pass2`.
+#[no_mangle]
+pub extern "C" fn convert_schema(h: usize, out: *mut u8, cap: usize) -> u32 {
+    let c = converter(h);
+    let Some(schema) = &c.schema else { return 0 };
+    let text: String = schema
+        .columns
+        .iter()
+        .zip(facetful_engine::format::compile::describe(schema))
+        .map(|(col, kind)| format!("{}\t{kind}\n", col.name))
+        .collect();
+    let n = text.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(text.as_ptr(), out, n) };
+    n as u32
+}
+
+#[no_mangle]
+pub extern "C" fn convert_error(h: usize, out: *mut u8, cap: usize) -> u32 {
+    let msg = converter(h).error.clone().unwrap_or_default();
+    let n = msg.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(msg.as_ptr(), out, n) };
+    n as u32
+}
+
+#[no_mangle]
+pub extern "C" fn convert_free(h: usize) {
+    drop(unsafe { Box::from_raw(h as *mut Converter) });
+}
