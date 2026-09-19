@@ -22,6 +22,12 @@ const QUERIES: &[&str] = &[
      where country in (select country from dim where country_rows > 500) group by country order by country",
     "select count(*) as n from t where (country, fuel) in (select country, fuel from t where capacity > 900)",
     "select count(*) as n from t where status not in (select status from t where capacity is null)",
+    // EXISTS / NOT EXISTS: the correlation becomes the semi-join keys
+    "select country, count(*) as n from t \
+     where exists (select 1 from dim d where d.country = t.country and d.country_rows > 500) group by country order by country",
+    // (correlated on the small dimension only: SQLite runs these as nested loops)
+    "select fuel, count(*) as n from t where not exists (select 1 from dim d where d.country = t.country and d.country_mw > 100000) \
+     group by fuel order by fuel",
     "select fuel, count(*) as n from t where (fuel, status) in (('fuel_0', 'status_0'), ('fuel_2', 'status_0')) \
      group by fuel order by fuel",
     // JOINs: a cached materialization here, a hash join in SQLite — same answers

@@ -366,7 +366,7 @@ impl Parser {
                     };
                     let span = cols[0].span().to(close);
                     let body = Span::new(open.start, close.end);
-                    return Ok(wrap_not(Expr::InSubquery { cols, query, body, span }));
+                    return Ok(wrap_not(Expr::InSubquery { cols, query, body, span, exists: false }));
                 }
                 let mut args = vec![lhs];
                 loop {
@@ -486,6 +486,19 @@ impl Parser {
             Tok::Case if self.peek() == &Tok::LParen => self.call("case".into(), t.span),
             Tok::Case => self.case_expr(t.span),
             Tok::Cast => self.cast_expr(t.span),
+            // EXISTS (select … where inner.k = outer.k …): keys from the correlation
+            Tok::Exists => {
+                let open = self.expect(Tok::LParen, "after 'exists'")?;
+                let query = Box::new(self.query()?);
+                let close = self.expect(Tok::RParen, "to close the exists subquery")?;
+                Ok(Expr::InSubquery {
+                    cols: Vec::new(),
+                    query,
+                    body: Span::new(open.start, close.end),
+                    span: Span::new(t.span.start, close.end),
+                    exists: true,
+                })
+            }
             Tok::Ident(name) => {
                 if self.peek() == &Tok::LParen {
                     self.call(name, t.span)

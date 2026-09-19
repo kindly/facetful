@@ -144,6 +144,11 @@ impl<S: ReadAt> Table<S> {
         })
     }
 
+    /// The keys of every cached derived table (for superset matching).
+    pub fn derived_keys(&self) -> Vec<String> {
+        self.derived.iter().map(|d| d.key.clone()).collect()
+    }
+
     /// Remove a derived table from the cache, handing it over — so it can be
     /// joined with this table (or another derived one) without two mutable
     /// borrows into the cache. Put it back with `derived_put`.

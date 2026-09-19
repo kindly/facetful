@@ -33,6 +33,7 @@ pub enum Tok {
     // keywords (reserved set — some spellings are sugar, all reserved now)
     Select,
     With,
+    Exists,
     Join,
     Inner,
     Left,
@@ -70,6 +71,7 @@ pub enum Tok {
 pub const KEYWORDS: &[(&str, Tok)] = &[
     ("select", Tok::Select),
     ("with", Tok::With),
+    ("exists", Tok::Exists),
     ("join", Tok::Join),
     ("inner", Tok::Inner),
     ("left", Tok::Left),

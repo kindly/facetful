@@ -320,16 +320,35 @@ fn resolve_joins<S: ReadAt>(
             kind,
             matched: false,
         };
-        let key = format!(
-            "join\u{1}{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}",
+        let prefix = format!(
+            "join\u{1}{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}",
             target_key(&left, cat),
             target_key(&right, cat),
             kind,
-            keys.iter().map(|(l, r)| format!("{l}={r}")).collect::<Vec<_>>().join(","),
-            left_carried.as_ref().map(|v| v.join(",")).unwrap_or_else(|| "*".into()),
-            carried.join(",")
+            keys.iter().map(|(l, r)| format!("{l}={r}")).collect::<Vec<_>>().join(",")
         );
+        // right columns are keyed as stored: `col` or `col>alias_col`
+        let stored = |c: &String| -> String {
+            match renames.iter().find(|(o, _)| o == c) {
+                Some((_, r)) => format!("{c}>{r}"),
+                None => c.clone(),
+            }
+        };
+        let exact_key = format!(
+            "{prefix}{}\u{1}{}",
+            left_carried.as_ref().map(|v| v.join(",")).unwrap_or_else(|| "*".into()),
+            carried.iter().map(stored).collect::<Vec<_>>().join(",")
+        );
+        // Superset matching: a cached join of the same sides, kind and keys
+        // that carries at least these columns serves this query too. Its
+        // column set is the one the joined table has, so the running names
+        // and the stored names of clash-renamed right columns follow it.
+        let (key, left_carried, renames) = match superset_join(table, &prefix, &left_carried, &carried, &cur_names) {
+            Some((k, lc, rn)) => (k, lc, rn),
+            None => (exact_key, left_carried, renames),
+        };
         if table.derived_get(&key).is_none() {
+            let spec = crate::join::JoinSpec { left_columns: left_carried.clone(), renames: renames.clone(), ..spec };
             let image = join_targets(table, &left, &right, &spec, cat)
                 .map_err(|e| Diagnostic::new(e, j.span))?;
             table.derived_insert(&key, image).map_err(|e| Diagnostic::new(format!("derived table: {e}"), j.span))?;
@@ -338,7 +357,7 @@ fn resolve_joins<S: ReadAt>(
             .iter()
             .map(|c| (c.clone(), renames.iter().find(|(o, _)| o == c).map(|(_, r)| r.clone()).unwrap_or_else(|| c.clone())))
             .collect();
-        // the running table now holds only the carried left columns
+        // the running table now holds the carried left columns
         if let Some(lc) = &left_carried {
             cur_names.retain(|n| lc.contains(n));
             for (_, cols) in aliases.iter_mut() {
@@ -370,6 +389,55 @@ fn resolve_joins<S: ReadAt>(
         fix(&mut o.expr)?;
     }
     Ok((left, rq))
+}
+
+/// A cached join under `prefix` whose left and right column sets contain
+/// `left_need` (None = all) and `right_need`: its key, its left column set,
+/// and the renames of the right columns we need as that table stores them
+/// (a clash rename carries the alias of the query that built it).
+/// `all_left` only sizes the "all left columns" case when picking the
+/// narrowest fit.
+fn superset_join<S: ReadAt>(
+    table: &Table<S>,
+    prefix: &str,
+    left_need: &Option<Vec<String>>,
+    right_need: &[String],
+    all_left: &[String],
+) -> Option<(String, Option<Vec<String>>, Vec<(String, String)>)> {
+    type Hit = (String, Option<Vec<String>>, Vec<(String, String)>, usize);
+    let mut best: Option<Hit> = None;
+    for k in table.derived_keys() {
+        let Some(rest) = k.strip_prefix(prefix) else { continue };
+        let Some((lc, rc)) = rest.split_once('\u{1}') else { continue };
+        let lc: Option<Vec<String>> = if lc == "*" { None } else { Some(lc.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()) };
+        let rc: Vec<(&str, Option<&str>)> = rc
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| match s.split_once('>') {
+                Some((o, r)) => (o, Some(r)),
+                None => (s, None),
+            })
+            .collect();
+        let left_ok = match (&lc, left_need) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(have), Some(need)) => need.iter().all(|n| have.contains(n)),
+        };
+        if !left_ok || !right_need.iter().all(|n| rc.iter().any(|(o, _)| *o == n)) {
+            continue;
+        }
+        // prefer the narrowest fit
+        let width = lc.as_ref().map_or(all_left.len(), |v| v.len()) + rc.len();
+        if best.as_ref().map_or(true, |(_, _, _, w)| width < *w) {
+            let renames = rc
+                .iter()
+                .filter_map(|(o, r)| r.map(|r| (o.to_string(), r.to_string())))
+                .filter(|(o, _)| right_need.iter().any(|n| n == o))
+                .collect();
+            best = Some((k, lc, renames, width));
+        }
+    }
+    best.map(|(k, lc, rn, _)| (k, lc, rn))
 }
 
 /// Run the join with both sides borrowed at once: a derived side is taken
@@ -457,9 +525,95 @@ fn expand_in_subqueries<S: ReadAt>(
     let mut rq = q.clone();
     let mut n = 0usize;
     let mut filter = rq.filter.take().expect("checked above");
-    expand_in_expr(table, &mut filter, src, scope, cat, &mut rq.joins, &mut n, false)?;
+    let outer = q.from_alias.clone().unwrap_or_else(|| q.from.clone());
+    expand_in_expr(table, &mut filter, src, scope, cat, &mut rq.joins, &mut n, false, &outer)?;
     rq.filter = Some(filter);
     Ok(Some(rq))
+}
+
+/// Split an EXISTS subquery into its correlation keys and the rest of its
+/// WHERE: top-level AND conjuncts of the form `inner.k = outer.k` (either
+/// order) become (outer column, inner column) pairs; other conjuncts stay;
+/// anything else mentioning the outer table is an error.
+fn correlate(
+    inner: &ast::Query,
+    outer: &str,
+    span: span::Span,
+) -> Result<(Vec<(ast::Expr, ast::Expr)>, Option<ast::Expr>), Diagnostic> {
+    use ast::{BinOp, Expr};
+    let inner_alias = inner.from_alias.clone().unwrap_or_else(|| inner.from.clone());
+    fn conjuncts(e: ast::Expr, out: &mut Vec<ast::Expr>) {
+        match e {
+            Expr::Binary { op: BinOp::And, lhs, rhs, .. } => {
+                conjuncts(*lhs, out);
+                conjuncts(*rhs, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut names = Vec::new();
+    let is_outer = |e: &Expr| -> bool {
+        let mut v = Vec::new();
+        collect_names(e, &mut v);
+        v.iter().any(|n| split_qualified(n).0 == Some(outer))
+    };
+    let mut pairs = Vec::new();
+    let mut rest = Vec::new();
+    let mut all = Vec::new();
+    if let Some(f) = &inner.filter {
+        conjuncts(f.clone(), &mut all);
+    }
+    for c in all {
+        if let Expr::Binary { op: BinOp::Eq, lhs, rhs, .. } = &c {
+            let side = |e: &Expr| -> Option<(bool, Expr)> {
+                let Expr::Column(n, sp) = e else { return None };
+                let (q, col) = split_qualified(n);
+                match q {
+                    Some(a) if a == outer => Some((true, Expr::Column(col.to_string(), *sp))),
+                    Some(a) if a == inner_alias => Some((false, Expr::Column(col.to_string(), *sp))),
+                    Some(_) => None,
+                    None => Some((false, e.clone())),
+                }
+            };
+            match (side(lhs), side(rhs)) {
+                (Some((true, o)), Some((false, i))) | (Some((false, i)), Some((true, o))) => {
+                    pairs.push((o, i));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if is_outer(&c) {
+            return Err(Diagnostic::new(
+                format!("exists: the correlation with '{outer}' must be column equalities (inner.k = {outer}.k)"),
+                c.span(),
+            ));
+        }
+        rest.push(c);
+    }
+    // the residual is a plain single-table query: `inner.col` → `col`
+    for c in rest.iter() {
+        collect_names(c, &mut names);
+    }
+    let bare: Vec<(String, String)> = names
+        .iter()
+        .filter_map(|n| match split_qualified(n) {
+            (Some(a), col) if a == inner_alias => Some((col.to_string(), col.to_string())),
+            _ => None,
+        })
+        .collect();
+    let plain: Vec<String> = names.iter().filter(|n| split_qualified(n).0.is_none()).cloned().collect();
+    let scope = [(inner_alias.clone(), bare)];
+    for c in rest.iter_mut() {
+        rewrite_names(c, &scope, &plain)?;
+    }
+    let rest = rest.into_iter().reduce(|a, b| Expr::Binary {
+        op: BinOp::And,
+        lhs: Box::new(a),
+        rhs: Box::new(b),
+        span,
+    });
+    Ok((pairs, rest))
 }
 
 fn expand_in_expr<S: ReadAt>(
@@ -471,22 +625,51 @@ fn expand_in_expr<S: ReadAt>(
     joins: &mut Vec<ast::Join>,
     n: &mut usize,
     negated: bool,
+    outer: &str,
 ) -> Result<(), Diagnostic> {
     use ast::{BinOp, Expr, UnOp};
     // NOT (x IN (select …)) is the negated form; other NOTs recurse
     if let Expr::Unary { op: UnOp::Not, expr, .. } = e {
         if matches!(**expr, Expr::InSubquery { .. }) {
             let mut inner = std::mem::replace(&mut **expr, Expr::Null(span::Span::new(0, 0)));
-            expand_in_expr(table, &mut inner, src, scope, cat, joins, n, !negated)?;
+            expand_in_expr(table, &mut inner, src, scope, cat, joins, n, !negated, outer)?;
             *e = inner;
             return Ok(());
         }
     }
     match e {
-        Expr::InSubquery { cols, query, body, span } => {
+        Expr::InSubquery { cols, query, body, span, exists } => {
             let span = *span;
+            let exists = *exists;
             *n += 1;
             let alias = format!("__in{}", *n);
+            // EXISTS: the keys are the correlation; the inner query becomes
+            // `select <inner keys> from … where <the rest>`
+            let mut rewritten_inner;
+            let query: &ast::Query = if exists {
+                let (pairs, rest) = correlate(query, outer, span)?;
+                if pairs.is_empty() {
+                    // uncorrelated: the subquery is a constant
+                    let (_, mut r) = exec_query(table, query, src, scope, cat)?;
+                    r.ensure_rows();
+                    let any = r.n_rows() > 0;
+                    let truth = any != negated;
+                    *e = Expr::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(Expr::Number(1.0, false, span)),
+                        rhs: Box::new(Expr::Number(if truth { 1.0 } else { 0.0 }, false, span)),
+                        span,
+                    };
+                    return Ok(());
+                }
+                rewritten_inner = (**query).clone();
+                rewritten_inner.select = pairs.iter().map(|(_, i)| ast::SelectItem { expr: i.clone(), alias: None }).collect();
+                rewritten_inner.filter = rest;
+                *cols = pairs.into_iter().map(|(o, _)| o).collect();
+                &rewritten_inner
+            } else {
+                &**query
+            };
             // 1. the inner query, materialized
             let inner_key = derive(table, query, *body, src, scope, cat)?;
             let names = schema_names(table, &Target::Derived(inner_key.clone()), cat);
@@ -543,6 +726,9 @@ fn expand_in_expr<S: ReadAt>(
             *e = if !negated {
                 // matched → TRUE; unmatched or a NULL outer key → not TRUE
                 not(is_null(key_ref))
+            } else if exists {
+                // NOT EXISTS has no NULL trap: no match is simply TRUE
+                is_null(key_ref)
             } else if inner_has_null {
                 // NOT IN against a set with NULL is never TRUE
                 Expr::Binary { op: BinOp::Eq, lhs: Box::new(Expr::Number(1.0, false, span)), rhs: Box::new(Expr::Number(0.0, false, span)), span }
@@ -558,14 +744,14 @@ fn expand_in_expr<S: ReadAt>(
         }
         Expr::Call { args, .. } => {
             for a in args.iter_mut() {
-                expand_in_expr(table, a, src, scope, cat, joins, n, negated)?;
+                expand_in_expr(table, a, src, scope, cat, joins, n, negated, outer)?;
             }
             Ok(())
         }
-        Expr::Unary { expr, .. } => expand_in_expr(table, expr, src, scope, cat, joins, n, negated),
+        Expr::Unary { expr, .. } => expand_in_expr(table, expr, src, scope, cat, joins, n, negated, outer),
         Expr::Binary { lhs, rhs, .. } => {
-            expand_in_expr(table, lhs, src, scope, cat, joins, n, negated)?;
-            expand_in_expr(table, rhs, src, scope, cat, joins, n, negated)
+            expand_in_expr(table, lhs, src, scope, cat, joins, n, negated, outer)?;
+            expand_in_expr(table, rhs, src, scope, cat, joins, n, negated, outer)
         }
         _ => Ok(()),
     }

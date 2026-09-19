@@ -21,8 +21,10 @@ pub enum Expr {
     /// element of an IN list (where it desugars at parse time)
     Row(Vec<Expr>, Span),
     /// `(a, b) IN (select x, y …)`: a semi-join, resolved before binding into
-    /// a cached materialization + join (design.sv d41 step 4)
-    InSubquery { cols: Vec<Expr>, query: Box<Query>, body: Span, span: Span },
+    /// a cached materialization + join (design.sv d41 step 4). With `exists`,
+    /// `EXISTS (select … where inner.k = outer.k …)`: `cols` is empty and the
+    /// keys come from the correlation in the subquery's WHERE.
+    InSubquery { cols: Vec<Expr>, query: Box<Query>, body: Span, span: Span, exists: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -93,9 +93,17 @@ fn left_join_with_aliases_qualified_names_and_a_clash_rename() {
     q(&mut f, &mut cat, "select f.cat, d.label, sum(f.v) as total, min(d.v) as w \
          from facts f left join dims d on f.cat = d.cat group by f.cat, d.label order by total desc");
     assert_eq!(f.derived_stats().0, 1, "same join, same columns: one derived table");
-    // a different column set is a different derived table
+    // a subset of the columns — under another alias, with the clash-renamed
+    // d.v — reuses the wider table
+    let rows = q(&mut f, &mut cat, "select x.label, sum(x.v) as w from facts left join dims x on facts.cat = x.cat group by x.label order by w desc");
+    assert_eq!(rows[0], vec!["Text(\"A\")", "Float(1.0)"]);
+    assert_eq!(f.derived_stats().0, 1, "subset of a cached join: superset reuse");
+    // a column the cached table lacks is a different derived table
     q(&mut f, &mut cat, "select d.id as did, count(*) as n from facts f left join dims d on f.cat = d.cat group by d.id order by n desc");
     assert_eq!(f.derived_stats().0, 2);
+    // … which itself is narrower, so a query needing only d.id and f.cat picks it
+    q(&mut f, &mut cat, "select d.id as did, count(*) as n from facts f inner join dims d on f.cat = d.cat group by d.id order by n desc");
+    assert_eq!(f.derived_stats().0, 3, "a different join kind is never reused");
 }
 
 #[test]

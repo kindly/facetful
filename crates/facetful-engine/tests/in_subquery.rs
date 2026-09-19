@@ -1,5 +1,6 @@
-//! IN (select …), row values, NOT IN with NULLs, literal tuple lists —
-//! exact SQL three-valued semantics, over the join fixtures.
+//! IN (select …), row values, NOT IN with NULLs, EXISTS / NOT EXISTS,
+//! literal tuple lists — exact SQL three-valued semantics, over the join
+//! fixtures; and superset reuse of the cached semi-join tables.
 
 use facetful_engine::format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_engine::format::{flags, ColumnDef, ColumnType, Schema};
@@ -113,4 +114,47 @@ fn literal_row_lists_desugar() {
     assert!(err.render("").contains("row has 3 values"));
     let err = run_query_with(&mut f, "select (cat, id) from t", &mut cat).err().unwrap();
     assert!(err.render("").contains("only valid on the left of IN"));
+}
+
+#[test]
+fn exists_and_not_exists_are_the_same_semi_join() {
+    let mut f = facts();
+    let mut cat = TableSet { tables: vec![("dims".to_string(), dims(false)), ("dimsn".to_string(), dims(true))] };
+    // correlated on one key, with a residual inner filter: same rows as the IN form
+    assert_eq!(
+        q(&mut f, &mut cat, "select count(*) from t where exists (select 1 from dims d where d.cat = t.cat and d.id >= 20)"),
+        vec![vec!["Int(5)"]]
+    );
+    // two correlation keys, either side order, on an aliased outer table
+    assert_eq!(
+        q(&mut f, &mut cat, "select count(*) from t f where exists (select * from dims where f.cat = dims.cat and dims.id = f.id)"),
+        vec![vec!["Int(6)"]]
+    );
+    // NOT EXISTS has no NULL trap: rows with no partner, including the NULL-cat row
+    assert_eq!(q(&mut f, &mut cat, "select id from t where not exists (select 1 from dims d where d.id = t.id)"), vec![vec!["Int(99)"]]);
+    assert_eq!(q(&mut f, &mut cat, "select count(*) from t where not exists (select 1 from dims d where d.cat = t.cat)"), vec![vec!["Int(1)"]]);
+    // … and a NULL in the inner key set changes nothing (unlike NOT IN)
+    assert_eq!(q(&mut f, &mut cat, "select count(*) from t where not exists (select 1 from dimsn d where d.cat = t.cat)"), vec![vec!["Int(1)"]]);
+    // uncorrelated: a constant
+    assert_eq!(q(&mut f, &mut cat, "select count(*) from t where exists (select 1 from dims where id > 1000)"), vec![vec!["Int(0)"]]);
+    assert_eq!(q(&mut f, &mut cat, "select count(*) from t where not exists (select 1 from dims where id > 1000)"), vec![vec!["Int(8)"]]);
+    // a correlation that isn't a column equality is refused, loudly
+    let err = run_query_with(&mut f, "select count(*) from t where exists (select 1 from dims d where d.id > t.id)", &mut cat).err().unwrap();
+    assert!(err.render("").contains("must be column equalities"), "{}", err.render(""));
+}
+
+#[test]
+fn semi_join_tables_are_reused_by_superset() {
+    let mut f = facts();
+    let mut cat = TableSet { tables: vec![("dims".to_string(), dims(false))] };
+    // a wide query first: the semi-join carries cat, id and v from the left
+    q(&mut f, &mut cat, "select id, sum(v) from t where exists (select 1 from dims d where d.cat = t.cat and d.id >= 20) group by id");
+    let before = f.derived_stats().0;
+    // narrower queries over the same predicate need a subset of those columns: no new tables
+    q(&mut f, &mut cat, "select count(*) from t where exists (select 1 from dims d where d.cat = t.cat and d.id >= 20)");
+    q(&mut f, &mut cat, "select cat, count(*) from t where exists (select 1 from dims d where d.cat = t.cat and d.id >= 20) group by cat");
+    assert_eq!(f.derived_stats().0, before, "narrower semi-joins reuse the wide one");
+    // NOT EXISTS is the same join read the other way
+    assert_eq!(q(&mut f, &mut cat, "select count(*) from t where not exists (select 1 from dims d where d.cat = t.cat and d.id >= 20)"), vec![vec!["Int(3)"]]);
+    assert_eq!(f.derived_stats().0, before);
 }
