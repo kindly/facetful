@@ -38,10 +38,13 @@ fn main() {
         Some("inspect") => inspect(&args[1..]),
         Some("query") => query(&args[1..]),
         Some("materialize") => materialize(&args[1..]),
+        Some("join") => join(&args[1..]),
         _ => {
             eprintln!("usage: facetful convert in.csv out.facetful [--row-group-size N]");
             eprintln!("       facetful inspect file.facetful");
             eprintln!("       facetful query file.facetful [\"select …\"]   (no SQL = REPL)");
+            eprintln!("       facetful materialize in.facetful \"select …\" out.facetful [--row-group-size N]");
+            eprintln!("       facetful join left.facetful right.facetful out.facetful --on l=r[,l2=r2] [--columns a,b] [--inner]");
             exit(2);
         }
     }
@@ -485,6 +488,73 @@ fn materialize(args: &[String]) {
         "{output}: {} rows, {} columns, {} bytes, {:.1} ms",
         (0..derived.group_count()).map(|g| derived.group_rows(g)).sum::<usize>(),
         derived.catalog().schema.columns.len(),
+        image.len(),
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+}
+
+
+/// `facetful join left right out --on l=r[,…] [--columns a,b] [--inner]`:
+/// the one-shot hash join, written as a new image.
+fn join(args: &[String]) {
+    let usage = || -> ! {
+        eprintln!("usage: facetful join left.facetful right.facetful out.facetful --on l=r[,l2=r2] [--columns a,b] [--inner] [--row-group-size N]");
+        exit(2);
+    };
+    let (mut on, mut columns, mut inner, mut group_target) = (None, Vec::new(), false, 65_536u32);
+    let mut pos: Vec<&String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--on" => on = it.next().cloned(),
+            "--columns" => {
+                columns = it.next().map(|c| c.split(',').map(str::to_string).collect()).unwrap_or_default()
+            }
+            "--inner" => inner = true,
+            "--row-group-size" => {
+                group_target = it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())
+            }
+            _ => pos.push(a),
+        }
+    }
+    let (&[left, right, output], Some(on)) = (pos.as_slice(), on) else { usage() };
+    let keys: Vec<(String, String)> = on
+        .split(',')
+        .map(|p| p.split_once('=').map(|(l, r)| (l.to_string(), r.to_string())).unwrap_or((p.to_string(), p.to_string())))
+        .collect();
+    let open = |path: &String| {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!("cannot read {path}: {e}");
+            exit(1);
+        });
+        facetful_engine::Table::open(bytes).unwrap_or_else(|e| {
+            eprintln!("{path}: {e}");
+            exit(1);
+        })
+    };
+    let (mut l, mut r) = (open(left), open(right));
+    let spec = facetful_engine::join::JoinSpec {
+        keys,
+        columns,
+        kind: if inner { facetful_engine::join::JoinKind::Inner } else { facetful_engine::join::JoinKind::Left },
+    };
+    let t0 = std::time::Instant::now();
+    let image = facetful_engine::join::join(&mut l, &mut r, &spec, group_target).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        exit(1);
+    });
+    let out = facetful_engine::Table::open(image.clone()).unwrap_or_else(|e| {
+        eprintln!("joined image failed to open: {e}");
+        exit(1);
+    });
+    std::fs::write(output, &image).unwrap_or_else(|e| {
+        eprintln!("cannot write {output}: {e}");
+        exit(1);
+    });
+    eprintln!(
+        "{output}: {} rows, {} columns, {} bytes, {:.1} ms",
+        (0..out.group_count()).map(|g| out.group_rows(g)).sum::<usize>(),
+        out.catalog().schema.columns.len(),
         image.len(),
         t0.elapsed().as_secs_f64() * 1e3
     );

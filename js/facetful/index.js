@@ -77,6 +77,11 @@ export class Facetful {
    * Runs against `table` (default: the last loaded). With `persist`, the
    * compiled image is also written to OPFS at that path, so a later visit
    * can `loadOpfs(name, path)` instead of recomputing. Returns { rows, bytes }.
+   *
+   * Provisional: instead of SQL, `{ join: { left, right, on, columns?, type? } }`
+   * materializes a one-shot hash join of two loaded tables (LEFT by default,
+   * unique right key, left row order kept, a `matched` column added). SQL
+   * JOIN syntax is the intended surface; this shape may go once it lands.
    */
   async materialize(name, sql, { table, persist } = {}) {
     return this._call({ cmd: "materialize", name, sql, table, persist });

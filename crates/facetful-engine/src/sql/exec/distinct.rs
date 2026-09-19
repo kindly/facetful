@@ -37,7 +37,7 @@ impl LastSeen {
 /// Fold the high half down, then multiply: every input bit reaches the top
 /// bits, which is where table indices are taken from (`>> shift`).
 #[inline]
-pub(super) fn mix64(mut h: u64) -> u64 {
+pub(crate) fn mix64(mut h: u64) -> u64 {
     h ^= h >> 32;
     h.wrapping_mul(0xD6E8_FEB8_6659_FD93)
 }

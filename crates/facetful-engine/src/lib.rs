@@ -8,6 +8,7 @@
 
 pub use facetful_format as format;
 pub mod mask_cache;
+pub mod join;
 pub mod materialize;
 pub mod text;
 

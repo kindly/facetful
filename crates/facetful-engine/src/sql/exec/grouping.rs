@@ -31,7 +31,7 @@ pub(super) struct PackedGroups {
 /// Open-addressed map from a packed group code to its gid: the same table
 /// shape and hash as `DistinctU64`, and the code is the whole key, so a hit
 /// needs no indirection to verify.
-pub(super) struct GroupMap {
+pub(crate) struct GroupMap {
     pub(super) slots: Vec<GSlot>,
     pub(super) mask: usize,
     pub(super) shift: u32,
@@ -39,7 +39,7 @@ pub(super) struct GroupMap {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct GSlot {
+pub(crate) struct GSlot {
     pub(super) key: u64,
     pub(super) gid: u32,
 }
@@ -48,9 +48,29 @@ impl GroupMap {
     pub(super) fn new() -> GroupMap {
         GroupMap { slots: Vec::new(), mask: 0, shift: 0, used: 0 }
     }
+    pub(crate) fn new_map() -> GroupMap {
+        GroupMap::new()
+    }
+    /// The gid of `key`, if present.
+    pub(crate) fn get(&self, key: u64) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut i = (mix64(key) >> self.shift) as usize;
+        loop {
+            let slot = self.slots[i];
+            if slot.gid == EMPTY {
+                return None;
+            }
+            if slot.key == key {
+                return Some(slot.gid);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
     /// The gid of `key`, inserting it as `next` when unseen.
     #[inline]
-    pub(super) fn get_or_insert(&mut self, key: u64, next: u32) -> u32 {
+    pub(crate) fn get_or_insert(&mut self, key: u64, next: u32) -> u32 {
         if (self.used + 1) * 4 >= self.slots.len() * 3 {
             self.resize();
         }
@@ -90,7 +110,7 @@ impl GroupMap {
 
 /// Global (all-groups) integer min/max from the footer stats, if every group
 /// has them.
-pub(super) fn int_range<S: ReadAt>(table: &Table<S>, col: usize) -> Option<(i64, i64)> {
+pub(crate) fn int_range<S: ReadAt>(table: &Table<S>, col: usize) -> Option<(i64, i64)> {
     use crate::format::Stats;
     let mut r: Option<(i64, i64)> = None;
     for g in &table.catalog().groups {
@@ -106,7 +126,7 @@ pub(super) fn int_range<S: ReadAt>(table: &Table<S>, col: usize) -> Option<(i64,
 }
 
 /// One GROUP BY position of a `TextGroups` plan.
-pub(super) enum TextDim {
+pub(crate) enum TextDim {
     /// dict/int column: packs into the plan's composite code
     Packed,
     /// plain Utf8 column: hashed and compared as bytes
@@ -120,7 +140,7 @@ pub(super) enum TextDim {
 /// against the group's stored key — its packed code plus byte spans in one
 /// arena — so no `Rc<String>` exists during the scan, and the group table's
 /// key lane is the arena itself, gathered as raw text.
-pub(super) struct TextGroups {
+pub(crate) struct TextGroups {
     pub(super) dims: Vec<TextDim>,
     /// the packed dims in GROUP BY order, as `PackedGroups` keeps them
     pub(super) pcols: Vec<usize>,
@@ -143,10 +163,44 @@ impl TextGroups {
     pub(super) fn n_text(&self) -> usize {
         self.dims.iter().filter(|d| matches!(d, TextDim::Text(_))).count()
     }
+    /// A plan with no dense dims and `n_text` text dims, for callers that
+    /// hash arbitrary byte tuples (the join's text keys).
+    pub(crate) fn text_only(n_text: usize) -> TextGroups {
+        TextGroups {
+            dims: (0..n_text).map(|_| TextDim::Text(0)).collect(),
+            pcols: Vec::new(),
+            pdims: Vec::new(),
+            pcards: Vec::new(),
+            slots: Vec::new(),
+            mask: 0,
+            shift: 0,
+            used: 0,
+            codes: Vec::new(),
+            spans: Vec::new(),
+            arena: Vec::new(),
+        }
+    }
+    /// The gid of the key `(composite, texts)` whose hash is `hash`, if present.
+    pub(crate) fn get(&self, hash: u64, composite: u64, texts: &[Option<&[u8]>]) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut i = (mix64(hash) >> self.shift) as usize;
+        loop {
+            let slot = self.slots[i];
+            if slot.gid == EMPTY {
+                return None;
+            }
+            if slot.key == hash && self.matches(slot.gid as usize, composite, texts) {
+                return Some(slot.gid);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
     /// The gid of the key `(composite, texts)` whose hash is `hash`,
     /// inserting it as `next` when unseen.
     #[inline]
-    pub(super) fn get_or_insert(
+    pub(crate) fn get_or_insert(
         &mut self,
         hash: u64,
         composite: u64,
@@ -221,7 +275,7 @@ impl TextGroups {
 
 /// FNV-free byte hash for text keys: the Fx mixer over 8-byte words.
 #[inline]
-pub(super) fn hash_bytes(b: &[u8]) -> u64 {
+pub(crate) fn hash_bytes(b: &[u8]) -> u64 {
     use std::hash::Hasher;
     let mut h = FxHasher::default();
     h.write(b);
@@ -255,7 +309,7 @@ pub(super) fn dense_dim<S: ReadAt>(table: &mut Table<S>, index: usize) -> Option
 }
 
 /// Dense-lane budget for packed grouping; larger products go through `GroupMap`.
-pub(super) const DENSE_LANES: u64 = 1 << 22;
+pub(crate) const DENSE_LANES: u64 = 1 << 22;
 
 pub(super) fn packed_plan<S: ReadAt>(table: &mut Table<S>, group_by: &[Bound]) -> Option<PackedGroups> {
     let mut cols = Vec::new();

@@ -14,6 +14,9 @@ use std::collections::HashMap;
 
 /// One input column. `valid` is per-row (true = present); None = no nulls.
 pub enum InCol {
+    /// an already dictionary-encoded column: codes into `dict` (≤ 65,535
+    /// entries), kept as-is — a gathered dictionary column costs no string work
+    Dict { codes: Vec<u16>, dict: Vec<String>, valid: Option<Vec<bool>> },
     Int { v: Vec<i64>, valid: Option<Vec<bool>> },
     Float { v: Vec<f64>, valid: Option<Vec<bool>> },
     Text { v: Vec<String>, valid: Option<Vec<bool>> },
@@ -26,6 +29,7 @@ pub enum InCol {
 impl InCol {
     fn len(&self) -> usize {
         match self {
+            InCol::Dict { codes, .. } => codes.len(),
             InCol::Int { v, .. } => v.len(),
             InCol::Float { v, .. } => v.len(),
             InCol::Text { v, .. } => v.len(),
@@ -58,6 +62,7 @@ fn narrowest_int(min: i64, max: i64) -> ColumnType {
 
 fn plan(col: InCol) -> Planned {
     match col {
+        InCol::Dict { codes, dict, valid } => Planned::Dict { codes, dict, valid },
         InCol::Int { v, valid } => {
             let present = |i: usize| valid.as_ref().map_or(true, |b| b[i]);
             let mut min = i64::MAX;

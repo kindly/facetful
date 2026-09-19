@@ -951,3 +951,24 @@ Tests: results equal the unfolded query, chained CTEs, `FROM (subquery)` under a
 
 Next per d41: the one-shot LEFT hash join as a shape `materialize` accepts, then `JOIN` syntax as its cached anonymous form.
 </sv-prose>
+
+<sv-prose id="d44">
+## Build log 27 — the one-shot hash join (d41 step 3, form B) (2026-09-19)
+
+David chose the two-image form first — "a small change to test whether it works" — with the JS shape explicitly provisional, expected to go once `JOIN` syntax lands (the agents write SQL better than they write option objects). Landed as `facetful_engine::join::join(left, right, spec) -> image`, wasm `table_join`, `db.materialize(name, { join: { left, right, on, columns?, type? } })`, CLI `facetful join left right out --on l=r[,…] [--columns …] [--inner]`.
+
+**The algorithm, as built — perfect-hash first, the grouping machinery reused:**
+
+- **Dictionary key on both sides** (the star-schema case): translate once per *left dictionary entry* — each left string looked up in the right dictionary through a `TextGroups` arena (one hash per distinct value, not per row) — giving `left code → right row`. The per-row probe is an array index; no hashing in the row loop. Codes are dense by construction, so this is DuckDB's perfect hash join with the "is the range dense?" question answered by the format.
+- **Integer key:** the right table's footer min/max gives the range; within the 4M-lane budget the map is a dense lane indexed by `k − min`, else the open-addressed `GroupMap`. Same fork `PackedGroups` takes.
+- **Plain-text key on either side:** bytes hashed into a `TextGroups` arena; a dictionary column on the other side hashes its dictionary string per row. Gids are dense and rows with NULL keys are skipped, so gid → row goes through an indirection (the bug the first PUDL run found: a dimension with one NULL fuel put gid 9 past a 9-entry table).
+- **Composite keys** pack the dense dims into one code, exactly as multi-column `GROUP BY` does; text dims join the arena hash.
+- **Uniqueness enforced, loudly:** a repeated right key is `join: the right key is not unique (row N repeats an earlier key) — a join must be many-to-one`, never a row explosion (d29). NULL keys never match, on either side.
+- **Gather:** every left column passes through; the chosen right columns are gathered by matched row into fact-positional lanes — a dictionary column carries its *codes* and the right table's dictionary (new compiler input `InCol::Dict`), so no string is touched; LEFT adds a `matched` 0/1 lane, INNER keeps matched rows and adds nothing. The left table's `sorted_by` carries over because row order is preserved. Name clashes are an error; the right key is not carried.
+
+**Measured.** PUDL, `generator_tech_wide` (42,257 rows × 128 columns) joined to a materialized 18,937-plant dimension on the int key: **85 ms**, every row matched, the dimension's state agrees with the fact's own state column on all 42,257 rows. The same facts joined to a 10-row fuel dimension whose key is plain text (below the dictionary payoff): 80 ms, 76 unmatched = the 76 NULL-fuel generators, `plants_in_fuel` equal to a direct count. Both times are dominated by re-compiling the 128 pass-through columns into a 34 MB image — which is the argument for the SQL form (step 3b): a `JOIN` inside a query knows which columns the query touches and need carry only those. Tests: dictionary keys with different code orders, dense int keys under INNER, plain-text and composite keys, NULL keys, and each error; the node smoke joins the 200K-row spike table to a materialized dimension and rejects a non-unique right key. 78 tests, gate clean.
+
+**Size: +11.2 KB gz (195.4 → 206.6, 67%), against an estimate of 6–8.** Honest accounting: the `join` body is 14.6 KB raw — reading and gathering every lane kind for two tables, three map variants, the closures over the dims — plus `parse_spec` at 4.2 KB raw (string splitting for the FFI text form, which the SQL form will not need), `read_col` 2.9, `gather` 1.6. Two things were trimmed before landing (`{:?}` in error paths; a `HashMap<&str, u32>` for translation replaced by the arena, −0.6 KB). The lesson for the estimate column of d41: a feature that touches *every lane kind for two tables* costs double a feature over one table, and an FFI text protocol is not free.
+
+**Next, per d41 step 3b:** the catalog and `JOIN` syntax, whose materialization calls this function with the projected right columns derived from the query and the cache key from the join's identity; `parse_spec` and the `{ join }` shape retire when it lands. `IN (select …)` with row values follows on the same catalog.
+</sv-prose>

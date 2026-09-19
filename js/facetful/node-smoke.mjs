@@ -114,4 +114,21 @@ try {
   console.log(`materialize round-trip: OK (${derived.rows} rows)`);
 }
 
+// join: a materialized per-country dimension joined back onto the facts on a
+// dictionary key; per-row n_rows equals that country's group count
+{
+  const dimImg = engine.materialize(handle, "select country, count(*) as n_rows from t group by country order by n_rows");
+  const dim = engine.openImage(dimImg);
+  const joined = engine.openImage(engine.join(handle, dim.handle, { on: "country", columns: ["n_rows"] }));
+  const chk = engine.query(joined.handle, "select country, min(n_rows) as lo, max(n_rows) as hi, count(*) as n, sum(matched) as m from t group by country order by country limit 3");
+  for (let i = 0; i < chk.rowCount; i++) {
+    const [lo, hi, n, m] = [1, 2, 3, 4].map((c) => chk.columns[c].values[i]);
+    if (lo !== n || hi !== n || m !== n) throw new Error(`join row ${i}: lo=${lo} hi=${hi} n=${n} matched=${m}`);
+  }
+  let rejected = false;
+  try { engine.join(dim.handle, handle, { on: "country", columns: ["capacity"] }); } catch (e) { rejected = e instanceof QueryError && /not unique/.test(e.message); }
+  if (!rejected) throw new Error("a non-unique right key must be a QueryError");
+  console.log(`join round-trip: OK (${joined.rows} rows)`);
+}
+
 console.log("js protocol smoke: OK");

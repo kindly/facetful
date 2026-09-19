@@ -51,6 +51,19 @@ export declare class Result {
   rows(): Generator<Record<string, CellValue>>;
 }
 
+/**
+ * Provisional one-shot join (see design.sv d41): `on` is a column name shared
+ * by both tables, or [left, right] pairs; `columns` picks right-side columns
+ * (default: all non-key); the right key must be unique.
+ */
+export interface JoinSpec {
+  left: string;
+  right: string;
+  on: string | string[] | [string, string][];
+  columns?: string[];
+  type?: "left" | "inner";
+}
+
 export interface LoadResult {
   name: string;
   rows: number;
@@ -100,7 +113,7 @@ export declare class Facetful {
    */
   materialize(
     name: string,
-    sql: string,
+    sql: string | { join: JoinSpec },
     options?: { table?: string; persist?: string },
   ): Promise<{ rows: number; bytes: number; elapsedMs: number }>;
   storeOpfs(path: string, buffer: ArrayBuffer): Promise<{ bytes: number }>;

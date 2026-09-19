@@ -40,6 +40,8 @@ use filter::*;
 use grouping::*;
 pub use value::{OutCol, QueryResult, Val};
 pub(crate) use output::sort_keyed2;
+pub(crate) use grouping::{hash_bytes, int_range, GroupMap, TextGroups, DENSE_LANES};
+pub(crate) use distinct::mix64;
 
 fn collect_aggs(b: &Bound, out: &mut Vec<Bound>) {
     match b {

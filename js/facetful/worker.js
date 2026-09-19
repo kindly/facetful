@@ -171,10 +171,21 @@ self.onmessage = async (e) => {
     } else if (cmd === "materialize") {
       // derived table: run the query on the source table, compile its result
       // into a new in-memory table under `name`; optionally persist the image
-      const src = e.data.table ? tables.get(e.data.table) : lastTable;
-      if (!src) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
       const t0 = performance.now();
-      const img = engine.materialize(src, e.data.sql);
+      let img;
+      if (typeof e.data.sql === "object" && e.data.sql && e.data.sql.join) {
+        // provisional: a join spec instead of SQL (see design.sv d41)
+        const j = e.data.sql.join;
+        const l = tables.get(j.left);
+        const r = tables.get(j.right);
+        if (!l) throw new Error(`no table '${j.left}'`);
+        if (!r) throw new Error(`no table '${j.right}'`);
+        img = engine.join(l, r, j);
+      } else {
+        const src = e.data.table ? tables.get(e.data.table) : lastTable;
+        if (!src) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
+        img = engine.materialize(src, e.data.sql);
+      }
       let bytes = 0;
       if (e.data.persist) {
         const image = engine.imageBytes(img);
