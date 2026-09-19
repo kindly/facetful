@@ -970,5 +970,17 @@ David chose the two-image form first — "a small change to test whether it work
 
 **Size: +11.2 KB gz (195.4 → 206.6, 67%), against an estimate of 6–8.** Honest accounting: the `join` body is 14.6 KB raw — reading and gathering every lane kind for two tables, three map variants, the closures over the dims — plus `parse_spec` at 4.2 KB raw (string splitting for the FFI text form, which the SQL form will not need), `read_col` 2.9, `gather` 1.6. Two things were trimmed before landing (`{:?}` in error paths; a `HashMap<&str, u32>` for translation replaced by the arena, −0.6 KB). The lesson for the estimate column of d41: a feature that touches *every lane kind for two tables* costs double a feature over one table, and an FFI text protocol is not free.
 
+**Against DuckDB** (same machine, same PUDL tables in memory, single-threaded, best-of-N warm; DuckDB native bulk-timed with setup subtracted, DuckDB-WASM 1.5.4 under Node via the September harness, CSV-loaded since its Parquet extension can't autoload offline):
+
+| shape | facetful wasm | facetful native | DuckDB-WASM 1T | DuckDB native 1T | DuckDB native 16T |
+|---|---|---|---|---|---|
+| materialize the join, all 131 columns | **38 ms** | 64 | 87 | 89 | 159 |
+| materialize a 4-column join (narrow facts, then join) | **4.6** (3.6 + 1.0) | 6.6 | 6.2 | 4.8 | 8.0 |
+| facet (state) on the pre-joined table | **0.4** | 0.29 | 2.1 | 1.3 | — |
+| facet (fuel × state) on the pre-joined table | **0.5** | 0.36 | 3.0 | 2.1 | — |
+| facet via a *query-time* `LEFT JOIN` | n/a | n/a | 3.7 / 4.5 | 3.4 / 2.7 | 3.3 / 4.6 |
+
+Reading it: the one-shot join itself is 2.3× faster than DuckDB's `CREATE TABLE … AS SELECT … JOIN` in either lane; the narrow join is parity; and once joined, a facet is 3–5× faster than DuckDB's on its own pre-joined table. DuckDB's query-time join facet — the shape LLM-written SQL produces — costs 3.4–3.7 ms every time; facetful's model pays 38 ms once (4.6 with projection) and 0.4 after, so it is ahead after ~12 facet queries on the full-width join and after 2 on the narrow one — inside the first interaction of a page that runs 10–30 per click. This is the measured case for 3b carrying only the columns a query references. Sixteen threads made DuckDB *slower* on the materialization (42K rows cannot amortize morsel parallelism), as in build log 19. One oddity recorded, not chased: facetful's native join (64 ms) is slower than its wasm build (38 ms) on the 34 MB all-columns image — the M5 glibc heap-trim pattern is the suspect; the CLI now reports join time separately from open + write.
+
 **Next, per d41 step 3b:** the catalog and `JOIN` syntax, whose materialization calls this function with the projected right columns derived from the query and the cache key from the join's identity; `parse_spec` and the `{ join }` shape retire when it lands. `IN (select …)` with row values follows on the same catalog.
 </sv-prose>

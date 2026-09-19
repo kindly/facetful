@@ -476,6 +476,7 @@ fn materialize(args: &[String]) {
             eprint!("{}", d.render(sql));
             exit(1);
         });
+    let mat_ms = t0.elapsed().as_secs_f64() * 1e3;
     let derived = facetful_engine::Table::open(image.clone()).unwrap_or_else(|e| {
         eprintln!("materialized image failed to open: {e}");
         exit(1);
@@ -485,7 +486,7 @@ fn materialize(args: &[String]) {
         exit(1);
     });
     eprintln!(
-        "{output}: {} rows, {} columns, {} bytes, {:.1} ms",
+        "{output}: {} rows, {} columns, {} bytes — materialize {mat_ms:.1} ms, {:.1} ms with open + write",
         (0..derived.group_count()).map(|g| derived.group_rows(g)).sum::<usize>(),
         derived.catalog().schema.columns.len(),
         image.len(),
@@ -543,6 +544,7 @@ fn join(args: &[String]) {
         eprintln!("{e}");
         exit(1);
     });
+    let join_ms = t0.elapsed().as_secs_f64() * 1e3;
     let out = facetful_engine::Table::open(image.clone()).unwrap_or_else(|e| {
         eprintln!("joined image failed to open: {e}");
         exit(1);
@@ -552,7 +554,7 @@ fn join(args: &[String]) {
         exit(1);
     });
     eprintln!(
-        "{output}: {} rows, {} columns, {} bytes, {:.1} ms",
+        "{output}: {} rows, {} columns, {} bytes — join {join_ms:.1} ms, {:.1} ms with open + write",
         (0..out.group_count()).map(|g| out.group_rows(g)).sum::<usize>(),
         out.catalog().schema.columns.len(),
         image.len(),
