@@ -55,8 +55,11 @@ export declare class Result {
 
 export type LaneKind = "int" | "float" | "bool" | "text" | "date" | "timestamp";
 export interface UdfSignature {
-  params: LaneKind[];
+  /** parameter types; "any" accepts every type (the lane still carries its real kind) */
+  params: (LaneKind | "any")[];
   returns: LaneKind;
+  /** how many trailing parameters may be omitted */
+  optional?: number;
   /** NULL in → NULL out without calling the function for that row (default true) */
   strict?: boolean;
   /** the last parameter type repeats */

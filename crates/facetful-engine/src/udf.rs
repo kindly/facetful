@@ -140,10 +140,12 @@ pub fn set_host(h: Box<dyn Host>) {
     HOST.with(|s| *s.borrow_mut() = Some(h));
 }
 
-/// Declare a function. Re-registering a name replaces it under a fresh id,
-/// so cached masks keyed on the old definition are never served for the
-/// new body. Core function names are refused.
-pub fn register(name: &str, params: &[Ty], ret: Ty, strict: bool, variadic: bool) -> Result<u32, String> {
+/// Declare a function. `params` are the parameter types (`Ty::Null` = any
+/// type); the last `optional` of them may be omitted; `variadic` lets the
+/// last repeat. Re-registering a name replaces it under a fresh id, so cached
+/// masks keyed on the old definition are never served for the new body. Core
+/// function names are refused.
+pub fn register(name: &str, params: &[Ty], ret: Ty, strict: bool, variadic: bool, optional: usize) -> Result<u32, String> {
     let name = name.to_ascii_lowercase();
     if crate::sql::binder::FUNCS.iter().any(|f| f.name == name) {
         return Err(format!("'{name}' is a built-in function"));
@@ -153,6 +155,9 @@ pub fn register(name: &str, params: &[Ty], ret: Ty, strict: bool, variadic: bool
     }
     if variadic && params.is_empty() {
         return Err("a variadic function needs at least one parameter type".into());
+    }
+    if optional > params.len() {
+        return Err("more optional parameters than parameters".into());
     }
     let id = NEXT_ID.with(|n| {
         let mut n = n.borrow_mut();
@@ -164,7 +169,7 @@ pub fn register(name: &str, params: &[Ty], ret: Ty, strict: bool, variadic: bool
     let def: &'static FuncDef = Box::leak(Box::new(FuncDef {
         name: Box::leak(name.clone().into_boxed_str()),
         kind: FuncKind::Scalar,
-        arity: (params.len(), if variadic { None } else { Some(params.len()) }),
+        arity: (params.len() - optional, if variadic { None } else { Some(params.len()) }),
         sig: Sig::Udf { id, params, ret, strict },
     }));
     DEFS.with(|d| {

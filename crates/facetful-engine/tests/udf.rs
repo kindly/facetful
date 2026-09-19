@@ -93,12 +93,14 @@ impl Host for TestHost {
 
 fn setup() -> (std::rc::Rc<std::cell::Cell<usize>>, std::rc::Rc<std::cell::RefCell<Vec<usize>>>) {
     let mut ids = std::collections::HashMap::new();
-    ids.insert(udf::register("plus", &[Ty::Int, Ty::Int], Ty::Int, true, false).unwrap(), "plus");
-    ids.insert(udf::register("shout", &[Ty::Text], Ty::Text, true, false).unwrap(), "shout");
-    ids.insert(udf::register("has", &[Ty::Text, Ty::Text], Ty::Bool, true, false).unwrap(), "has");
-    ids.insert(udf::register("zero_if_null", &[Ty::Float], Ty::Float, false, false).unwrap(), "zero_if_null");
-    ids.insert(udf::register("boom", &[Ty::Int], Ty::Int, true, false).unwrap(), "boom");
-    ids.insert(udf::register("count_args", &[Ty::Int], Ty::Int, true, true).unwrap(), "count_args");
+    ids.insert(udf::register("plus", &[Ty::Int, Ty::Int], Ty::Int, true, false, 0).unwrap(), "plus");
+    ids.insert(udf::register("shout", &[Ty::Text], Ty::Text, true, false, 0).unwrap(), "shout");
+    ids.insert(udf::register("has", &[Ty::Text, Ty::Text], Ty::Bool, true, false, 0).unwrap(), "has");
+    ids.insert(udf::register("zero_if_null", &[Ty::Float], Ty::Float, false, false, 0).unwrap(), "zero_if_null");
+    ids.insert(udf::register("boom", &[Ty::Int], Ty::Int, true, false, 0).unwrap(), "boom");
+    ids.insert(udf::register("count_args", &[Ty::Int], Ty::Int, true, true, 0).unwrap(), "count_args");
+    // an optional last parameter of any type
+    ids.insert(udf::register("count_opt", &[Ty::Text, Ty::Null], Ty::Int, true, false, 1).unwrap(), "count_args");
     let calls = std::rc::Rc::new(std::cell::Cell::new(0));
     let lens = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     udf::set_host(Box::new(TestHost { ids, calls: calls.clone(), lens: lens.clone() }));
@@ -145,6 +147,12 @@ fn binding_and_lanes() {
     assert_eq!(q(&mut t, "select count_args(1, 2, 3) from t limit 1"), vec![vec!["Int(3)"]]);
     let err = run_query(&mut t, "select count_args(1, 'x') from t").err().unwrap().render("");
     assert!(err.contains("argument 2 needs int"), "{err}");
+    // optional + any: 1 or 2 args, the second of any type
+    assert_eq!(q(&mut t, "select count_opt('a') from t limit 1"), vec![vec!["Int(1)"]]);
+    assert_eq!(q(&mut t, "select count_opt('a', 7) from t limit 1"), vec![vec!["Int(2)"]]);
+    assert_eq!(q(&mut t, "select count_opt('a', 'b') from t limit 1"), vec![vec!["Int(2)"]]);
+    let err = run_query(&mut t, "select count_opt('a', 1, 2) from t").err().unwrap().render("");
+    assert!(err.contains("takes 1 to 2 argument(s)"), "{err}");
     // grouped expression path: a UDF over an aggregate
     assert_eq!(q(&mut t, "select plus(max(n), 1) from t"), vec![vec!["Int(7)"]]);
 }
@@ -162,8 +170,8 @@ fn errors_and_registry() {
     let err = run_query(&mut t, "select shoutt(name) from t").err().unwrap().render("");
     assert!(err.contains("did you mean 'shout()'"), "{err}");
     // built-in names are protected; bad names refused
-    assert!(udf::register("upper", &[Ty::Text], Ty::Text, true, false).is_err());
-    assert!(udf::register("no-dash", &[Ty::Text], Ty::Text, true, false).is_err());
+    assert!(udf::register("upper", &[Ty::Text], Ty::Text, true, false, 0).is_err());
+    assert!(udf::register("no-dash", &[Ty::Text], Ty::Text, true, false, 0).is_err());
     // unregister
     assert!(udf::unregister("boom"));
     assert!(!udf::unregister("boom"));

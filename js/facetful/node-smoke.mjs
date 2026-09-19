@@ -213,6 +213,12 @@ try {
     ["select url_host('not a url')", undefined],
     ["select regexp('Coal Creek', '^coal', 'i')", 1],
     ["select regexp('Coal Creek', '^coal')", 0],
+    ["select regexp_extract('Unit 12 of 30', '\\d+')", "12"],
+    ["select regexp_extract('Unit 12 of 30', 'of (\\d+)', 1)", "30"],
+    ["select regexp_extract('2024-07-01', '(?<y>\\d{4})-(?<m>\\d\\d)', 'm')", "07"],
+    ["select regexp_extract('none', '\\d+')", undefined],
+    ["select regexp_replace('a1b22c', '\\d+', '#')", "a#b#c"],
+    ["select regexp_replace('2024-07-01', '(?<y>\\d{4})-(\\d\\d)-(\\d\\d)', '$3/$2/$<y>')", "01/07/2024"],
   ];
   for (const [sql, want] of checks) {
     const got = one(sql);

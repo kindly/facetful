@@ -19,7 +19,7 @@ export const udfs = [
   // pattern); the native CLI answers the same SQL through the `regex` crate
   {
     name: "regexp",
-    signature: { params: ["text", "text"], returns: "bool", variadic: true },
+    signature: { params: ["text", "text", "text"], returns: "bool", optional: 1 },
     fn: (() => {
       const cache = new Map();
       return (args, len, out) => {
@@ -28,6 +28,46 @@ export const udfs = [
         let re = cache.get(key);
         if (!re) cache.set(key, (re = new RegExp(p.values[0], args[2] ? args[2].values[0] : "")));
         for (let i = 0; i < len; i++) out.values[i] = re.test(s.values[i]) ? 1 : 0;
+      };
+    })(),
+  },
+  // regexp_extract(s, pattern[, group]) -> text: the match, or group n (number) / a
+  // named group (text); NULL when nothing matches
+  {
+    name: "regexp_extract",
+    signature: { params: ["text", "text", "any"], returns: "text", optional: 1 },
+    fn: (() => {
+      const cache = new Map();
+      return (args, len, out) => {
+        const [s, p] = args;
+        const pat = p.values[0];
+        let re = cache.get(pat);
+        if (!re) cache.set(pat, (re = new RegExp(pat, "u")));
+        const g = args[2] ? args[2].values[0] : 0;
+        for (let i = 0; i < len; i++) {
+          const m = re.exec(s.values[i]);
+          if (!m) { out.values[i] = null; continue; }
+          const v = typeof g === "number" ? m[g] : m.groups ? m.groups[g] : undefined;
+          out.values[i] = v === undefined ? null : v;
+        }
+      };
+    })(),
+  },
+  // regexp_replace(s, pattern, replacement[, flags]) -> text: every match replaced;
+  // $1 and $<name> refer to groups (the native CLI accepts the same spelling)
+  {
+    name: "regexp_replace",
+    signature: { params: ["text", "text", "text", "text"], returns: "text", optional: 1 },
+    fn: (() => {
+      const cache = new Map();
+      return (args, len, out) => {
+        const [s, p, r] = args;
+        const flags = args[3] ? args[3].values[0] : "";
+        const key = p.values[0] + "\u0000" + flags;
+        let re = cache.get(key);
+        if (!re) cache.set(key, (re = new RegExp(p.values[0], flags.includes("g") ? flags : flags + "g")));
+        const repl = r.values[0];
+        for (let i = 0; i < len; i++) out.values[i] = s.values[i].replace(re, repl);
       };
     })(),
   },
@@ -124,7 +164,7 @@ export const udfs = [
   // country_name('DE') -> 'Germany' (ISO 3166 alpha-2; optional locale second arg)
   {
     name: "country_name",
-    signature: { params: ["text"], returns: "text", variadic: true },
+    signature: { params: ["text", "text"], returns: "text", optional: 1 },
     fn: (() => {
       const names = new Map();
       return (args, len, out) => {

@@ -33,6 +33,8 @@ export async function instantiate(wasmBytes, opfsRead) {
 
 /** Lane kinds on the UDF wire (the numbers are the ABI). */
 export const KIND = { int: 0, float: 1, bool: 2, text: 3, date: 4, timestamp: 5 };
+/** parameter-only kind: accepts any argument type (the lane carries its real kind) */
+const ANY = 6;
 const KIND_NAMES = Object.keys(KIND);
 // descriptor words: see facetful-wasm `WasmHost`
 const D_KIND = 0, D_LEN = 1, D_FLAGS = 2, D_DATA = 3, D_AUX = 4, D_VALID = 5, D_BYTES = 6, D_ERR = 7, D_WORDS = 8;
@@ -49,8 +51,10 @@ export class Engine {
 
   /**
    * Register a user-defined scalar function (design.sv d49). `sig` is
-   * `{ params: kind[], returns: kind, strict?, variadic?, perRow? }` with kinds
-   * from KIND (by name). The function is called ONCE per lane —
+   * `{ params: kind[], returns: kind, strict?, variadic?, optional?, perRow? }`
+   * with kinds from KIND (by name; a parameter may also be "any"). `optional`
+   * is how many trailing parameters may be omitted; `variadic` lets the last
+   * repeat. The function is called ONCE per lane —
    * `fn(args, len, out)` where each arg is `{ kind, values, valid, broadcast }`
    * (`values` a Float64Array for numbers/dates/bools, `string[]` for text;
    * `broadcast` = a literal, one value; `valid` a bitmap or null) and `out` is
@@ -60,13 +64,13 @@ export class Engine {
    * Strict (the default) skips NULL inputs and NULL-fills those outputs.
    */
   registerFunction(name, sig, fn) {
-    const kinds = (sig.params || []).map(kindOf);
+    const kinds = (sig.params || []).map((k) => (k === "any" ? ANY : kindOf(k)));
     const ret = kindOf(sig.returns);
     const nameB = this.enc.encode(name);
     const p = u32(this.w.alloc(nameB.byteLength + kinds.length + 1));
     new Uint8Array(this.mem(), p, nameB.byteLength).set(nameB);
     new Uint8Array(this.mem(), p + nameB.byteLength, kinds.length).set(kinds);
-    const flags = (sig.strict === false ? 0 : 1) | (sig.variadic ? 2 : 0);
+    const flags = (sig.strict === false ? 0 : 1) | (sig.variadic ? 2 : 0) | ((sig.optional || 0) << 2);
     const id = this.w.udf_register(p, nameB.byteLength, p + nameB.byteLength, kinds.length, ret, flags);
     this.w.dealloc(p, nameB.byteLength + kinds.length + 1);
     if (!id) {

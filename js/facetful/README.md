@@ -160,6 +160,7 @@ await db.registerFunction("mw_to_gw", { params: ["float"], returns: "float", per
 
 **Ready-made functions**, registered by default (`Facetful.open({ udfs: false })`
 opts out; the list is importable from `facetful/udfs`): `regexp(s, pattern[, flags])`,
+`regexp_extract(s, pattern[, group])`, `regexp_replace(s, pattern, replacement)`,
 `json_extract(doc, '$.a.b[0]')`, `to_tz(ts, 'Europe/London')`
 (Intl's time-zone tables — hundreds of KB the wasm never has to carry),
 `date_trunc('month', ts)`, `date_add(d, 1, 'month')`, `weekday`, `quarter`,
@@ -172,8 +173,9 @@ arrive as days / ms numbers). Functions bind like built-ins — wrong argument
 types are caret-diagnosed, the declared return type is the column's type — and
 their results go through the same caches, so a `regexp()` filter is evaluated
 once per pattern and served from the mask cache after. `strict` (default)
-gives NULL out for NULL in without calling you; `variadic` repeats the last
-parameter; `unregisterFunction(name)` removes one. The function runs in the
+gives NULL out for NULL in without calling you; `optional: n` makes the last
+`n` parameters omittable, a parameter kind of `"any"` accepts every type, and
+`variadic` repeats the last parameter; `unregisterFunction(name)` removes one. The function runs in the
 worker: pass a self-contained function (its source is sent — an IIFE for
 state, as above — no closures over your variables) or `{ moduleUrl }`. A
 throwing function fails the query with its message. `regexp()` is the

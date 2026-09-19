@@ -149,7 +149,8 @@ pub enum Sig {
     /// all args same type as first, returns that type
     SameAsFirst,
     /// a user-defined function (crate::udf): declared parameter types (the
-    /// last repeats when variadic) and return type; `strict` = NULL in, NULL out
+    /// last repeats when variadic; `Ty::Null` = any) and return type;
+    /// `strict` = NULL in, NULL out
     Udf { id: u32, params: &'static [Ty], ret: Ty, strict: bool },
 }
 
@@ -511,7 +512,8 @@ impl<'a> Binder<'a> {
             Sig::Udf { params, ret, .. } => {
                 for (i, b) in bound.iter().enumerate() {
                     let want = params[i.min(params.len() - 1)];
-                    if !b.ty().coerces_to(want) {
+                    // Ty::Null in a signature means "any type"
+                    if want != Ty::Null && !b.ty().coerces_to(want) {
                         return Err(Diagnostic::new(
                             format!("{}() argument {} needs {}, this is {}", func.name, i + 1, want.name(), b.ty().name()),
                             arg_span(i),

@@ -121,8 +121,9 @@ impl facetful_engine::udf::Host for WasmHost {
 
 static mut UDF_ERROR: Option<String> = None;
 
-/// Declare a user-defined function: `params` is `argc` kind bytes, `ret` a
-/// kind, `flags` bit0 = strict (NULL in → NULL out), bit1 = variadic. Returns
+/// Declare a user-defined function: `params` is `argc` kind bytes (6 = any
+/// type), `ret` a kind, `flags` bit0 = strict (NULL in → NULL out), bit1 =
+/// variadic, bits 2.. = how many trailing parameters are optional. Returns
 /// the function id (≥ 1), or 0 with the reason in `udf_error`.
 #[no_mangle]
 pub extern "C" fn udf_register(
@@ -140,11 +141,16 @@ pub extern "C" fn udf_register(
         let name = core::str::from_utf8(name).map_err(|_| "name is not UTF-8".to_string())?;
         let params: Vec<_> = params
             .iter()
-            .map(|&k| Kind::from_u8(k).map(|k| k.ty()).ok_or_else(|| format!("unknown parameter kind {k}")))
+            .map(|&k| {
+                if k == 6 {
+                    return Ok(facetful_engine::sql::binder::Ty::Null);
+                }
+                Kind::from_u8(k).map(|k| k.ty()).ok_or_else(|| format!("unknown parameter kind {k}"))
+            })
             .collect::<Result<_, _>>()?;
         let ret = Kind::from_u8(ret as u8).ok_or_else(|| format!("unknown return kind {ret}"))?.ty();
         udf::set_host(Box::new(WasmHost));
-        udf::register(name, &params, ret, flags & 1 != 0, flags & 2 != 0)
+        udf::register(name, &params, ret, flags & 1 != 0, flags & 2 != 0, (flags >> 2) as usize)
     })();
     match result {
         Ok(id) => id,
