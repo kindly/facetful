@@ -184,6 +184,15 @@ export class Engine {
     return { handle, rows: this.w.table_total_rows(handle) };
   }
 
+  /** Make `handle` reachable by `name` from other tables' queries (FROM / JOIN). */
+  catalogRegister(name, handle) {
+    const b = this.enc.encode(name);
+    const p = u32(this.w.alloc(b.byteLength));
+    new Uint8Array(this.mem(), p, b.byteLength).set(b);
+    this.w.catalog_register(p, b.byteLength, handle);
+    this.w.dealloc(p, b.byteLength);
+  }
+
   /** Run SQL; returns { columns, rowCount, stats } with copied-out buffers. */
   query(tableHandle, sql) {
     const sqlBytes = this.enc.encode(sql);

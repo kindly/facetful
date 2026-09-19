@@ -310,7 +310,53 @@ pub extern "C" fn table_dict_value(t: usize, col: u32, code: u32, out_ptr: *mut 
 // (transferables), then frees the handle. Strings NEVER cross as JS arrays.
 
 use facetful_engine::sql::exec::{QueryResult, Val};
-use facetful_engine::sql::run_query;
+use facetful_engine::sql::{run_query_with, Catalog};
+
+/// The worker's registry of loaded tables, mirrored here so a query can name
+/// them in FROM / JOIN: (name, handle, identity). Identity increments per
+/// registration, so a table reloaded under the same name is a different key.
+static mut CATALOG: Vec<(String, usize, u64)> = Vec::new();
+static mut NEXT_ID: u64 = 1;
+
+/// Register (or re-register) `handle` under `name`.
+#[no_mangle]
+pub extern "C" fn catalog_register(name_ptr: *const u8, name_len: usize, handle: usize) {
+    let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    let Ok(name) = core::str::from_utf8(name) else { return };
+    unsafe {
+        let cat = &mut *core::ptr::addr_of_mut!(CATALOG);
+        cat.retain(|(n, _, _)| n != name);
+        let id = NEXT_ID;
+        NEXT_ID += 1;
+        cat.push((name.to_string(), handle, id));
+    }
+}
+
+/// Forget every name bound to `handle` (before the table is freed).
+#[no_mangle]
+pub extern "C" fn catalog_unregister(handle: usize) {
+    unsafe {
+        let cat = &mut *core::ptr::addr_of_mut!(CATALOG);
+        cat.retain(|(_, h, _)| *h != handle);
+    }
+}
+
+/// The registry as the running query sees it: every table but its own.
+struct WasmCatalog {
+    base: usize,
+}
+
+impl Catalog<Src> for WasmCatalog {
+    fn table(&mut self, name: &str) -> Option<(&mut T, u64)> {
+        let cat = unsafe { &*core::ptr::addr_of!(CATALOG) };
+        let (_, h, id) = cat.iter().find(|(n, h, _)| n == name && *h != self.base)?;
+        Some((unsafe { &mut *(*h as *mut T) }, *id))
+    }
+    fn is_self(&self, name: &str) -> bool {
+        let cat = unsafe { &*core::ptr::addr_of!(CATALOG) };
+        cat.iter().any(|(n, h, _)| n == name && *h == self.base)
+    }
+}
 
 pub struct ColBuf {
     kind: u32, // 1 = int (as f64), 2 = float, 3 = bool (u8), 4 = text
@@ -450,11 +496,12 @@ fn columnize(mut r: QueryResult) -> Outcome {
 /// check `outcome_is_err` before reading columns.
 #[no_mangle]
 pub extern "C" fn query_run(t: usize, sql_ptr: *const u8, sql_len: usize) -> usize {
+    let t_handle = t;
     let t = unsafe { &mut *(t as *mut T) };
     let sql = unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) };
     let outcome = match core::str::from_utf8(sql) {
         Err(_) => Outcome::Err("query is not valid UTF-8".into()),
-        Ok(sql) => match run_query(t, sql) {
+        Ok(sql) => match run_query_with(t, sql, &mut WasmCatalog { base: t_handle }) {
             Ok(r) => {
                 let (sg, tg) = (r.scanned_groups as u32, r.total_groups as u32);
                 match columnize(r) {
@@ -484,11 +531,17 @@ pub extern "C" fn table_materialize(
     sql_len: usize,
     group_target: u32,
 ) -> usize {
+    let t_handle = t;
     let t = unsafe { &mut *(t as *mut T) };
     let sql = unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) };
     let outcome = match core::str::from_utf8(sql) {
         Err(_) => Outcome::Err("query is not valid UTF-8".into()),
-        Ok(sql) => match facetful_engine::materialize::materialize(t, sql, group_target) {
+        Ok(sql) => match facetful_engine::materialize::materialize_with(
+            t,
+            sql,
+            group_target,
+            &mut WasmCatalog { base: t_handle },
+        ) {
             Ok(image) => Outcome::Image(image),
             Err(d) => Outcome::Err(d.render(sql)),
         },

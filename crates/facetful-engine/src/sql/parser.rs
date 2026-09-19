@@ -128,6 +128,55 @@ impl Parser {
             let (f, s) = self.table_name()?;
             (f, s, None)
         };
+        let from_alias = self.table_alias()?;
+        let mut joins = Vec::new();
+        loop {
+            let start = self.peek_span().start;
+            let kind = match self.peek() {
+                Tok::Join => JoinKind::Inner,
+                Tok::Inner => {
+                    self.next();
+                    JoinKind::Inner
+                }
+                Tok::Left => {
+                    self.next();
+                    self.eat(&Tok::Outer);
+                    JoinKind::Left
+                }
+                _ => break,
+            };
+            self.expect(Tok::Join, "after the join kind")?;
+            let source = if let Tok::LParen = self.peek() {
+                let open = self.next().span;
+                let sub = Box::new(self.query()?);
+                let close = self.expect(Tok::RParen, "to close the joined subquery")?;
+                JoinSource::Subquery(sub, Span::new(open.start, close.end))
+            } else {
+                JoinSource::Table(self.ident("as the joined table name")?.0)
+            };
+            let alias = self.table_alias()?;
+            let on = if self.eat(&Tok::Using) {
+                self.expect(Tok::LParen, "after 'using'")?;
+                let mut cols = Vec::new();
+                loop {
+                    let (name, sp) = self.ident("as a column name in using (…)")?;
+                    cols.push((Expr::Column(name.clone(), sp), Expr::Column(name, sp)));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Tok::RParen, "to close using (…)")?;
+                cols
+            } else {
+                self.expect(Tok::On, "after the joined table (on a.k = b.k, or using (k))")?;
+                let cond = self.expr(0)?;
+                let mut pairs = Vec::new();
+                flatten_equalities(cond, &mut pairs)?;
+                pairs
+            };
+            let end = self.toks[self.pos.saturating_sub(1)].span.end;
+            joins.push(Join { kind, source, alias, on, span: Span::new(start, end) });
+        }
 
         let filter = if self.eat(&Tok::Where) { Some(self.expr(0)?) } else { None };
 
@@ -173,7 +222,9 @@ impl Parser {
             select,
             from,
             from_span,
+            from_alias,
             from_subquery,
+            joins,
             span: Span::new(start, end),
             filter,
             group_by,
@@ -198,6 +249,17 @@ impl Parser {
 
     fn table_name(&mut self) -> Result<(String, Span), Diagnostic> {
         self.ident("as the table name after 'from'")
+    }
+
+    /// `[AS] alias` after a table or subquery; a bare identifier counts.
+    fn table_alias(&mut self) -> Result<Option<String>, Diagnostic> {
+        if self.eat(&Tok::As) {
+            return Ok(Some(self.ident("after 'as'")?.0));
+        }
+        if let Tok::Ident(_) | Tok::QuotedIdent(_) = self.peek() {
+            return Ok(Some(self.ident("as an alias")?.0));
+        }
+        Ok(None)
     }
 
     fn ident(&mut self, ctx: &str) -> Result<(String, Span), Diagnostic> {
@@ -369,6 +431,11 @@ impl Parser {
             Tok::Ident(name) => {
                 if self.peek() == &Tok::LParen {
                     self.call(name, t.span)
+                } else if self.eat(&Tok::Dot) {
+                    // `alias.column`: kept as one dotted name; resolved
+                    // against the FROM/JOIN aliases before binding
+                    let (col, sp) = self.ident("after '.'")?;
+                    Ok(Expr::Column(format!("{name}.{col}"), Span::new(t.span.start, sp.end)))
                 } else {
                     Ok(Expr::Column(name, t.span))
                 }
@@ -475,5 +542,27 @@ fn describe(t: &Tok) -> String {
         Tok::Ge => "'>='".into(),
         Tok::Concat => "'||'".into(),
         kw => format!("the keyword '{kw:?}'").to_lowercase(),
+    }
+}
+
+
+/// `a = b [and c = d …]` into key pairs; anything else is not a join condition.
+fn flatten_equalities(e: Expr, out: &mut Vec<(Expr, Expr)>) -> Result<(), Diagnostic> {
+    match e {
+        Expr::Binary { op: BinOp::And, lhs, rhs, .. } => {
+            flatten_equalities(*lhs, out)?;
+            flatten_equalities(*rhs, out)
+        }
+        Expr::Binary { op: BinOp::Eq, lhs, rhs, .. }
+            if matches!(*lhs, Expr::Column(..)) && matches!(*rhs, Expr::Column(..)) =>
+        {
+            out.push((*lhs, *rhs));
+            Ok(())
+        }
+        other => Err(Diagnostic::new(
+            "a join condition is one or more column equalities: on a.key = b.key [and …]",
+            other.span(),
+        )
+        .with_hint("filters on the joined table belong in WHERE")),
     }
 }

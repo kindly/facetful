@@ -131,4 +131,21 @@ try {
   console.log(`join round-trip: OK (${joined.rows} rows)`);
 }
 
+// SQL JOIN: the dimension is registered under a name and named in the query;
+// the first query materializes the join, the second hits the cache
+{
+  const dimImg = engine.materialize(handle, "select country, count(*) as n_rows from t group by country");
+  const dim = engine.openImage(dimImg);
+  engine.catalogRegister("dim", dim.handle);
+  const sql = "select t.country, d.n_rows, count(*) as n from t left join dim d on t.country = d.country group by t.country, d.n_rows order by n desc limit 3";
+  const a = engine.query(handle, sql);
+  const b = engine.query(handle, sql);
+  if (a.rowCount !== 3 || a.columns[1].values[0] !== a.columns[2].values[0]) throw new Error("sql join: n_rows must equal the group count");
+  if (JSON.stringify(Array.from(b.columns[2].values)) !== JSON.stringify(Array.from(a.columns[2].values))) throw new Error("sql join: cached rerun differs");
+  let bad = false;
+  try { engine.query(handle, "select count(*) from t join dim d on t.country > d.country"); } catch (e) { bad = e instanceof QueryError && /column equalities/.test(e.message); }
+  if (!bad) throw new Error("a non-equality join condition must be a QueryError");
+  console.log("sql join: OK");
+}
+
 console.log("js protocol smoke: OK");

@@ -54,7 +54,7 @@ fn main() {
 
 fn query(args: &[String]) {
     use facetful_engine::sql::exec::Val;
-    use facetful_engine::sql::run_query;
+    use facetful_engine::sql::run_query_with;
     use facetful_engine::Table;
     use std::io::{BufRead, Write};
 
@@ -72,9 +72,23 @@ fn query(args: &[String]) {
         }));
         args.drain(i..=i + 1);
     }
+    // --table name=path (repeatable): other tables the SQL may name in FROM / JOIN
+    let mut others: Vec<(String, String)> = Vec::new();
+    while let Some(i) = args.iter().position(|a| a == "--table") {
+        let spec = args.get(i + 1).cloned().unwrap_or_else(|| {
+            eprintln!("--table needs name=path.facetful");
+            exit(2);
+        });
+        let Some((name, path)) = spec.split_once('=') else {
+            eprintln!("--table: '{spec}' is not name=path.facetful");
+            exit(2);
+        };
+        others.push((name.to_string(), path.to_string()));
+        args.drain(i..=i + 1);
+    }
 
     let Some(path) = args.first() else {
-        eprintln!("usage: facetful query file.facetful [\"select …\"] [--mask-cache <bytes>]");
+        eprintln!("usage: facetful query file.facetful [\"select …\"] [--mask-cache <bytes>] [--table name=other.facetful …]");
         exit(2);
     };
     let bytes = std::fs::read(path).unwrap_or_else(|e| {
@@ -87,6 +101,18 @@ fn query(args: &[String]) {
     });
     if let Some(b) = mask_budget {
         table.masks().set_budget(b);
+    }
+    let mut set = facetful_engine::sql::TableSet { tables: Vec::new() };
+    for (name, p) in &others {
+        let bytes = std::fs::read(p).unwrap_or_else(|e| {
+            eprintln!("cannot read {p}: {e}");
+            exit(1);
+        });
+        let t = Table::open(bytes).unwrap_or_else(|e| {
+            eprintln!("{p}: {e}");
+            exit(1);
+        });
+        set.tables.push((name.clone(), t));
     }
 
     use facetful_engine::sql::binder::Ty;
@@ -118,7 +144,7 @@ fn query(args: &[String]) {
 
     let mut run_one = |sql: &str| {
         let t0 = std::time::Instant::now();
-        match run_query(&mut table, sql) {
+        match run_query_with(&mut table, sql, &mut set) {
             Err(d) => eprint!("{}", d.render(sql)),
             Ok(mut r) => {
                 r.ensure_rows();
@@ -180,10 +206,9 @@ fn query(args: &[String]) {
             }
             println!("# query\tcold_ms\twarm_ms");
             for (name, sql) in &blocks {
-                use facetful_engine::sql::run_query;
                 // warmup: lazy segment loads, dict caches, mask cache
                 for _ in 0..3 {
-                    if let Err(d) = run_query(&mut table, sql) {
+                    if let Err(d) = run_query_with(&mut table, sql, &mut set) {
                         eprint!("{name}: {}", d.render(sql));
                         std::process::exit(1);
                     }
@@ -197,7 +222,7 @@ fn query(args: &[String]) {
                     (0..10)
                         .map(|_| {
                             let t0 = std::time::Instant::now();
-                            let _ = run_query(&mut table, sql).unwrap();
+                            let _ = run_query_with(&mut table, sql, &mut set).unwrap();
                             t0.elapsed().as_secs_f64() * 1000.0
                         })
                         .collect(),
@@ -209,7 +234,7 @@ fn query(args: &[String]) {
                         .map(|_| {
                             table.masks().clear();
                             let t0 = std::time::Instant::now();
-                            let _ = run_query(&mut table, sql).unwrap();
+                            let _ = run_query_with(&mut table, sql, &mut set).unwrap();
                             t0.elapsed().as_secs_f64() * 1000.0
                         })
                         .collect(),
@@ -536,8 +561,11 @@ fn join(args: &[String]) {
     let (mut l, mut r) = (open(left), open(right));
     let spec = facetful_engine::join::JoinSpec {
         keys,
-        columns,
+        left_columns: None,
+        columns: if columns.is_empty() { None } else { Some(columns) },
+        renames: Vec::new(),
         kind: if inner { facetful_engine::join::JoinKind::Inner } else { facetful_engine::join::JoinKind::Left },
+        matched: true,
     };
     let t0 = std::time::Instant::now();
     let image = facetful_engine::join::join(&mut l, &mut r, &spec, group_target).unwrap_or_else(|e| {

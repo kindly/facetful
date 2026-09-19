@@ -17,6 +17,7 @@ pub enum Tok {
     LParen,
     RParen,
     Comma,
+    Dot,
     Star,
     Slash,
     Percent,
@@ -32,6 +33,12 @@ pub enum Tok {
     // keywords (reserved set — some spellings are sugar, all reserved now)
     Select,
     With,
+    Join,
+    Inner,
+    Left,
+    Outer,
+    On,
+    Using,
     From,
     Where,
     Group,
@@ -63,6 +70,12 @@ pub enum Tok {
 pub const KEYWORDS: &[(&str, Tok)] = &[
     ("select", Tok::Select),
     ("with", Tok::With),
+    ("join", Tok::Join),
+    ("inner", Tok::Inner),
+    ("left", Tok::Left),
+    ("outer", Tok::Outer),
+    ("on", Tok::On),
+    ("using", Tok::Using),
     ("from", Tok::From),
     ("where", Tok::Where),
     ("group", Tok::Group),
@@ -220,6 +233,11 @@ pub fn lex(src: &str) -> Result<Vec<SpannedTok>, Diagnostic> {
                     }
                 }
                 out.push(SpannedTok { tok: Tok::QuotedIdent(s), span: Span::new(start, i) });
+            }
+            b'.' if !b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
+                // a qualifier: `alias.column`
+                out.push(SpannedTok { tok: Tok::Dot, span: Span::new(i, i + 1) });
+                i += 1;
             }
             b'0'..=b'9' | b'.' => {
                 let mut j = i;

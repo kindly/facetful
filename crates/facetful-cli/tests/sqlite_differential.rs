@@ -6,7 +6,8 @@
 //! Skips (with a note) when sqlite3 or the spike dataset isn't available.
 
 use facetful_engine::sql::exec::Val;
-use facetful_engine::sql::run_query;
+use facetful_engine::materialize::materialize;
+use facetful_engine::sql::{run_query_with, TableSet};
 use facetful_engine::Table;
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,6 +17,14 @@ fn repo(p: &str) -> PathBuf {
 }
 
 const QUERIES: &[&str] = &[
+    // JOINs: a cached materialization here, a hash join in SQLite — same answers
+    "select t.country, d.country_rows, count(*) as n, sum(t.capacity) as mw \
+     from t left join dim d on t.country = d.country \
+     group by t.country, d.country_rows order by n desc, t.country limit 10",
+    "select fuel, round(sum(capacity / d.country_mw), 4) as share \
+     from t inner join dim d on t.country = d.country \
+     where d.country_rows > 500 group by fuel order by fuel",
+    "select count(*) as n, count(d.country_rows) as joined from t left join dim d using (country)",
     // CTEs and FROM subqueries: materialized here, inlined by SQLite — same answers
     "with c as (select country, count(*) as n, sum(capacity) as total from t group by country) \
      select country, n, total from c where n > 100 order by total desc, country limit 10",
@@ -103,7 +112,8 @@ fn facetful_matches_sqlite() {
         "create table t (country TEXT, status TEXT, fuel TEXT, region TEXT, owner TEXT, \
          year TEXT, capacity REAL, id INTEGER);\n\
          .mode csv\n.import --skip 1 '{}' t\n\
-         update t set capacity = NULL where capacity = '';",
+         update t set capacity = NULL where capacity = '';\n\
+         create table dim as select country, count(*) as country_rows, sum(capacity) as country_mw from t group by country;",
         csv.display()
     );
     let mut child = Command::new("sqlite3")
@@ -122,18 +132,22 @@ fn facetful_matches_sqlite() {
 
     let bytes = std::fs::read(&facetful_file).unwrap();
     let mut table = Table::open(bytes).unwrap();
+    // the same dimension, materialized here and registered under the same name
+    let dim_sql = "select country, count(*) as country_rows, sum(capacity) as country_mw from t group by country";
+    let dim = Table::open(materialize(&mut table, dim_sql, 65_536).unwrap()).unwrap();
+    let mut set = TableSet { tables: vec![("dim".to_string(), dim)] };
 
     for sql in QUERIES {
         // facetful — twice: cold, then with the filter-mask cache primed by
         // the first run. Both must agree with SQLite (cache-correctness).
         table.masks().clear();
-        let run = |table: &mut _| -> Vec<Vec<String>> {
-            let mut r = run_query(table, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+        let run = |table: &mut _, set: &mut TableSet<Vec<u8>>| -> Vec<Vec<String>> {
+            let mut r = run_query_with(table, sql, set).unwrap_or_else(|d| panic!("{}", d.render(sql)));
             r.ensure_rows();
             r.rows.iter().map(|row| row.iter().map(render_val).collect()).collect()
         };
-        let ours = run(&mut table);
-        let cached = run(&mut table);
+        let ours = run(&mut table, &mut set);
+        let cached = run(&mut table, &mut set);
         assert_eq!(ours, cached, "mask-cached rerun differs on: {sql}");
 
         // sqlite

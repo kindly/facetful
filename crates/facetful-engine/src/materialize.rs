@@ -12,7 +12,7 @@ use crate::format::read::ReadAt;
 use crate::format::SortKey;
 use crate::sql::binder::{BoundQuery, Ty};
 use crate::sql::exec::{OutCol, QueryResult, Val};
-use crate::sql::{execute_sql, span::Span, Diagnostic};
+use crate::sql::{execute_sql_with, span::Span, Catalog, Diagnostic, NoCatalog};
 use crate::Table;
 
 /// Run `sql` against `table` (CTEs and subqueries included) and compile the
@@ -23,7 +23,17 @@ pub fn materialize<S: ReadAt>(
     sql: &str,
     group_target: u32,
 ) -> Result<Vec<u8>, Diagnostic> {
-    let (bound, result) = execute_sql(table, sql)?;
+    materialize_with(table, sql, group_target, &mut NoCatalog)
+}
+
+/// `materialize` with other tables in scope for JOIN / FROM.
+pub fn materialize_with<S: ReadAt>(
+    table: &mut Table<S>,
+    sql: &str,
+    group_target: u32,
+    cat: &mut dyn Catalog<S>,
+) -> Result<Vec<u8>, Diagnostic> {
+    let (bound, result) = execute_sql_with(table, sql, cat)?;
     compile_result(&bound, result, group_target)
 }
 

@@ -8,6 +8,8 @@ import { parquetToColumns } from "./parquet.js";
 
 let engine = null;
 const tables = new Map(); // name -> handle
+// register under a name for FROM / JOIN from other tables' queries
+const setTable = (name, handle) => { setTable(name, handle); engine.catalogRegister(name, handle); };
 let lastTable = null;
 
 // OPFS file registry: the wasm's opfs_read import addresses files by these ids.
@@ -77,7 +79,7 @@ async function opfsOpenTable(name, path, cacheBytes) {
   }
   try {
     const { handle, rows } = engine.openOpfsTable(fileId, h.getSize(), cacheBytes);
-    tables.set(name, handle);
+    setTable(name, handle);
     lastTable = handle;
     return { rows, fileLen: h.getSize() };
   } catch (err) {
@@ -127,7 +129,7 @@ self.onmessage = async (e) => {
       reply({ ok: true });
     } else if (cmd === "load") {
       const { handle, rows } = engine.openTable(e.data.buffer);
-      tables.set(e.data.name, handle);
+      setTable(e.data.name, handle);
       lastTable = handle;
       reply({ ok: true, rows });
     } else if (cmd === "loadParquet") {
@@ -135,7 +137,7 @@ self.onmessage = async (e) => {
       const t0 = performance.now();
       const { rows, img } = await transcodeParquet(e.data.buffer);
       const { handle } = engine.openImage(img);
-      tables.set(e.data.name, handle);
+      setTable(e.data.name, handle);
       lastTable = handle;
       reply({ ok: true, rows, transcodeMs: performance.now() - t0 });
     } else if (cmd === "openParquet") {
@@ -159,7 +161,7 @@ self.onmessage = async (e) => {
         imageBytes = engine.imageBytes(img);
       } catch { /* copy-out failed: open uncached */ }
       const { handle } = engine.openImage(img);
-      tables.set(e.data.name, handle);
+      setTable(e.data.name, handle);
       lastTable = handle;
       if (imageBytes) {
         try {
@@ -193,7 +195,7 @@ self.onmessage = async (e) => {
         await opfsWrite(e.data.persist, image);
       }
       const { handle, rows } = engine.openImage(img);
-      tables.set(e.data.name, handle);
+      setTable(e.data.name, handle);
       reply({ ok: true, rows, bytes, elapsedMs: performance.now() - t0 });
     } else if (cmd === "storeOpfs") {
       await opfsWrite(e.data.path, new Uint8Array(e.data.buffer));

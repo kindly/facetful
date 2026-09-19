@@ -144,6 +144,22 @@ impl<S: ReadAt> Table<S> {
         })
     }
 
+    /// Remove a derived table from the cache, handing it over — so it can be
+    /// joined with this table (or another derived one) without two mutable
+    /// borrows into the cache. Put it back with `derived_put`.
+    pub fn derived_take(&mut self, key: &str) -> Option<(Table<S>, usize)> {
+        let i = self.derived.iter().position(|d| d.key == key)?;
+        let d = self.derived.swap_remove(i);
+        self.derived_bytes -= d.bytes;
+        Some((d.table, d.bytes))
+    }
+
+    pub fn derived_put(&mut self, key: &str, table: Table<S>, bytes: usize) {
+        self.derived_tick += 1;
+        self.derived_bytes += bytes;
+        self.derived.push(Derived { key: key.to_string(), table, bytes, last_used: self.derived_tick });
+    }
+
     /// Drop least-recently-used derived tables until `incoming` more bytes fit.
     fn evict_derived(&mut self, incoming: usize) {
         while self.derived_bytes + incoming > self.derived_budget && !self.derived.is_empty() {

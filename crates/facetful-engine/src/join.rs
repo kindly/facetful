@@ -28,9 +28,19 @@ pub enum JoinKind {
 pub struct JoinSpec {
     /// (left column, right column) pairs compared for equality
     pub keys: Vec<(String, String)>,
-    /// right-side columns to carry; empty = every non-key right column
-    pub columns: Vec<String>,
+    /// left-side columns to carry; `None` = all (the one-shot form). The SQL
+    /// form passes the columns the query touches: on a 128-column fact table
+    /// that is the difference between 65 ms and a few.
+    pub left_columns: Option<Vec<String>>,
+    /// right-side columns to carry; `None` = every non-key right column
+    pub columns: Option<Vec<String>>,
+    /// output names for carried right columns that would otherwise clash
+    pub renames: Vec<(String, String)>,
     pub kind: JoinKind,
+    /// LEFT only: add a `matched` 0/1 column. The one-shot form wants it; the
+    /// SQL form does not (`right.key IS NULL` is the idiom, and a second LEFT
+    /// JOIN in one query must not collide on the name).
+    pub matched: bool,
 }
 
 /// Not matched.
@@ -187,17 +197,22 @@ pub fn join<S: ReadAt>(
     for (l, r) in &spec.keys {
         key_cols.push((col_index(left, l, "left")?, col_index(right, r, "right")?));
     }
-    let right_cols: Vec<usize> = if spec.columns.is_empty() {
-        (0..right.catalog().schema.columns.len())
+    let right_cols: Vec<usize> = match &spec.columns {
+        None => (0..right.catalog().schema.columns.len())
             .filter(|c| !key_cols.iter().any(|(_, r)| r == c))
-            .collect()
-    } else {
-        spec.columns.iter().map(|n| col_index(right, n, "right")).collect::<Result<_, _>>()?
+            .collect(),
+        Some(cols) => cols.iter().map(|n| col_index(right, n, "right")).collect::<Result<_, _>>()?,
     };
-    let left_names: Vec<String> = left.catalog().schema.columns.iter().map(|c| c.name.clone()).collect();
+    let left_cols: Vec<usize> = match &spec.left_columns {
+        None => (0..left.catalog().schema.columns.len()).collect(),
+        Some(cols) => cols.iter().map(|n| col_index(left, n, "left")).collect::<Result<_, _>>()?,
+    };
+    let all_left_names: Vec<String> = left.catalog().schema.columns.iter().map(|c| c.name.clone()).collect();
+    let left_names: Vec<String> = left_cols.iter().map(|&c| all_left_names[c].clone()).collect();
     let mut names = left_names.clone();
     for &c in &right_cols {
-        let n = right.catalog().schema.columns[c].name.clone();
+        let orig = &right.catalog().schema.columns[c].name;
+        let n = spec.renames.iter().find(|(o, _)| o == orig).map(|(_, r)| r.clone()).unwrap_or_else(|| orig.clone());
         if names.contains(&n) {
             return Err(format!(
                 "join: column '{n}' exists on both sides — pick right columns that don't clash"
@@ -205,7 +220,8 @@ pub fn join<S: ReadAt>(
         }
         names.push(n);
     }
-    if spec.kind == JoinKind::Left {
+    let flag = spec.kind == JoinKind::Left && spec.matched;
+    if flag {
         if names.iter().any(|n| n == "matched") {
             return Err("join: a column named 'matched' would clash with the match flag".into());
         }
@@ -244,7 +260,7 @@ pub fn join<S: ReadAt>(
         } else {
             return Err(format!(
                 "join: cannot join on '{}' = '{}': keys must be dictionary text, integer/date, or text on both sides",
-                left_names[lc], right.catalog().schema.columns[rc].name
+                all_left_names[lc], right.catalog().schema.columns[rc].name
             ));
         };
         if let Dim::Dict { card, .. } | Dim::Int { card, .. } = &dim {
@@ -399,7 +415,7 @@ pub fn join<S: ReadAt>(
     };
     let right_rows: Vec<u32> = kept.iter().map(|&i| matches[i as usize]).collect();
     let mut cols: Vec<InCol> = Vec::with_capacity(names.len());
-    for c in 0..left_names.len() {
+    for &c in &left_cols {
         let col = read_col(left, c)?;
         let (ty, dict) = {
             let def = &left.catalog().schema.columns[c];
@@ -417,11 +433,22 @@ pub fn join<S: ReadAt>(
         let dict = if dict { Some(right.dictionary(c).map_err(|e| format!("join: {e}"))?) } else { None };
         cols.push(gather(&col, &right_rows, ty, dict));
     }
-    if spec.kind == JoinKind::Left {
+    if flag {
         cols.push(InCol::Int { v: right_rows.iter().map(|&r| (r != NONE) as i64).collect(), valid: None });
     }
-    // left row order is preserved, so the left table's sort still holds
-    let sorted_by = left.catalog().sorted_by.clone();
+    // left row order is preserved, so the left table's sort still holds —
+    // for the sort columns that were carried, at their new positions
+    let sorted_by: Vec<_> = left
+        .catalog()
+        .sorted_by
+        .iter()
+        .map_while(|k| {
+            left_cols.iter().position(|&c| c == k.column as usize).map(|i| crate::format::SortKey {
+                column: i as u16,
+                descending: k.descending,
+            })
+        })
+        .collect();
     compile_sorted(&names, cols, group_target, sorted_by).map(|(img, _)| img).map_err(|e| format!("join: {e}"))
 }
 
@@ -454,5 +481,6 @@ pub fn parse_spec(text: &str) -> Result<JoinSpec, String> {
         .collect();
     let columns: Vec<String> =
         lines.next().unwrap_or("").split('\x1f').filter(|s| !s.is_empty()).map(str::to_string).collect();
-    Ok(JoinSpec { keys, columns, kind })
+    let columns = if columns.is_empty() { None } else { Some(columns) };
+    Ok(JoinSpec { keys, left_columns: None, columns, renames: Vec::new(), kind, matched: true })
 }

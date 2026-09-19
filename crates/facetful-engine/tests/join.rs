@@ -91,8 +91,12 @@ fn rows(t: &mut Table<Vec<u8>>, sql: &str) -> Vec<Vec<String>> {
 fn spec(keys: &[(&str, &str)], columns: &[&str], kind: JoinKind) -> JoinSpec {
     JoinSpec {
         keys: keys.iter().map(|(l, r)| (l.to_string(), r.to_string())).collect(),
-        columns: columns.iter().map(|c| c.to_string()).collect(),
+        left_columns: None,
+        // an empty list here means "all non-key right columns", as the CLI's default
+        columns: if columns.is_empty() { None } else { Some(columns.iter().map(|c| c.to_string()).collect()) },
+        renames: Vec::new(),
         kind,
+        matched: true,
     }
 }
 

@@ -88,16 +88,46 @@ pub struct Cte {
     pub body_span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Left,
+    Inner,
+}
+
+/// What a JOIN reads: a named table (a CTE in scope, or a table the
+/// catalog knows) or a subquery.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinSource {
+    Table(String),
+    Subquery(Box<Query>, Span),
+}
+
+/// One `[LEFT|INNER] JOIN source [AS] alias ON a = b [AND …] | USING (cols)`.
+/// Only column equalities: the join is a many-to-one materialization
+/// (design.sv d41), so the condition is a key list, not a predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub kind: JoinKind,
+    pub source: JoinSource,
+    pub alias: Option<String>,
+    /// (left side expr, right side expr) pairs, each a plain or qualified column
+    pub on: Vec<(Expr, Expr)>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub with: Vec<Cte>,
     pub select: Vec<SelectItem>,
-    /// the FROM name: a CTE in scope, else the table itself (any spelling);
-    /// for `FROM (subquery) alias`, the alias (or empty)
+    /// the FROM name: a CTE in scope, a table the catalog knows, else the
+    /// table itself (any spelling); for `FROM (subquery) alias`, the alias
     pub from: String,
     pub from_span: Span,
+    pub from_alias: Option<String>,
     /// `FROM (subquery)`: an anonymous CTE
     pub from_subquery: Option<Box<Query>>,
+    /// joins, applied left to right; each materializes onto the running table
+    pub joins: Vec<Join>,
     /// the whole query's text
     pub span: Span,
     pub filter: Option<Expr>,
