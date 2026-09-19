@@ -353,8 +353,21 @@ impl Parser {
 
             // ---- sugar: all desugars to Call, spans cover the whole idiom ----
             Tok::In => {
-                self.expect(Tok::LParen, "after 'in'")
-                    .map_err(|d| d.with_hint("in expects a parenthesized list: x in ('a', 'b')"))?;
+                let open = self
+                    .expect(Tok::LParen, "after 'in'")
+                    .map_err(|d| d.with_hint("in expects a parenthesized list: x in ('a', 'b'), or a subquery"))?;
+                // x IN (select …) / (a, b) IN (select …): a semi-join
+                if let Tok::Select | Tok::With = self.peek() {
+                    let query = Box::new(self.query()?);
+                    let close = self.expect(Tok::RParen, "to close the subquery")?;
+                    let cols = match lhs {
+                        Expr::Row(items, _) => items,
+                        e => vec![e],
+                    };
+                    let span = cols[0].span().to(close);
+                    let body = Span::new(open.start, close.end);
+                    return Ok(wrap_not(Expr::InSubquery { cols, query, body, span }));
+                }
                 let mut args = vec![lhs];
                 loop {
                     args.push(self.expr(0)?);
@@ -364,6 +377,39 @@ impl Parser {
                 }
                 let close = self.expect(Tok::RParen, "to close the 'in' list")?;
                 let span = args[0].span().to(close);
+                // (a, b) IN ((1, 'x'), (2, 'y')) → (a = 1 and b = 'x') or (…): the
+                // three-valued logic of AND/OR is exactly the row-value rule
+                if let Expr::Row(cols, _) = &args[0] {
+                    let mut alts: Vec<Expr> = Vec::new();
+                    for item in &args[1..] {
+                        let Expr::Row(vals, vsp) = item else {
+                            return Err(Diagnostic::new(
+                                "every element of a row-value IN list must be a row of the same width",
+                                item.span(),
+                            ));
+                        };
+                        if vals.len() != cols.len() {
+                            return Err(Diagnostic::new(
+                                format!("row has {} values, the left side has {}", vals.len(), cols.len()),
+                                *vsp,
+                            ));
+                        }
+                        let mut conj: Option<Expr> = None;
+                        for (c, v) in cols.iter().zip(vals) {
+                            let eq = Expr::Binary { op: BinOp::Eq, lhs: Box::new(c.clone()), rhs: Box::new(v.clone()), span };
+                            conj = Some(match conj {
+                                None => eq,
+                                Some(a) => Expr::Binary { op: BinOp::And, lhs: Box::new(a), rhs: Box::new(eq), span },
+                            });
+                        }
+                        alts.push(conj.expect("a row has at least one value"));
+                    }
+                    let mut out = alts.remove(0);
+                    for a in alts {
+                        out = Expr::Binary { op: BinOp::Or, lhs: Box::new(out), rhs: Box::new(a), span };
+                    }
+                    return Ok(wrap_not(out));
+                }
                 Ok(wrap_not(Expr::call("in", args, span)))
             }
             Tok::Like => {
@@ -418,6 +464,18 @@ impl Parser {
             }
             Tok::LParen => {
                 let e = self.expr(0)?;
+                if self.eat(&Tok::Comma) {
+                    // a row value: (a, b, …)
+                    let mut items = vec![e];
+                    loop {
+                        items.push(self.expr(0)?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    let close = self.expect(Tok::RParen, "to close the row value")?;
+                    return Ok(Expr::Row(items, Span::new(t.span.start, close.end)));
+                }
                 self.expect(Tok::RParen, "to close this parenthesis")?;
                 Ok(e)
             }

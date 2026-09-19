@@ -17,6 +17,13 @@ fn repo(p: &str) -> PathBuf {
 }
 
 const QUERIES: &[&str] = &[
+    // IN (select …), row values, NOT IN: a semi-join materialization here, SQLite's own — same answers
+    "select country, count(*) as n from t \
+     where country in (select country from dim where country_rows > 500) group by country order by country",
+    "select count(*) as n from t where (country, fuel) in (select country, fuel from t where capacity > 900)",
+    "select count(*) as n from t where status not in (select status from t where capacity is null)",
+    "select fuel, count(*) as n from t where (fuel, status) in (('fuel_0', 'status_0'), ('fuel_2', 'status_0')) \
+     group by fuel order by fuel",
     // JOINs: a cached materialization here, a hash join in SQLite — same answers
     "select t.country, d.country_rows, count(*) as n, sum(t.capacity) as mw \
      from t left join dim d on t.country = d.country \

@@ -19,7 +19,29 @@ fn shape(e: &Expr) -> String {
             let a: Vec<String> = args.iter().map(shape).collect();
             format!("{name}({})", a.join(","))
         }
+        Expr::Row(items, _) => {
+            let a: Vec<String> = items.iter().map(shape).collect();
+            format!("row({})", a.join(","))
+        }
+        Expr::InSubquery { cols, query, .. } => {
+            let a: Vec<String> = cols.iter().map(shape).collect();
+            format!("in_subquery(({}) from {})", a.join(","), query.from)
+        }
     }
+}
+
+#[test]
+fn row_values_and_in_subqueries_parse() {
+    // literal tuple lists desugar to AND/OR at parse time
+    same("(a, b) in ((1, 'x'), (2, 'y'))", "(a = 1 and b = 'x') or (a = 2 and b = 'y')");
+    same("(a, b) not in ((1, 'x'))", "not (a = 1 and b = 'x')");
+    // subqueries stay a node for the resolver
+    let e = parse_expr("(a, b) in (select x, y from d where z > 1)").unwrap();
+    assert_eq!(shape(&e), "in_subquery((a,b) from d)");
+    let e = parse_expr("a not in (select x from d)").unwrap();
+    assert_eq!(shape(&e), "(Not in_subquery((a) from d))");
+    let err = parse_expr("(a, b) in ((1, 2, 3))").unwrap_err();
+    assert!(err.render("").contains("row has 3 values"));
 }
 
 fn same(a: &str, b: &str) {

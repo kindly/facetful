@@ -132,6 +132,9 @@ fn exec_query<S: ReadAt>(
         Some(sub) => Target::Derived(derive(table, sub, q.from_span, src, &scope, cat)?),
         None => resolve_name(&q.from, &scope, cat),
     };
+    // `IN (select …)` in WHERE becomes a synthetic LEFT JOIN + IS [NOT] NULL
+    let expanded = expand_in_subqueries(table, q, src, &mut scope, cat)?;
+    let q = expanded.as_ref().unwrap_or(q);
     let rewritten;
     let q = if q.joins.is_empty() {
         q
@@ -425,6 +428,149 @@ fn join_targets<S: ReadAt>(
     }
 }
 
+/// `(a, b) IN (select x, y …)` (and `NOT IN`) in WHERE, as a semi-join with
+/// exact three-valued semantics and no new executor code: the inner query
+/// materializes, its distinct key set materializes over that, a synthetic
+/// LEFT JOIN on (a = x, b = y) carries the right key, and the predicate is
+/// `key IS NOT NULL` — for NOT IN, `key IS NULL AND a IS NOT NULL AND …`,
+/// or constant FALSE when the inner set holds a NULL (SQL's rule).
+fn expand_in_subqueries<S: ReadAt>(
+    table: &mut Table<S>,
+    q: &ast::Query,
+    src: &str,
+    scope: &mut Vec<(String, String)>,
+    cat: &mut dyn Catalog<S>,
+) -> Result<Option<ast::Query>, Diagnostic> {
+    fn has_in(e: &ast::Expr) -> bool {
+        match e {
+            ast::Expr::InSubquery { .. } => true,
+            ast::Expr::Call { args, .. } => args.iter().any(has_in),
+            ast::Expr::Unary { expr, .. } => has_in(expr),
+            ast::Expr::Binary { lhs, rhs, .. } => has_in(lhs) || has_in(rhs),
+            _ => false,
+        }
+    }
+    let Some(filter) = &q.filter else { return Ok(None) };
+    if !has_in(filter) {
+        return Ok(None);
+    }
+    let mut rq = q.clone();
+    let mut n = 0usize;
+    let mut filter = rq.filter.take().expect("checked above");
+    expand_in_expr(table, &mut filter, src, scope, cat, &mut rq.joins, &mut n, false)?;
+    rq.filter = Some(filter);
+    Ok(Some(rq))
+}
+
+fn expand_in_expr<S: ReadAt>(
+    table: &mut Table<S>,
+    e: &mut ast::Expr,
+    src: &str,
+    scope: &mut Vec<(String, String)>,
+    cat: &mut dyn Catalog<S>,
+    joins: &mut Vec<ast::Join>,
+    n: &mut usize,
+    negated: bool,
+) -> Result<(), Diagnostic> {
+    use ast::{BinOp, Expr, UnOp};
+    // NOT (x IN (select …)) is the negated form; other NOTs recurse
+    if let Expr::Unary { op: UnOp::Not, expr, .. } = e {
+        if matches!(**expr, Expr::InSubquery { .. }) {
+            let mut inner = std::mem::replace(&mut **expr, Expr::Null(span::Span::new(0, 0)));
+            expand_in_expr(table, &mut inner, src, scope, cat, joins, n, !negated)?;
+            *e = inner;
+            return Ok(());
+        }
+    }
+    match e {
+        Expr::InSubquery { cols, query, body, span } => {
+            let span = *span;
+            *n += 1;
+            let alias = format!("__in{}", *n);
+            // 1. the inner query, materialized
+            let inner_key = derive(table, query, *body, src, scope, cat)?;
+            let names = schema_names(table, &Target::Derived(inner_key.clone()), cat);
+            if names.len() != cols.len() {
+                return Err(Diagnostic::new(
+                    format!("IN compares {} column(s) but the subquery selects {}", cols.len(), names.len()),
+                    span,
+                ));
+            }
+            for c in cols.iter() {
+                if !matches!(c, Expr::Column(..)) {
+                    return Err(Diagnostic::new("IN (select …) compares plain columns", c.span()));
+                }
+            }
+            // 2. its distinct key set, materialized over it
+            let quoted: Vec<String> = names.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect();
+            let distinct_sql = format!(
+                "select {} from __in_src group by {}",
+                quoted.join(", "),
+                quoted.join(", ")
+            );
+            scope.push(("__in_src".to_string(), inner_key.clone()));
+            let distinct_q = parse_query(&distinct_sql)?;
+            let distinct_key = derive(table, &distinct_q, span::Span::new(0, distinct_sql.len()), &distinct_sql, scope, cat)?;
+            // 3. does the key set hold a NULL? (decides NOT IN)
+            let null_sql = format!(
+                "select count(*) from __in_src where {}",
+                quoted.iter().map(|c| format!("{c} is null")).collect::<Vec<_>>().join(" or ")
+            );
+            let null_q = parse_query(&null_sql)?;
+            let (_, mut r) = exec_query(table, &null_q, &null_sql, scope, cat)?;
+            r.ensure_rows();
+            let inner_has_null = matches!(r.rows.first().and_then(|row| row.first()), Some(exec::Val::Int(c)) if *c > 0);
+            scope.pop();
+            // 4. the synthetic join and the predicate
+            let derived_name = format!("{alias}_d");
+            scope.push((derived_name.clone(), distinct_key));
+            let on: Vec<(Expr, Expr)> = cols
+                .iter()
+                .zip(&names)
+                .map(|(c, rn)| (c.clone(), Expr::Column(format!("{alias}.{rn}"), span)))
+                .collect();
+            joins.push(ast::Join {
+                kind: ast::JoinKind::Left,
+                source: ast::JoinSource::Table(derived_name),
+                alias: Some(alias.clone()),
+                on,
+                span,
+            });
+            let key_ref = Expr::Column(format!("{alias}.{}", names[0]), span);
+            let is_null = |x: Expr| Expr::call("isnull", vec![x], span);
+            let not = |x: Expr| Expr::Unary { op: UnOp::Not, expr: Box::new(x), span };
+            let and = |a: Expr, b: Expr| Expr::Binary { op: BinOp::And, lhs: Box::new(a), rhs: Box::new(b), span };
+            *e = if !negated {
+                // matched → TRUE; unmatched or a NULL outer key → not TRUE
+                not(is_null(key_ref))
+            } else if inner_has_null {
+                // NOT IN against a set with NULL is never TRUE
+                Expr::Binary { op: BinOp::Eq, lhs: Box::new(Expr::Number(1.0, false, span)), rhs: Box::new(Expr::Number(0.0, false, span)), span }
+            } else {
+                // unmatched, and every outer key non-NULL
+                let mut pred = is_null(key_ref);
+                for c in cols.iter() {
+                    pred = and(pred, not(is_null(c.clone())));
+                }
+                pred
+            };
+            Ok(())
+        }
+        Expr::Call { args, .. } => {
+            for a in args.iter_mut() {
+                expand_in_expr(table, a, src, scope, cat, joins, n, negated)?;
+            }
+            Ok(())
+        }
+        Expr::Unary { expr, .. } => expand_in_expr(table, expr, src, scope, cat, joins, n, negated),
+        Expr::Binary { lhs, rhs, .. } => {
+            expand_in_expr(table, lhs, src, scope, cat, joins, n, negated)?;
+            expand_in_expr(table, rhs, src, scope, cat, joins, n, negated)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn split_qualified(name: &str) -> (Option<&str>, &str) {
     match name.split_once('.') {
         Some((a, c)) => (Some(a), c),
@@ -464,6 +610,9 @@ fn lookup(aliases: &[(String, Vec<(String, String)>)], cur_names: &[String], nam
 fn collect_names(e: &ast::Expr, out: &mut Vec<String>) {
     match e {
         ast::Expr::Column(n, _) => out.push(n.clone()),
+        ast::Expr::Row(items, _) | ast::Expr::InSubquery { cols: items, .. } => {
+            items.iter().for_each(|a| collect_names(a, out))
+        }
         ast::Expr::Call { args, .. } => args.iter().for_each(|a| collect_names(a, out)),
         ast::Expr::Unary { expr, .. } => collect_names(expr, out),
         ast::Expr::Binary { lhs, rhs, .. } => {
@@ -493,6 +642,9 @@ fn rewrite_names(
             Ok(())
         }
         ast::Expr::Call { args, .. } => args.iter_mut().try_for_each(|a| rewrite_names(a, aliases, cur_names)),
+        ast::Expr::Row(items, _) | ast::Expr::InSubquery { cols: items, .. } => {
+            items.iter_mut().try_for_each(|a| rewrite_names(a, aliases, cur_names))
+        }
         ast::Expr::Unary { expr, .. } => rewrite_names(expr, aliases, cur_names),
         ast::Expr::Binary { lhs, rhs, .. } => {
             rewrite_names(lhs, aliases, cur_names)?;

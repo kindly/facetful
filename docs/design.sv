@@ -1002,3 +1002,23 @@ Reading it: the one-shot join itself is 2.3× faster than DuckDB's `CREATE TABLE
 
 **Left for later:** joins whose FROM is another catalog table (run the query against that table instead — a clear error says so), superset cache matching, the `*` naming when both sides share many columns, and `IN (select …)` with row values on the same catalog (d41 step 4).
 </sv-prose>
+
+<sv-prose id="d46">
+## Build log 29 — IN (select …) with row values: the semi-join as a rewrite (d41 step 4) (2026-09-19)
+
+The last d41 step, and the one that shows what the materialization approach buys: **no executor code at all.** `x IN (select k from y)` is a semi-join, and a semi-join is a LEFT JOIN plus `IS NOT NULL` — both of which exist. So `sql::expand_in_subqueries` rewrites, before binding:
+
+1. the inner query materializes (a cached derived table, like any CTE body);
+2. its **distinct key set** materializes over that — `select "k1", "k2" from __in_src group by "k1", "k2"`, generated text through the same `derive`, so it is cached and deduplicated like everything else;
+3. one query asks whether the key set holds a NULL (`count(*) where k1 is null or …`);
+4. a synthetic `LEFT JOIN __inN_d AS __inN ON a = __inN.k1 AND b = __inN.k2` is appended to the query's joins — and from there build log 28's machinery does the rest: only the touched columns carried, clash renames, the derived cache;
+5. the predicate becomes `__inN.k1 IS NOT NULL`; for `NOT IN`, `__inN.k1 IS NULL AND a IS NOT NULL AND b IS NOT NULL`; and when the key set holds a NULL, `NOT IN` becomes constant FALSE — SQL's three-valued rule, the one that surprises people (`x NOT IN (…NULL…)` selects nothing), reproduced exactly because SQLite is the reference.
+
+**Row values** are SQL:1999 row value constructors. `(a, b) IN (select x, y …)` is the same rewrite with two keys (composite keys were already a packed code or an arena hash). The literal form `(a, b) IN ((1,'x'), (2,'y'))` desugars **at parse time** to `(a = 1 AND b = 'x') OR (a = 2 AND b = 'y')`, because the three-valued logic of AND/OR is precisely the row-value comparison rule: a NULL component leaves the row unknown *unless another component is definitely unequal* — the test that caught my own wrong expectation: `(NULL, 20) NOT IN (('eu',10), ('asia',30))` is TRUE, and SQLite says so too. `Expr::Row` exists only as the left side of IN and as an element of an IN list; anywhere else it is an error, as is `IN (select …)` outside WHERE or over expressions (plain columns only, since join keys are columns).
+
+**Measured** (PUDL, generator facts with the 18.9K-plant dimension registered, native): `plant_id_eia IN (select plant_id_eia from plants where plant_rows >= 30)` grouped by fuel — 0.1 ms warm, count 8,351 = the equivalent `INNER JOIN`; `(plant_id_eia, fuel) IN (select … where gen_2024 > 1e6)` 0.05 ms; `state NOT IN (select pstate …)` 2,284 = the anti-join complement; the literal list `(state, fuel) IN (('TX','gas'), ('CA','solar'), ('WY','coal'))` 1.0 ms cold / 0.04 warm, 3,672 = its OR-of-ANDs expansion. Four queries joined the SQLite differential — scalar IN over the dimension, row-value IN over the same table, `NOT IN` against a set containing NULL, a literal tuple list — and agree. Engine tests cover scalar and row-value IN including through a CTE, cache reuse across reruns, `NOT IN` with a NULL outer key and a NULL inner set, literal lists and their errors; parser tests fix the desugar shapes. 86 tests, gate clean.
+
+**Size: +7.9 KB gz (217.2 → 225.1, 73%).** `expand_in_expr` 5 KB raw, `Parser::infix` +6.9 KB raw for the row-value desugar (AND/OR tree building), `exec_query` +0.8. The same shape as the last two steps: resolver code is string-and-AST manipulation and costs more than its logic suggests. **The d41 set is complete at ~36 KB gz against 16–19 estimated** — each step justified by measurement, each estimate low by about 2×, and the correction recorded where the next estimate gets made.
+
+**Position after d41.** Four features share one mechanism — a query result becomes a cached table — and none added an arm to the executor. That was the bet in d41 and it held. Open on this line, none urgent: superset matching in the derived cache, `EXISTS` (the same rewrite if a workload asks), `IN (select …)` in SELECT items, and the feature gates from the lite-build discussion, which the module boundaries already support.
+</sv-prose>

@@ -17,6 +17,12 @@ pub enum Expr {
     /// `*` in `count(*)` / `select *`
     Star(Span),
     Null(Span),
+    /// `(a, b)`: a row value — valid only as the left side of IN, or as an
+    /// element of an IN list (where it desugars at parse time)
+    Row(Vec<Expr>, Span),
+    /// `(a, b) IN (select x, y …)`: a semi-join, resolved before binding into
+    /// a cached materialization + join (design.sv d41 step 4)
+    InSubquery { cols: Vec<Expr>, query: Box<Query>, body: Span, span: Span },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +55,12 @@ impl Expr {
             | Expr::Str(_, s)
             | Expr::Column(_, s)
             | Expr::Star(s)
-            | Expr::Null(s) => *s,
-            Expr::Call { span, .. } | Expr::Unary { span, .. } | Expr::Binary { span, .. } => *span,
+            | Expr::Null(s)
+            | Expr::Row(_, s) => *s,
+            Expr::Call { span, .. }
+            | Expr::Unary { span, .. }
+            | Expr::Binary { span, .. }
+            | Expr::InSubquery { span, .. } => *span,
         }
     }
 

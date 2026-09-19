@@ -366,6 +366,15 @@ impl<'a> Binder<'a> {
                 *span,
             )),
             Expr::Column(name, span) => self.bind_column(name, *span),
+            Expr::Row(_, span) => Err(Diagnostic::new(
+                "a row value (a, b) is only valid on the left of IN",
+                *span,
+            )),
+            Expr::InSubquery { span, .. } => Err(Diagnostic::new(
+                "IN (select …) is supported in WHERE, comparing plain columns",
+                *span,
+            )
+            .with_hint("write the subquery as a CTE or JOIN to use it elsewhere")),
             Expr::Unary { op, expr, span } => {
                 let b = self.bind(expr, allow_aggregate)?;
                 let ty = match op {
