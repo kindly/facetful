@@ -14,6 +14,8 @@ export interface OpenOptions {
    * explicit URL when running without one.
    */
   hyparquetUrl?: string;
+  /** register the ready-made functions from `facetful/udfs` at open (default true) */
+  udfs?: boolean;
 }
 
 export interface QueryStats {

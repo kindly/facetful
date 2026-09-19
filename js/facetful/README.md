@@ -37,7 +37,9 @@ The command runs the same wasm engine the browser does (Node is the second
 runtime), so a `.facetful` built here is exactly what `openParquet` would have
 built, and SQL — including your registered functions, via `--udf module.mjs` —
 behaves identically in both places. CSV can also be opened directly in the
-browser with `loadCsv` (below).
+browser with `loadCsv` (below). The ready-made functions (`json_extract`,
+`to_tz`, `date_trunc`, …, see "User-defined functions") are registered by
+default in both.
 
 ```js
 import { Facetful } from "facetful";
@@ -88,10 +90,9 @@ encoding), row groups written as they finish, memory bounded by the distinct
 values plus one row group — a 200 MB / 3M-row CSV converts in ~4 s at ~70 MB
 of process memory (Node included). Types: int (narrowed), float, ISO date and
 datetime, text; repeated text is dictionary-encoded. `query` without SQL is a
-REPL; tables open lazily, so large files don't load into memory. A `--udf`
-module's default export is an array of `{ name, signature, fn }` — the shape
-`facetful/udfs` exports, so `--udf node_modules/facetful/udfs.js` registers
-the ready-made set.
+REPL; tables open lazily, so large files don't load into memory. The
+ready-made functions are registered; a `--udf` module's default export adds
+your own, as an array of `{ name, signature, fn }`.
 
 ## Derived tables: `materialize`
 
@@ -157,8 +158,8 @@ await db.query("select fuel, count(*) from t where regexp(plant_name, '^(Big|Lit
 await db.registerFunction("mw_to_gw", { params: ["float"], returns: "float", perRow: true }, (mw) => mw / 1000);
 ```
 
-**Ready-made functions** — `import { udfs } from "facetful/udfs"` and register
-the ones you want: `json_extract(doc, '$.a.b[0]')`, `to_tz(ts, 'Europe/London')`
+**Ready-made functions**, registered by default (`Facetful.open({ udfs: false })`
+opts out; the list is importable from `facetful/udfs`): `json_extract(doc, '$.a.b[0]')`, `to_tz(ts, 'Europe/London')`
 (Intl's time-zone tables — hundreds of KB the wasm never has to carry),
 `date_trunc('month', ts)`, `date_add(d, 1, 'month')`, `weekday`, `quarter`,
 `country_name('DE')`, `format_number(x, 'en-US:compact')`, `unaccent('Zürich')`,

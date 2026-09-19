@@ -9,7 +9,7 @@
 //   [...r.rows()]              // row objects, materialized lazily
 
 export class Facetful {
-  static async open({ wasmUrl, workerUrl, hyparquetUrl } = {}) {
+  static async open({ wasmUrl, workerUrl, hyparquetUrl, udfs = true } = {}) {
     // the no-argument form must stay a literal `new Worker(new URL(...))`
     // expression: bundlers (Vite, webpack) statically analyze exactly that
     // pattern to compile the worker graph
@@ -21,6 +21,7 @@ export class Facetful {
       cmd: "init",
       wasmUrl: String(wasmUrl ?? new URL("./facetful_wasm.wasm", import.meta.url)),
       hyparquetUrl,
+      udfs,
     });
     return db;
   }

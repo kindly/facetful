@@ -9,10 +9,12 @@
 // Conversion streams: two passes over the CSV in 1 MB chunks, row groups
 // written as they finish, memory bounded whatever the file size. Tables open
 // lazily through positional reads (the browser's OPFS import, here fs.readSync).
-// A --udf module's default export is an array of { name, signature, fn }.
+// The ready-made functions (../udfs.js) are registered; a --udf module's
+// default export adds more: an array of { name, signature, fn }.
 import { readFileSync, openSync, readSync, writeSync, closeSync, fstatSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { instantiate, QueryError } from "../core.js";
+import { udfs as builtinUdfs } from "../udfs.js";
 
 const args = process.argv.slice(2);
 const cmd = args.shift();
@@ -32,6 +34,7 @@ const opfsRead = (fileId, offset, dest) => {
   return readSync(fd, dest, 0, dest.length, offset);
 };
 const engine = await instantiate(readFileSync(new URL("../facetful_wasm.wasm", import.meta.url)), opfsRead);
+for (const u of builtinUdfs) engine.registerFunction(u.name, u.signature, u.fn);
 
 function openLazy(path) {
   const fd = openSync(path, "r");

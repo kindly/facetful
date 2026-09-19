@@ -3,9 +3,9 @@
 // JSON, the Intl tables (timezones, country names, number formats), Unicode
 // normalization, URL parsing — plus the temporal long tail over Date.UTC.
 //
-//   import { udfs } from "facetful/udfs";
-//   for (const u of udfs) await db.registerFunction(u.name, u.signature, u.fn);
-//   // or a subset: udfs.filter(u => ["json_extract", "to_tz"].includes(u.name))
+// Registered by default by Facetful.open() and the `facetful` command
+// (`open({ udfs: false })` opts out). The list is exported for callers that
+// drive core.js directly or want a subset.
 //
 // Each entry is { name, signature, fn }. Functions are self-contained (they run
 // in the worker from their source), vectorized where it pays, per-row where it

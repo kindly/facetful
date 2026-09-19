@@ -5,6 +5,7 @@
 
 import { instantiate, transferables, QueryError } from "./core.js";
 import { parquetToColumns } from "./parquet.js";
+import { udfs as builtinUdfs } from "./udfs.js";
 
 let engine = null;
 const tables = new Map(); // name -> handle
@@ -126,6 +127,9 @@ self.onmessage = async (e) => {
       if (e.data.hyparquetUrl) hyparquetUrl = e.data.hyparquetUrl;
       const wasmBytes = await (await fetch(e.data.wasmUrl)).arrayBuffer();
       engine = await instantiate(wasmBytes, opfsRead);
+      // the ready-made functions (udfs.js) are on by default: they cost
+      // nothing until a query calls one, and agents expect date_trunc to exist
+      if (e.data.udfs !== false) for (const u of builtinUdfs) engine.registerFunction(u.name, u.signature, u.fn);
       reply({ ok: true });
     } else if (cmd === "load") {
       const { handle, rows } = engine.openTable(e.data.buffer);
