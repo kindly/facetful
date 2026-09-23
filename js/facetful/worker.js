@@ -10,7 +10,7 @@ import { udfs as builtinUdfs } from "./udfs.js";
 let engine = null;
 const tables = new Map(); // name -> handle
 // register under a name for FROM / JOIN from other tables' queries
-const setTable = (name, handle) => { setTable(name, handle); engine.catalogRegister(name, handle); };
+const setTable = (name, handle) => { tables.set(name, handle); engine.catalogRegister(name, handle); };
 let lastTable = null;
 
 // OPFS file registry: the wasm's opfs_read import addresses files by these ids.

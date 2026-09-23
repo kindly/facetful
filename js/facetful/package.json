@@ -1,6 +1,6 @@
 {
   "name": "facetful",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Tiny columnar SQL engine for browser faceting — Rust/wasm, ~240KB gz, zero dependencies. Open Parquet or CSV instantly, facet 1M rows in milliseconds, persist to OPFS; one install gives the library and the `facetful` command.",
   "license": "MIT",
   "author": "David Raznick",
