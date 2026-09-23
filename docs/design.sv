@@ -1162,3 +1162,13 @@ d51 built. The converter first, because everything else sits on it.
 
 **Versions.** 0.4.0 is what is staged on npm: joins, CTEs, subqueries, EXISTS. **0.5.0 is everything since**: the Tier 1 UDF ABI and the thirteen default functions, the streaming converter, the `facetful` command, `loadCsv`, one `npm install`. **0.6** is the napi addon behind the same command. Tier 2 stays parked.
 </sv-prose>
+
+<sv-prose id="d54">
+## Build log 33 — 0.5.1: the worker never ran under a gate (2026-09-23)
+
+**The bug.** `worker.js` defined `setTable` as a function that called itself instead of `tables.set`, so every table load through the worker — `load`, `loadOpfs`, `openParquet`, `loadParquet`, `materialize`, `loadCsv` — died with "Maximum call stack size exceeded". It shipped in 0.4.0 and again in 0.5.0. Every gate (node-smoke, the parquet differential, the `facetful` command) talks to `core.js` directly; the browser path through `index.js` → worker was exercised only by hand. Fixed in 0.5.1, a one-line change plus the version bump.
+
+**The gate gap is closed.** `node-worker-smoke.mjs` drives `worker.js` in Node through its own message protocol: it supplies `self`, `postMessage` and a file-reading `fetch`, imports the worker, and sends `init`, `load`, `query` (with a ready-made function), `materialize` and a `FROM` on the derived table, a two-table join, `loadCsv` from a buffer, `registerFunction` from source text, and the two error shapes (missing table, SQL error with `isQueryError`). Run against the 0.5.0 worker it fails at `load`. The release gate runs it after the parquet differential. OPFS commands stay untested here (no `navigator.storage` in Node); the browser remains the only place they run.
+
+**Rule.** A module that ships must have a gate that imports *that module*, not the one beneath it.
+</sv-prose>

@@ -11,6 +11,7 @@ cp "$WASM" js/facetful/facetful_wasm.wasm
 
 node js/facetful/node-smoke.mjs
 node js/facetful/node-parquet-diff.mjs
+node js/facetful/node-worker-smoke.mjs   # worker.js through its message protocol
 
 # the command itself: a streamed conversion must reproduce the checked-in image,
 # and a query with a ready-made function must run without flags
