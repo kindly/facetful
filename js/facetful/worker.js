@@ -242,6 +242,10 @@ self.onmessage = async (e) => {
       if (!handle) throw new Error("no table loaded");
       engine.setMaskBudget(handle, e.data.bytes);
       reply({ ok: true });
+    } else if (cmd === "describe") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
+      reply({ ok: true, info: engine.describe(handle) });
     } else if (cmd === "memoryStats") {
       // the worker's whole footprint in one number: wasm linear memory never
       // shrinks, so this is its high-water (image copies, caches, results)
@@ -254,7 +258,7 @@ self.onmessage = async (e) => {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
       const t0 = performance.now();
-      const result = engine.query(handle, e.data.sql, { dictText: e.data.dictText === true });
+      const result = engine.query(handle, e.data.sql, { dictText: e.data.dictText ?? false });
       result.elapsedMs = performance.now() - t0;
       reply({ ok: true, result }, transferables(result));
     } else {

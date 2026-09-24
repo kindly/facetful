@@ -212,6 +212,20 @@ export class Engine {
   }
 
   /** { segments, bytes } currently cached. */
+  /** The table's catalog: { version, rows, groups, target, sortedBy, columns }
+   *  with per-column { name, kind, bytes, nulls, min?, max?, dict? }. */
+  describe(tableHandle) {
+    let n = this.w.table_describe(tableHandle, this.scratch, 4096);
+    if (n <= 4096) return JSON.parse(this.dec.decode(new Uint8Array(this.mem(), this.scratch, n)));
+    const p = u32(this.w.alloc(n));
+    try {
+      n = this.w.table_describe(tableHandle, p, n);
+      return JSON.parse(this.dec.decode(new Uint8Array(this.mem(), p, n)));
+    } finally {
+      this.w.dealloc(p, n);
+    }
+  }
+
   cacheStats(tableHandle) {
     const packed = this.w.table_cache_stats(tableHandle);
     return { segments: Number(packed >> 32n), bytes: Number(packed & 0xffffffffn) * 1024 };
@@ -359,18 +373,23 @@ export class Engine {
   }
 
   /** Run SQL; returns { columns, rowCount, stats } with copied-out buffers.
-   *  `dictText`: a text column backed by a dictionary arrives as `codes`
-   *  (Uint16Array, one per row) + `dict` ({ offsets, bytes }: the distinct
-   *  values present, in dictionary order) instead of a string per row — the
-   *  wasm side never builds the per-row form. Plain text columns are
-   *  unaffected. */
+   *  `dictText`: a text column arrives as `codes` (Uint16Array, or Uint32Array
+   *  past 65,535 values; one per row) + `dict` ({ offsets, bytes }: the
+   *  distinct values present) instead of a string per row. `true`: columns
+   *  that are dictionary-encoded in the image (free — the wasm never builds
+   *  the per-row form; dictionary order). `"all"`: also any other text column
+   *  whose rows are less than half distinct, after a hash pass over its values
+   *  (first-appearance order). */
   query(tableHandle, sql, { dictText = false } = {}) {
+    if (dictText !== false && dictText !== true && dictText !== "all") throw new Error(`dictText: expected true, false or "all", got ${JSON.stringify(dictText)}`);
     const sqlBytes = this.enc.encode(sql);
     const sqlPtr = u32(this.w.alloc(sqlBytes.byteLength));
     new Uint8Array(this.mem(), sqlPtr, sqlBytes.byteLength).set(sqlBytes);
-    // bit 0: keep dictionary columns as codes (every allocation the result
-    // needs happens inside this call; the col_* getters never grow memory)
-    const h = this.w.query_run_opts(tableHandle, sqlPtr, sqlBytes.byteLength, dictText ? 1 : 0);
+    // bit 0: keep dictionary columns as codes; bit 1: encode plain text too
+    // (every allocation the result needs happens inside this call; the
+    // col_* getters never grow memory)
+    const flags = dictText === "all" ? 3 : dictText ? 1 : 0;
+    const h = this.w.query_run_opts(tableHandle, sqlPtr, sqlBytes.byteLength, flags);
     try {
       if (this.w.outcome_is_err(h)) {
         const n = this.w.outcome_error(h, this.scratch, 4096);
@@ -398,11 +417,12 @@ export class Engine {
           const dn = this.w.col_dict_len(h, i);
           if (dn > 0) {
             const codesP = u32(this.w.col_codes_ptr(h, i));
+            const wide = this.w.col_codes_width(h, i) === 4;
             const dictOffP = u32(this.w.col_dict_offsets_ptr(h, i));
             const dictBytesP = u32(this.w.col_dict_bytes_ptr(h, i));
             const dictBytesN = u32(this.w.col_dict_bytes_len(h, i));
             const mem = this.mem();
-            col.codes = new Uint16Array(mem, codesP, rowCount).slice();
+            col.codes = (wide ? new Uint32Array(mem, codesP, rowCount) : new Uint16Array(mem, codesP, rowCount)).slice();
             col.dict = {
               offsets: new Uint32Array(mem, dictOffP, dn + 1).slice(),
               bytes: new Uint8Array(mem, dictBytesP, dictBytesN).slice(),

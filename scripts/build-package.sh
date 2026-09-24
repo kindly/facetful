@@ -23,6 +23,7 @@ node js/facetful/bin/facetful.mjs convert $SPIKE/data-200000.csv "${TMPDIR:-/tmp
 cmp "${TMPDIR:-/tmp}/gate.facetful" $SPIKE/data-200000.facetful
 node js/facetful/bin/facetful.mjs query "${TMPDIR:-/tmp}/gate.facetful" \
   "select count(*) as n from t where regexp(country, '^country_1[0-9]$')" | grep -q "^25947" || { echo "FAIL: facetful command"; exit 1; }
+node js/facetful/bin/facetful.mjs inspect "${TMPDIR:-/tmp}/gate.facetful" | grep -q "^owner .*utf8/dict (u16 codes) .* 1981 values" || { echo "FAIL: facetful inspect"; exit 1; }
 rm -f "${TMPDIR:-/tmp}/gate.facetful"
 echo "facetful command: OK"
 

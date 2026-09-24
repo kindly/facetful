@@ -35,16 +35,35 @@ export interface RawColumn {
   offsets?: Uint32Array;
   /** text only: UTF-8 blob. */
   bytes?: Uint8Array;
-  /** text queried with `dictText`, when the column is dictionary-backed: one
+  /** text queried with `dictText`, when a dictionary pays (see `query`): one
    *  code per row into `dict` (NULL rows per `validity`); `offsets`/`bytes`
-   *  are then absent. Uint32Array is reserved for dictionaries past 65,535. */
+   *  are then absent. Uint32Array when the dictionary has more than 65,535
+   *  values. */
   codes?: Uint16Array | Uint32Array;
-  /** with `codes`: the distinct values present, in dictionary order, laid out
-   *  like a text column (`offsets` has one more entry than there are values). */
+  /** with `codes`: the distinct values present, laid out like a text column
+   *  (`offsets` has one more entry than there are values) — in the image's
+   *  dictionary order for a dictionary column, first appearance otherwise. */
   dict?: { offsets: Uint32Array; bytes: Uint8Array };
 }
 
 export type CellValue = number | string | boolean | null;
+
+export interface TableInfo {
+  version: number;
+  rows: number;
+  groups: number;
+  target: number;
+  sortedBy: { column: string; descending: boolean }[];
+  columns: {
+    name: string;
+    kind: string;
+    bytes: number;
+    nulls: number;
+    min?: number;
+    max?: number;
+    dict?: number;
+  }[];
+}
 
 export declare class Result {
   columns: { name: string; kind: ColumnKind }[];
@@ -185,6 +204,16 @@ export declare class Facetful {
   cacheStats(options?: { table?: string }): Promise<{ segments: number; bytes: number }>;
 
   /**
+   * A loaded table's catalog (what `facetful inspect` prints): total rows,
+   * row-group count and target, the sort keys the image records, and per
+   * column its kind as the converter names it ("int32", "float64", "utf8",
+   * "utf8/dict (u16 codes)", "date", …), on-disk bytes across all row groups,
+   * null count, min/max folded over the row groups (numeric columns), and
+   * the dictionary's entry count (dictionary columns).
+   */
+  describe(options?: { table?: string }): Promise<TableInfo>;
+
+  /**
    * The worker's wasm memory size in bytes and the number of tables it holds.
    * Wasm linear memory never shrinks, so `wasmBytes` is the worker's
    * high-water mark: image copies, segment and mask caches, and the largest
@@ -201,14 +230,18 @@ export declare class Facetful {
    * table by name, defaulting to the most recently loaded. Rejects with an
    * Error whose message is a rendered diagnostic (caret + hint) on SQL errors.
    *
-   * `dictText`: a text column that is dictionary-encoded in the image (and
-   * selected as-is) comes back as `codes` + `dict` on `columnRaw` instead of
-   * one string per row — for a 1.5M-row result over a 372-value column that is
-   * 3 MB instead of 52 MB, and nothing per row is built or copied. `rows()`,
-   * `column()` and `dictionary()` decode it; existing `columnRaw` readers only
-   * see a change when they pass the option.
+   * `dictText`: text columns come back as `codes` + `dict` on `columnRaw`
+   * instead of one string per row. `true` does it for columns that are
+   * dictionary-encoded in the image and selected as-is — free, since the
+   * per-row form is never built: a 1.5M-row result over a 372-value column is
+   * 3 MB instead of 52 MB. `"all"` also encodes any other text column whose
+   * rows are less than half distinct, after a hash pass over its values that
+   * costs about 100 ms per million rows per column (a 664K-value title column
+   * over 1.5M rows: 62 MB → 38 MB). `rows()`, `column()` and `dictionary()`
+   * decode either; existing `columnRaw` readers only see a change when they
+   * pass the option.
    */
-  query(sql: string, options?: { table?: string; dictText?: boolean }): Promise<Result>;
+  query(sql: string, options?: { table?: string; dictText?: boolean | "all" }): Promise<Result>;
 
   /** Terminate the worker. */
   close(): void;

@@ -52,6 +52,9 @@ window.__smoke = (async () => {
     await step("removeOpfs", () => db.removeOpfs("smoke/t.facetful"));
     await step("registerFunction", () => db.registerFunction("twice", { params: ["int"], returns: "int", perRow: true }, (x) => x * 2));
     eq((await db.query("select twice(count(*)) as n from t", { table: "t" })).column("n")[0], 400000, "registered function");
+    const info = await step("describe", () => db.describe({ table: "t" }));
+    eq(info.rows, 200000, "describe rows");
+    eq(info.columns.find((c) => c.name === "country").dict, 200, "describe dictionary size");
     const mem = await step("memoryStats", () => db.memoryStats());
     if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 4) throw new Error("memoryStats: " + JSON.stringify(mem));
     let msg = "";

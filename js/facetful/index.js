@@ -147,6 +147,13 @@ export class Facetful {
   }
 
   /** { segments, bytes } currently held by a table's segment cache. */
+  /** A loaded table's catalog: rows, row groups, sort keys, and per column its
+   *  kind, on-disk bytes, null count, min/max and dictionary size. */
+  async describe({ table } = {}) {
+    const { info } = await this._call({ cmd: "describe", table });
+    return info;
+  }
+
   /** The worker's wasm memory size in bytes (its high-water: wasm memory never
    *  shrinks) and how many tables it holds. For reporting a page's memory
    *  split between the worker and the page's own result buffers. */
@@ -166,8 +173,10 @@ export class Facetful {
   }
 
   /** Run SQL. `table` selects a loaded table (defaults to the last loaded).
-   *  `dictText`: text columns backed by a dictionary come back as codes + a
-   *  dictionary on `columnRaw` (rows()/column() still return strings). */
+   *  `dictText` (true | "all"): text columns come back as codes + a dictionary
+   *  on `columnRaw` — true for the image's dictionary columns (free), "all"
+   *  for any text column where that pays (a hash pass); rows()/column() still
+   *  return strings. */
   async query(sql, { table, dictText } = {}) {
     const { result } = await this._call({ cmd: "query", sql, table, dictText });
     return new Result(result);

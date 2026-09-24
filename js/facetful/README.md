@@ -31,6 +31,7 @@ One install gives the browser library **and** the `facetful` command:
 npm install facetful
 npx facetful convert data.csv data.facetful        # streaming: any file size, ~20 MB of memory
 npx facetful query data.facetful "select country, count(*) as n from t group by country order by n desc limit 5"
+npx facetful inspect data.facetful      # rows, row groups, sort keys; per column kind, bytes, nulls, range or dictionary size
 ```
 
 The command runs the same wasm engine the browser does (Node is the second
@@ -59,10 +60,12 @@ const r = await db.query(`
 for (const row of r.rows()) console.log(row);
 r.columnRaw("mw"); // Float64Array + validity bitmap, near-zero copy (charts)
 
-// big results: a dictionary-encoded text column as codes + dictionary, not a string per row
+// big results: text as codes + dictionary, not a string per row — `true` for the image's
+// dictionary columns (free), "all" to also encode other text columns where that pays (a hash pass)
 const big = await db.query("select country, mw from t", { dictText: true });
 big.columnRaw("country"); // { codes: Uint16Array, dict: { offsets, bytes }, validity }
 big.dictionary("country"); // the decoded distinct values, indexed by code
+await db.describe(); // the table's catalog: rows, groups, per-column kind / bytes / nulls / min-max / dictionary size
 await db.memoryStats(); // { wasmBytes, tables }: the worker's memory high-water, from the page
 console.log(r.elapsedMs, r.stats); // ms in worker, row groups pruned
 ```

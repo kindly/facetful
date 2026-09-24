@@ -307,6 +307,86 @@ pub extern "C" fn table_total_rows(t: usize) -> u32 {
 }
 
 /// Column index by name; -1 if absent.
+fn json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// The table's catalog as JSON: `{version, rows, groups, target, sortedBy:
+/// [{column, descending}], columns: [{name, kind, bytes, nulls, min?, max?,
+/// dict?}]}` — kind as the converter reports it, bytes the column's on-disk
+/// total across groups, min/max folded over every group's stats, dict the
+/// dictionary's entry count. Returns the full length; when it exceeds `cap`
+/// nothing is written and the caller retries with a bigger buffer.
+#[no_mangle]
+pub extern "C" fn table_describe(t: usize, out: *mut u8, cap: usize) -> u32 {
+    use facetful_engine::format::Stats;
+    let t = unsafe { &mut *(t as *mut T) };
+    let cat = t.catalog().clone(); // dictionary sizes below need `t` mutably
+    let kinds = facetful_engine::format::compile::describe(&cat.schema);
+    let mut s = String::new();
+    s.push_str(&format!(
+        "{{\"version\":{},\"rows\":{},\"groups\":{},\"target\":{},\"sortedBy\":[",
+        cat.version, cat.total_rows, cat.groups.len(), cat.row_group_target
+    ));
+    for (i, k) in cat.sorted_by.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str("{\"column\":");
+        json_str(&mut s, &cat.schema.columns[k.column as usize].name);
+        s.push_str(&format!(",\"descending\":{}}}", k.descending));
+    }
+    s.push_str("],\"columns\":[");
+    for (ci, c) in cat.schema.columns.iter().enumerate() {
+        if ci > 0 { s.push(','); }
+        let bytes: u64 = cat.groups.iter().map(|g| g.cols[ci].seg_lens.iter().map(|&l| l as u64).sum::<u64>()).sum();
+        let nulls: u64 = cat.groups.iter().map(|g| g.cols[ci].null_count as u64).sum();
+        let mut lo: Option<f64> = None;
+        let mut hi: Option<f64> = None;
+        let mut ints = false;
+        for g in &cat.groups {
+            let (a, b) = match g.cols[ci].stats {
+                Stats::Int { min, max } => { ints = true; (min as f64, max as f64) }
+                Stats::Float { min, max } => (min, max),
+                Stats::None => continue,
+            };
+            lo = Some(lo.map_or(a, |x: f64| x.min(a)));
+            hi = Some(hi.map_or(b, |x: f64| x.max(b)));
+        }
+        s.push_str("{\"name\":");
+        json_str(&mut s, &c.name);
+        s.push_str(",\"kind\":");
+        json_str(&mut s, &kinds[ci]);
+        s.push_str(&format!(",\"bytes\":{bytes},\"nulls\":{nulls}"));
+        if let (Some(a), Some(b)) = (lo, hi) {
+            if a.is_finite() && b.is_finite() {
+                if ints { s.push_str(&format!(",\"min\":{},\"max\":{}", a as i64, b as i64)); }
+                else { s.push_str(&format!(",\"min\":{a},\"max\":{b}")); }
+            }
+        }
+        if c.is_dict() {
+            let n = t.dictionary(ci).map(|d| d.len()).unwrap_or(0);
+            s.push_str(&format!(",\"dict\":{n}"));
+        }
+        s.push('}');
+    }
+    s.push_str("]}");
+    if s.len() <= cap {
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), out, s.len()) };
+    }
+    s.len() as u32
+}
+
 #[no_mangle]
 pub extern "C" fn table_col_by_name(t: usize, name_ptr: *const u8, name_len: usize) -> i32 {
     let t = unsafe { &*(t as *const T) };
@@ -522,6 +602,9 @@ pub struct ColBuf {
     /// a getter that allocates can grow the memory after JS has taken its
     /// view of it, and a grown memory detaches that view.
     codes: Vec<u16>,
+    /// codes wider than u16: a plain text column encoded here with more than
+    /// 65,535 distinct values (`col_codes_width` says which vector is live)
+    codes32: Vec<u32>,
     dict_offsets: Vec<u32>,
     dict_bytes: Vec<u8>,
 }
@@ -532,6 +615,96 @@ impl ColBuf {
     }
 }
 
+/// 64-bit word-at-a-time multiply-xor hash of a byte string. The map below is
+/// keyed by this value through an identity hasher: probing compares 8-byte
+/// keys, not byte slices, and every string is hashed exactly once.
+fn str_hash(bytes: &[u8]) -> u64 {
+    let mut h = 0x243F_6A88_85A3_08D3u64 ^ (bytes.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(0x100_0000_01B3).rotate_left(31);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..rest.len()].copy_from_slice(rest);
+        h = (h ^ u64::from_le_bytes(buf)).wrapping_mul(0x100_0000_01B3).rotate_left(31);
+    }
+    h ^= h >> 32;
+    h.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (h >> 29)
+}
+
+#[derive(Default)]
+struct Identity(u64);
+impl core::hash::Hasher for Identity {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("keys are u64")
+    }
+    fn write_u64(&mut self, k: u64) {
+        self.0 = k;
+    }
+}
+
+/// Dictionary-encode a per-row text column when that pays (the compiler's
+/// rule: fewer distinct values than half the rows): `(codes, dict offsets,
+/// dict bytes)` in first-appearance order, NULL rows as code 0. Gives up
+/// early: when a probe of 4,096 rows spread evenly over the column finds
+/// nine in ten distinct (an identifier column costs the probe, not half a
+/// pass — spread, because a result sorted by date can look unique at its
+/// head and repeat everywhere else), and the moment the distinct count
+/// proves the rule cannot hold. A 64-bit hash collision between two
+/// different strings gives up too, so the encoding is exact.
+fn encode_text(offsets: &[u32], bytes: &[u8], valid: &[u8], rows: usize) -> Option<(Vec<u32>, Vec<u32>, Vec<u8>)> {
+    use std::collections::HashMap;
+    const PROBE: usize = 4096;
+    if rows > PROBE * 2 {
+        let mut set: HashMap<u64, (), core::hash::BuildHasherDefault<Identity>> =
+            HashMap::with_capacity_and_hasher(PROBE + 16, Default::default());
+        let mut probed = 0usize;
+        for k in 0..PROBE {
+            let i = k * (rows / PROBE);
+            if valid[i / 8] >> (i % 8) & 1 != 0 {
+                set.insert(str_hash(&bytes[offsets[i] as usize..offsets[i + 1] as usize]), ());
+                probed += 1;
+            }
+        }
+        if probed > 0 && set.len() * 10 > probed * 9 {
+            return None;
+        }
+    }
+    let mut index: HashMap<u64, u32, core::hash::BuildHasherDefault<Identity>> =
+        HashMap::with_capacity_and_hasher((rows / 4).min(1 << 20) + 16, Default::default());
+    let mut codes = Vec::with_capacity(rows);
+    let mut doffs = vec![0u32];
+    let mut dbytes = Vec::new();
+    for i in 0..rows {
+        if valid[i / 8] >> (i % 8) & 1 == 0 {
+            codes.push(0);
+            continue;
+        }
+        let s = &bytes[offsets[i] as usize..offsets[i + 1] as usize];
+        let next = index.len() as u32;
+        let code = *index.entry(str_hash(s)).or_insert(next);
+        if code == next {
+            if index.len() * 2 > rows {
+                return None; // more than half distinct already: cannot pay
+            }
+            dbytes.extend_from_slice(s);
+            doffs.push(dbytes.len() as u32);
+        } else {
+            let (a, b) = (doffs[code as usize] as usize, doffs[code as usize + 1] as usize);
+            if &dbytes[a..b] != s {
+                return None; // hash collision: leave the column as text
+            }
+        }
+        codes.push(code);
+    }
+    Some((codes, doffs, dbytes))
+}
+
 pub enum Outcome {
     Ok { cols: Vec<ColBuf>, rows: usize, scanned: u32, total: u32 },
     Err(String),
@@ -539,7 +712,7 @@ pub enum Outcome {
     Image(Vec<u8>),
 }
 
-fn columnize(mut r: QueryResult, keep_dict: bool) -> Outcome {
+fn columnize(mut r: QueryResult, keep_dict: bool, encode: bool) -> Outcome {
     // columnar channel: typed vectors move straight into ColBufs (near-memcpy)
     if let Some(out_cols) = r.cols.take() {
         use facetful_engine::sql::binder::Ty;
@@ -561,6 +734,7 @@ fn columnize(mut r: QueryResult, keep_dict: bool) -> Outcome {
                 bytes: Vec::new(),
                 validity: Vec::new(),
                 codes: Vec::new(),
+                codes32: Vec::new(),
                 dict_offsets: Vec::new(),
                 dict_bytes: Vec::new(),
             };
@@ -582,8 +756,23 @@ fn columnize(mut r: QueryResult, keep_dict: bool) -> Outcome {
                 }
                 OutCol::Text { offsets, bytes, valid } => {
                     c.kind = 4;
-                    c.offsets = offsets;
-                    c.bytes = bytes;
+                    // flag bit 1: a plain text column is encoded here when
+                    // fewer than half its rows are distinct (d58)
+                    match if encode && rows >= 16 { encode_text(&offsets, &bytes, &valid, rows) } else { None } {
+                        Some((codes, doffs, dbytes)) => {
+                            if doffs.len() - 1 <= u16::MAX as usize {
+                                c.codes = codes.iter().map(|&x| x as u16).collect();
+                            } else {
+                                c.codes32 = codes;
+                            }
+                            c.dict_offsets = doffs;
+                            c.dict_bytes = dbytes;
+                        }
+                        None => {
+                            c.offsets = offsets;
+                            c.bytes = bytes;
+                        }
+                    }
                     c.validity = valid;
                 }
                 OutCol::Dict { codes, dict, valid } if keep_dict => {
@@ -657,6 +846,7 @@ fn columnize(mut r: QueryResult, keep_dict: bool) -> Outcome {
             bytes: Vec::new(),
             validity: vec![0u8; (rows + 7) / 8],
             codes: Vec::new(),
+            codes32: Vec::new(),
             dict_offsets: Vec::new(),
             dict_bytes: Vec::new(),
         };
@@ -697,12 +887,14 @@ pub extern "C" fn query_run(t: usize, sql_ptr: *const u8, sql_len: usize) -> usi
 }
 
 /// `query_run` with flags: bit 0 keeps dictionary text columns as codes +
-/// a compacted dictionary (`col_dict_len` > 0) instead of expanding them.
-/// Every allocation the result needs happens here, so the `col_*` getters
-/// never grow the memory under a JS view of it.
+/// a compacted dictionary (`col_dict_len` > 0) instead of expanding them;
+/// bit 1 also dictionary-encodes plain text columns when that pays (a hash
+/// pass over their values). Every allocation the result needs happens here,
+/// so the `col_*` getters never grow the memory under a JS view of it.
 #[no_mangle]
 pub extern "C" fn query_run_opts(t: usize, sql_ptr: *const u8, sql_len: usize, flags: u32) -> usize {
     let keep_dict = flags & 1 != 0;
+    let encode_text = flags & 2 != 0;
     let t_handle = t;
     let t = unsafe { &mut *(t as *mut T) };
     let sql = unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) };
@@ -711,7 +903,7 @@ pub extern "C" fn query_run_opts(t: usize, sql_ptr: *const u8, sql_len: usize, f
         Ok(sql) => match run_query_with(t, sql, &mut WasmCatalog { base: t_handle }) {
             Ok(r) => {
                 let (sg, tg) = (r.scanned_groups as u32, r.total_groups as u32);
-                match columnize(r, keep_dict) {
+                match columnize(r, keep_dict, encode_text) {
                     Outcome::Ok { cols, rows, .. } => {
                         Outcome::Ok { cols, rows, scanned: sg, total: tg }
                     }
@@ -863,10 +1055,18 @@ pub extern "C" fn col_dict_len(h: usize, i: usize) -> u32 {
     col(h, i).map_or(0, |c| c.dict_len() as u32)
 }
 
-/// One u16 code per row (valid when `col_dict_len` > 0).
+/// Bytes per code: 2 or 4 (0 when the column has no codes).
 #[no_mangle]
-pub extern "C" fn col_codes_ptr(h: usize, i: usize) -> *const u16 {
-    col(h, i).map_or(core::ptr::null(), |c| c.codes.as_ptr())
+pub extern "C" fn col_codes_width(h: usize, i: usize) -> u32 {
+    col(h, i).map_or(0, |c| if !c.codes32.is_empty() { 4 } else if !c.codes.is_empty() { 2 } else { 0 })
+}
+
+/// One code per row, `col_codes_width` bytes each (valid when `col_dict_len` > 0).
+#[no_mangle]
+pub extern "C" fn col_codes_ptr(h: usize, i: usize) -> *const u8 {
+    col(h, i).map_or(core::ptr::null(), |c| {
+        if !c.codes32.is_empty() { c.codes32.as_ptr() as *const u8 } else { c.codes.as_ptr() as *const u8 }
+    })
 }
 
 #[no_mangle]

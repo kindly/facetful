@@ -3,6 +3,7 @@
 // d51): one `npm install facetful` gives the library and this.
 //
 //   facetful convert in.csv out.facetful [--row-group-size N]
+//   facetful inspect file.facetful [--json]
 //   facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
 //   facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf …]
 //
@@ -20,6 +21,7 @@ const args = process.argv.slice(2);
 const cmd = args.shift();
 const usage = () => {
   console.error(`usage: facetful convert in.csv out.facetful [--row-group-size N]
+       facetful inspect file.facetful [--json]
        facetful query file.facetful ["select …"] [--table name=path.facetful …] [--udf module.mjs …]
        facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf module.mjs …]`);
   process.exit(2);
@@ -54,16 +56,42 @@ async function registerUdfs(paths) {
 /** Split flags out of a positional list: --table name=path, --udf path, --row-group-size N. */
 function parse(argv) {
   const pos = [], tables = [], udfs = [];
-  let groupSize = 65536;
+  let groupSize = 65536, json = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--table") tables.push(argv[++i]);
     else if (a === "--udf") udfs.push(argv[++i]);
     else if (a === "--row-group-size") groupSize = Number(argv[++i]);
+    else if (a === "--json") json = true;
     else if (a.startsWith("--")) usage();
     else pos.push(a);
   }
-  return { pos, tables, udfs, groupSize };
+  return { pos, tables, udfs, groupSize, json };
+}
+
+const human = (n) => n >= 1 << 30 ? `${(n / (1 << 30)).toFixed(2)} GB` : n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : n >= 1024 ? `${(n / 1024).toFixed(0)} KB` : `${n} B`;
+
+/** `facetful inspect`: the image's catalog, as a table or as JSON. */
+function inspect(path, json) {
+  const { handle } = openLazy(path);
+  const info = engine.describe(handle);
+  if (json) return console.log(JSON.stringify(info, null, 2));
+  const size = fstatSync(fds.get(nextId - 1)).size;
+  console.log(`${path}: ${human(size)}, format v${info.version}, ${info.rows} rows, ${info.groups} row group${info.groups === 1 ? "" : "s"} (target ${info.target})`);
+  if (info.sortedBy.length) console.log(`sorted by: ${info.sortedBy.map((k) => k.column + (k.descending ? " desc" : "")).join(", ")}`);
+  const range = (c) => {
+    if (c.dict !== undefined) return `${c.dict} values`;
+    if (c.min === undefined) return "";
+    const f = c.kind === "date" ? isoDate : c.kind === "timestamp" ? isoTs : String;
+    return `${f(c.min)} … ${f(c.max)}`;
+  };
+  const rows = info.columns.map((c) => [c.name, c.kind, human(c.bytes), c.nulls ? String(c.nulls) : "", range(c)]);
+  const head = ["column", "kind", "bytes", "nulls", "range / dictionary"];
+  const widths = head.map((h, j) => Math.max(h.length, ...rows.map((r) => r[j].length)));
+  const line = (cells) => cells.map((s, j) => j === 2 ? s.padStart(widths[j]) : s.padEnd(widths[j])).join("  ");
+  console.log(line(head));
+  console.log(widths.map((w) => "-".repeat(w)).join("  "));
+  for (const r of rows) console.log(line(r));
 }
 
 const text = (c, i) => engine.dec.decode(c.bytes.subarray(c.offsets[i], c.offsets[i + 1]));
@@ -143,6 +171,10 @@ try {
     const { pos, groupSize } = parse(args);
     if (pos.length !== 2) usage();
     convert(pos[0], pos[1], groupSize);
+  } else if (cmd === "inspect") {
+    const { pos, json } = parse(args);
+    if (pos.length !== 1) usage();
+    inspect(pos[0], json);
   } else if (cmd === "query" || cmd === "materialize") {
     const { pos, tables, udfs } = parse(args);
     if (pos.length < 1) usage();

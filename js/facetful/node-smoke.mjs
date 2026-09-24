@@ -241,6 +241,12 @@ try {
   const c = d.columns[0];
   if (!c.codes || c.codes.length !== d.rowCount || !c.dict || c.offsets) throw new Error("dictText: country should be codes + dict");
   if (d.columns[1].codes || !d.columns[1].offsets) throw new Error("dictText: a computed text column stays per-row text");
+  const enc = engine.query(handle, "select owner || '' as o from t limit 20000", { dictText: "all" }).columns[0];
+  if (!enc.codes || enc.dict.offsets.length - 1 > 1981 || enc.codes.BYTES_PER_ELEMENT !== 2) throw new Error('dictText "all": low-cardinality computed text is encoded');
+  const uniq = engine.query(handle, "select country || '-' || id as u from t limit 20000", { dictText: "all" }).columns[0];
+  if (uniq.codes || !uniq.offsets) throw new Error('dictText "all": unique text is left as text');
+  const same = engine.query(handle, "select owner || '' as o from t limit 20000", { dictText: true }).columns[0];
+  if (same.codes) throw new Error("dictText true: computed text stays per-row text");
   const dn = c.dict.offsets.length - 1;
   const strs = Array.from({ length: dn }, (_, k) => dec.decode(c.dict.bytes.subarray(c.dict.offsets[k], c.dict.offsets[k + 1])));
   const distinct = new Set();

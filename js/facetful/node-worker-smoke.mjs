@@ -81,6 +81,15 @@ r = await ok({ cmd: "query", table: "t", sql: "select twice(count(*)) as n from 
 if (r.result.columns[0].values[0] !== 400000) throw new Error("registered function");
 if (!(await ok({ cmd: "unregisterFunction", name: "twice" })).ok) throw new Error("unregister");
 
+// describe: the catalog of a loaded table
+{
+  const { info } = await ok({ cmd: "describe", table: "t" });
+  const country = info.columns.find((c) => c.name === "country");
+  if (info.rows !== 200000 || info.groups !== 4 || country.kind !== "utf8/dict (u8 codes)" || country.dict !== 200) throw new Error(`describe ${JSON.stringify(info).slice(0, 200)}`);
+  const cap = info.columns.find((c) => c.name === "capacity");
+  if (cap.nulls !== 5983 || cap.min !== 0.1) throw new Error(`describe stats ${JSON.stringify(cap)}`);
+}
+
 // memoryStats: the worker's wasm high-water and table count
 {
   const m = await ok({ cmd: "memoryStats" });
