@@ -1245,5 +1245,14 @@ The handoff measured 508 vs 79; the 430 ms it worked around is gone. Without a L
 
 **Repo hygiene.** Twenty-two empty files — `.bashrc`, `.gitconfig`, `.zshrc`, `.mcp.json`, the `.claude/…` entries — had been tracked since the first commit: a sandboxed `git add -A` saw the sandbox's `/dev/null` masks of those home-directory paths as empty files. Untracked and ignored by name; `.gitmodules` among them was also why git warned "unable to access .gitmodules" on every command.
 
-**Size.** 258,977 gz unoptimized: +4.1 KB for this step (the hash pass, the probe, `table_describe`), +12.9 KB since 0.5.1 before wasm-opt — about 82% of budget optimized. The release is what the tree holds: d54–d58.
+**Size, measured optimized** (binaryen 119 fetched back onto the machine; each commit rebuilt in a worktree, the 0.5.1 baseline reproducing its recorded 240,543 exactly):
+
+| commit | gz optimized | step |
+|---|---|---|
+| 0.5.1 | 240,543 | |
+| d56: dictionary results + windowed projection | 247,622 | +7.1 KB |
+| d57: text gathers off the image, `query_run_opts` | 249,908 | +2.3 KB |
+| d58: `"all"`, `table_describe` | 254,469 | +4.6 KB |
+
+**+13.9 KB for the release, 82.8% of budget.** The unoptimized deltas in d56–d58 (+7.1, +1.7, +4.1) were close on the whole but not per step: wasm-opt recovers less of the new code than of the old. David found the jump larger than expected; the history says it is the same size as the last one — 0.4.0 → 0.5.0 was +14.6 KB (the UDF ABI 7.3, the streaming converter 7.4), 0.3 → 0.4 about +30 (joins, CTEs, subqueries, EXISTS). Two releases at ~14 KB each is the rate; three more at that rate hit the budget. Where the bytes are, by inspection: the generic `project`/`gather_segments`/`gather_ctx` monomorphize once per table source type, the two hashbrown instantiations for the encoder and its probe, and `table_describe`'s string building. Candidates if a trim is wanted later: one map type for probe and encoder (~1 KB), `describe` emitting a compact binary the JS formats instead of JSON (~1 KB), and the lite-build gate that has been on the list since d51 for callers who want none of the UDF, converter or dictionary machinery. The release is what the tree holds: d54–d58.
 </sv-prose>
