@@ -916,6 +916,60 @@ pub extern "C" fn query_run_opts(t: usize, sql_ptr: *const u8, sql_len: usize, f
     Box::into_raw(Box::new(outcome)) as usize
 }
 
+/// Several statements in one call (design.sv d59): `sql_ptr..sql_len` holds
+/// them separated by NUL. Statements the fused kernel can run share masks
+/// and lanes; the rest run one by one. Returns a batch handle: `batch_len`
+/// outcomes, each taken with `batch_outcome` (an ordinary outcome handle the
+/// caller frees with `outcome_free`), then `batch_free`.
+#[no_mangle]
+pub extern "C" fn query_batch(t: usize, sql_ptr: *const u8, sql_len: usize, flags: u32) -> usize {
+    let keep_dict = flags & 1 != 0;
+    let encode_text = flags & 2 != 0;
+    let t_handle = t;
+    let t = unsafe { &mut *(t as *mut T) };
+    let bytes = unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) };
+    let outcomes: Vec<usize> = match core::str::from_utf8(bytes) {
+        Err(_) => vec![Box::into_raw(Box::new(Outcome::Err("query is not valid UTF-8".into()))) as usize],
+        Ok(all) => {
+            let srcs: Vec<&str> = all.split('\0').collect();
+            facetful_engine::sql::run_batch_with(t, &srcs, &mut WasmCatalog { base: t_handle })
+                .into_iter()
+                .zip(&srcs)
+                .map(|(r, src)| {
+                    let o = match r {
+                        Ok(r) => {
+                            let (sg, tg) = (r.scanned_groups as u32, r.total_groups as u32);
+                            match columnize(r, keep_dict, encode_text) {
+                                Outcome::Ok { cols, rows, .. } => Outcome::Ok { cols, rows, scanned: sg, total: tg },
+                                e => e,
+                            }
+                        }
+                        Err(d) => Outcome::Err(d.render(src)),
+                    };
+                    Box::into_raw(Box::new(o)) as usize
+                })
+                .collect()
+        }
+    };
+    Box::into_raw(Box::new(outcomes)) as usize
+}
+
+#[no_mangle]
+pub extern "C" fn batch_len(h: usize) -> u32 {
+    unsafe { &*(h as *const Vec<usize>) }.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn batch_outcome(h: usize, i: usize) -> usize {
+    unsafe { &*(h as *const Vec<usize>) }.get(i).copied().unwrap_or(0)
+}
+
+/// Frees the list only; each outcome is freed by its reader.
+#[no_mangle]
+pub extern "C" fn batch_free(h: usize) {
+    drop(unsafe { Box::from_raw(h as *mut Vec<usize>) });
+}
+
 fn outcome(h: usize) -> &'static Outcome {
     unsafe { &*(h as *const Outcome) }
 }

@@ -265,4 +265,25 @@ try {
   console.log(`dict results: OK (${d.rowCount} rows, ${dn} values; ${(bytesText / 1e6).toFixed(1)} MB as text -> ${(bytesNow / 1e6).toFixed(2)} MB as codes)`);
 }
 
+// a batch (d59): fused members equal the same statements run alone; errors name the statement
+{
+  const sqls = [
+    "select country, count(*) as n, sum(capacity) as mw from t where status in ('status_0','status_1') and fuel = 'fuel_2' group by country order by n desc, country limit 30",
+    "select status, count(*) as n from t where fuel = 'fuel_2' and country like 'country_1%' group by status order by status",
+    "select count(*) as n, sum(capacity) as mw, count(capacity) as k from t where status in ('status_0','status_1') and fuel = 'fuel_2'",
+    "select upper(fuel) as f, count(*) as n from t group by upper(fuel) order by f",
+  ];
+  const batch = engine.queryBatch(handle, sqls);
+  const cells = (r) => { const out = []; for (let i = 0; i < r.rowCount; i++) out.push(r.columns.map((c) => c.kind === "text" ? ((c.validity[i >> 3] >> (i & 7)) & 1 ? text(c, i) : null) : c.values[i]).join("|")); return out.join("\n"); };
+  sqls.forEach((sql, i) => { const one = engine.query(handle, sql); if (cells(one) !== cells(batch[i])) throw new Error(`batch statement ${i} differs from the single run`); });
+  const dt = engine.queryBatch(handle, [sqls[0]], { dictText: true })[0].columns[0];
+  if (!dt.codes || !dt.dict) throw new Error("batch: dictText applies to fused results");
+  let msg = "";
+  try { engine.queryBatch(handle, [sqls[0], "select nope from t"]); } catch (e) { msg = e.message; }
+  if (!/^statement 1: .*unknown column 'nope'/s.test(msg)) throw new Error(`batch error: ${msg}`);
+  const t0 = performance.now(); for (let i = 0; i < 10; i++) engine.queryBatch(handle, sqls.slice(0, 3)); const tb = (performance.now() - t0) / 10;
+  const t1 = performance.now(); for (let i = 0; i < 10; i++) for (const s of sqls.slice(0, 3)) engine.query(handle, s); const ts = (performance.now() - t1) / 10;
+  console.log(`batch: OK (3 fused + 1 ordinary; fused ${tb.toFixed(2)} ms vs one by one ${ts.toFixed(2)} ms)`);
+}
+
 console.log("js protocol smoke: OK");

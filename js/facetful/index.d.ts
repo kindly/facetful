@@ -249,6 +249,19 @@ export declare class Facetful {
    * pass the option.
    */
   query(sql: string, options?: { table?: string; dictText?: boolean | "all" }): Promise<Result>;
+  /**
+   * Several statements in one call: one worker message, one engine call, and
+   * the statements a facet UI sends — single table, at most one dictionary
+   * GROUP BY key, `count(*)` / `count(col)` / `sum(col)` items, any WHERE,
+   * ORDER BY over the select items, LIMIT/OFFSET — run fused: the WHERE masks
+   * and column lanes are shared and each statement is one pass over them.
+   * Anything else in the array runs as it would alone, in order. Results
+   * come back in order, identical to running each statement by itself. A
+   * failing statement rejects the whole call with a diagnostic that names
+   * its index. Send a facet panel's whole refresh this way: on a 1.5M-row
+   * table eight facets plus totals went from 41 ms to 15 ms of engine time.
+   */
+  query(sqls: string[], options?: { table?: string; dictText?: boolean | "all" }): Promise<Result[]>;
 
   /** Terminate the worker. */
   close(): void;

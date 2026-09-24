@@ -254,6 +254,14 @@ self.onmessage = async (e) => {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
       reply({ ok: true, ...engine.cacheStats(handle) });
+    } else if (cmd === "queryBatch") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
+      const t0 = performance.now();
+      const results = engine.queryBatch(handle, e.data.sqls, { dictText: e.data.dictText ?? false });
+      const elapsedMs = performance.now() - t0;
+      for (const r of results) r.elapsedMs = elapsedMs;
+      reply({ ok: true, results }, results.flatMap(transferables));
     } else if (cmd === "query") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);

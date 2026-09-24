@@ -68,6 +68,84 @@ pub fn run_query_with<S: ReadAt>(
     execute_sql_with(table, src, cat).map(|(_, r)| r)
 }
 
+/// Several statements at once (design.sv d59): the ones the fused kernel can
+/// run — single-table, at most one dictionary GROUP BY key, count/sum items,
+/// any WHERE — share masks and lanes and run as one pass each; the others
+/// run one by one as `run_query_with` would. Results come back in order,
+/// each with its own diagnostic on failure.
+pub fn run_batch_with<S: ReadAt>(
+    table: &mut Table<S>,
+    srcs: &[&str],
+    cat: &mut dyn Catalog<S>,
+) -> Vec<Result<exec::QueryResult, Diagnostic>> {
+    fn has_in(e: &ast::Expr) -> bool {
+        match e {
+            ast::Expr::InSubquery { .. } => true,
+            ast::Expr::Call { args, .. } => args.iter().any(has_in),
+            ast::Expr::Unary { expr, .. } => has_in(expr),
+            ast::Expr::Binary { lhs, rhs, .. } => has_in(lhs) || has_in(rhs),
+            _ => false,
+        }
+    }
+    let mut out: Vec<Option<Result<exec::QueryResult, Diagnostic>>> = (0..srcs.len()).map(|_| None).collect();
+    // parse and bind what may fuse: plain single-table statements
+    let schema = table.catalog().schema.clone();
+    let mut bound: Vec<(usize, binder::BoundQuery, span::Span)> = Vec::new();
+    for (i, src) in srcs.iter().enumerate() {
+        let q = match parse_query(src) {
+            Ok(q) => q,
+            Err(d) => {
+                out[i] = Some(Err(d));
+                continue;
+            }
+        };
+        let simple = q.with.is_empty()
+            && q.from_subquery.is_none()
+            && q.joins.is_empty()
+            && !q.filter.as_ref().is_some_and(has_in)
+            && resolve_name(&q.from, &[], cat) == Target::Base;
+        if simple {
+            match binder::Binder::new(&schema).bind_query(&q) {
+                Ok(b) => bound.push((i, b, q.span)),
+                Err(d) => out[i] = Some(Err(d)),
+            }
+        }
+    }
+    let refs: Vec<&binder::BoundQuery> = bound.iter().map(|(_, b, _)| b).collect();
+    crate::udf::take_error();
+    match exec::execute_batch(table, &refs) {
+        Ok(results) => {
+            let udf_err = crate::udf::take_error();
+            for ((i, _, sp), r) in bound.iter().zip(results) {
+                if let Some(r) = r {
+                    out[*i] = Some(match &udf_err {
+                        Some(e) => Err(Diagnostic::new(format!("user-defined function failed: {e}"), *sp)),
+                        None => Ok(r),
+                    });
+                }
+            }
+            if udf_err.is_some() {
+                table.masks().clear();
+            }
+        }
+        Err(e) => {
+            for (i, _, sp) in &bound {
+                out[*i] = Some(Err(Diagnostic::new(format!("execution error: {e}"), *sp)));
+            }
+        }
+    }
+    // everything else, in order, the ordinary way
+    out.into_iter()
+        .enumerate()
+        .map(|(i, r)| r.unwrap_or_else(|| run_query_with(table, srcs[i], cat)))
+        .collect()
+}
+
+/// `run_batch_with` over the table alone.
+pub fn run_batch<S: ReadAt>(table: &mut Table<S>, srcs: &[&str]) -> Vec<Result<exec::QueryResult, Diagnostic>> {
+    run_batch_with(table, srcs, &mut NoCatalog)
+}
+
 /// `run_query`, also returning the final query as bound — its column names,
 /// types and ORDER BY are what `materialize` records about the result.
 pub fn execute_sql<S: ReadAt>(

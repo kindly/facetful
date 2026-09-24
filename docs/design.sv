@@ -1298,3 +1298,26 @@ Engine time only; in a page the SQL path also pays nine worker round trips again
 
 **Not in 0.6** (d58 closed that release); the next item after it.
 </sv-prose>
+
+<sv-prose id="d60">
+## Build log 37 — the fused batch: `db.query([sql, …])` (2026-09-24)
+
+**Built as d59 said, then re-shaped by measurement.** `sql::run_batch_with(table, &[sql], cat)` parses every statement; the plain single-table ones (no CTE, FROM subquery, JOIN or IN-subquery, FROM resolving to the base table) bind, and `exec::execute_batch` classifies each bound query (`batch::shape_of`): aggregate, at most one GROUP BY key that `dense_dim` calls a dictionary, select items among the key, `count(*)`, `count(col)`, `sum(col)` over a non-dictionary numeric column, ORDER BY over select items, LIMIT/OFFSET, any WHERE. The family runs in `batch::execute_family`; everything else runs through `run_query_with` in order. Per statement a `Result<QueryResult, Diagnostic>`, so one bad statement fails alone (the JS surface rejects the call naming the statement's index — simpler to type and use than a mixed array; d59 said per-statement errors, and they are, one layer down).
+
+**The kernel, three versions in one evening.** (1) Shared lanes and masks with a per-row `tally` that matched on every select item: PUDL 6.2 ms one by one → 6.2 ms fused. No gain: the per-row cost, not the per-statement setup, was the SQL path's problem all along, and this kernel visited every row twice with a byte check each. (2) Iterate only the rows a statement keeps: the cached conjunct masks AND into 64-bit words and the loop walks set bits with `trailing_zeros`, so a selective facet filter costs its rows, not the group's; a totals query is a population count. PUDL 2.6 ms. (3) Loops with nothing in them but the lookups and the increment — one pass for the count, one per further item — instead of the generic tally: PUDL 0.86 ms count-only.
+
+| refresh: 8 facets + totals, warm, engine time | one by one | batch | the M1 primitive |
+|---|---|---|---|
+| PUDL 183K, count only | 5.1 ms | **0.89 ms** | 1.36 ms |
+| PUDL, count + sum | 6.2 ms | **1.34 ms** | 1.34 ms (sums once) |
+| grantnav 1.52M, count only | 40 ms | **8.7 ms** | 15.0 ms |
+| grantnav, count + sum | 70 ms | **17 ms** | 14.9 ms (sums once) |
+
+Cold and next-click are the same picture (`bench/facet-fuse.mjs`). The batch beats the primitive it was measured against on count-only facets because it visits kept rows only, where the primitive visits every row for every dimension. Engine time; a page also saves eight worker round trips per refresh.
+
+**Size, and a choice.** A first cut specialized the hot loops by key nullability × mask presence × item kind — 42 loop bodies — and cost +10.8 KB gz. Collapsing them (a missing WHERE is an all-ones mask, a missing validity bitmap an all-ones buffer, one loop shape per item kind) saved only 1.6 KB and cost grantnav's count+sum 14.2 → 17.1 ms (the extra validity load per row); kept, for the smaller code. **The batch is +9.3 KB gz: 254.5 → 263.7 KB, 85% of budget.** Two releases at 14 KB and now a feature at 9: the lite-build gate (d51) moves from "someday" to "before the next feature of this size".
+
+**Surface.** wasm `query_batch(t, ptr, len, flags)` over NUL-separated statements → a handle of ordinary outcome handles (`batch_len`, `batch_outcome`, `batch_free`); `core.js` `queryBatch(handle, sqls, { dictText })` reading each outcome through the shared `_readOutcome`; worker `queryBatch`; `db.query(string[])` → `Result[]` with the same options as a single statement (`dictText` applies to fused results — a facet UI should ask for codes, as `bench/facet-fuse.mjs` does). Tests: `tests/batch.rs` (a family with NULL keys, NULL measures, filters, ORDER BY, windows, a non-fusable member, in-place errors; the 200K spike's real interaction), node-smoke (batch equals single, dictText, error index, timing), the worker and browser smokes, the gate.
+
+**Not done, deliberately.** Integer dimension keys (`dense_dim`'s narrow-int case: years), `min`/`max`/`avg`, and the filters-except-own one-pass trick. The first two are small and wait for a caller; the third is no longer the fastest route.
+</sv-prose>

@@ -81,6 +81,12 @@ r = await ok({ cmd: "query", table: "t", sql: "select twice(count(*)) as n from 
 if (r.result.columns[0].values[0] !== 400000) throw new Error("registered function");
 if (!(await ok({ cmd: "unregisterFunction", name: "twice" })).ok) throw new Error("unregister");
 
+// queryBatch: several statements, one message; results in order
+r = await ok({ cmd: "queryBatch", table: "t", sqls: ["select country, count(*) as n from t where capacity > 3 group by country order by n desc limit 3", "select count(*) as n from t where capacity > 3"] });
+if (r.results.length !== 2 || r.results[0].rowCount !== 3 || r.results[1].columns[0].values[0] !== 111597) throw new Error(`queryBatch ${JSON.stringify(r).slice(0, 200)}`);
+const be = await send({ cmd: "queryBatch", table: "t", sqls: ["select 1 as x from t limit 1", "select contry from t"] });
+if (be.ok || !be.isQueryError || !/statement 1: .*unknown column 'contry'/s.test(be.error)) throw new Error(`queryBatch error: ${be.error}`);
+
 // describe: the catalog of a loaded table
 {
   const { info } = await ok({ cmd: "describe", table: "t" });

@@ -172,12 +172,19 @@ export class Facetful {
     await this._call({ cmd: "setMaskBudget", bytes, table });
   }
 
-  /** Run SQL. `table` selects a loaded table (defaults to the last loaded).
+  /** Run SQL — one statement, or an array of statements in one call (the
+   *  facet-shaped ones share masks and lanes and run fused; see index.d.ts).
+   *  `table` selects a loaded table (defaults to the last loaded).
    *  `dictText` (true | "all"): text columns come back as codes + a dictionary
    *  on `columnRaw` — true for the image's dictionary columns (free), "all"
    *  for any text column where that pays (a hash pass); rows()/column() still
    *  return strings. */
   async query(sql, { table, dictText } = {}) {
+    if (Array.isArray(sql)) {
+      // a batch: one message, one engine call; facet-shaped statements fuse
+      const { results } = await this._call({ cmd: "queryBatch", sqls: sql, table, dictText });
+      return results.map((r) => new Result(r));
+    }
     const { result } = await this._call({ cmd: "query", sql, table, dictText });
     return new Result(result);
   }

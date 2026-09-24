@@ -390,6 +390,44 @@ export class Engine {
     // col_* getters never grow memory)
     const flags = dictText === "all" ? 3 : dictText ? 1 : 0;
     const h = this.w.query_run_opts(tableHandle, sqlPtr, sqlBytes.byteLength, flags);
+    this.w.dealloc(sqlPtr, sqlBytes.byteLength);
+    return this._readOutcome(h);
+  }
+
+  /** Several statements in one call: the facet-shaped ones (single table,
+   *  one dictionary GROUP BY key, count/sum items, any WHERE) run fused —
+   *  masks and lanes shared, one lean pass each — and the rest run in order.
+   *  Returns one result per statement; a failing statement throws a
+   *  QueryError naming its index. */
+  queryBatch(tableHandle, sqls, { dictText = false } = {}) {
+    if (dictText !== false && dictText !== true && dictText !== "all") throw new Error(`dictText: expected true, false or "all", got ${JSON.stringify(dictText)}`);
+    const bytes = this.enc.encode(sqls.join("\0"));
+    const p = u32(this.w.alloc(bytes.byteLength));
+    new Uint8Array(this.mem(), p, bytes.byteLength).set(bytes);
+    const flags = dictText === "all" ? 3 : dictText ? 1 : 0;
+    const h = this.w.query_batch(tableHandle, p, bytes.byteLength, flags);
+    this.w.dealloc(p, bytes.byteLength);
+    const n = this.w.batch_len(h);
+    const handles = [];
+    for (let i = 0; i < n; i++) handles.push(this.w.batch_outcome(h, i));
+    this.w.batch_free(h);
+    const out = [];
+    let failed = null;
+    for (let i = 0; i < n; i++) {
+      try {
+        out.push(this._readOutcome(handles[i]));
+      } catch (e) {
+        if (!failed) failed = new QueryError(`statement ${i}: ${e.message}`);
+        for (let j = i + 1; j < n; j++) this.w.outcome_free(handles[j]); // free the rest, then fail
+        break;
+      }
+    }
+    if (failed) throw failed;
+    return out;
+  }
+
+  /** Copy an outcome's columns out of wasm memory and free it. */
+  _readOutcome(h) {
     try {
       if (this.w.outcome_is_err(h)) {
         const n = this.w.outcome_error(h, this.scratch, 4096);

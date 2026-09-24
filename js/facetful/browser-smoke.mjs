@@ -54,6 +54,15 @@ window.__smoke = (async () => {
     await step("removeOpfs", () => db.removeOpfs("smoke/t.facetful"));
     await step("registerFunction", () => db.registerFunction("twice", { params: ["int"], returns: "int", perRow: true }, (x) => x * 2));
     eq((await db.query("select twice(count(*)) as n from t", { table: "t" })).column("n")[0], 400000, "registered function");
+    const batch = await step("query batch", () => db.query([
+      "select country, count(*) as n from t where capacity > 3 group by country order by n desc limit 5",
+      "select status, count(*) as n, sum(capacity) as mw from t where capacity > 3 group by status order by status",
+      "select count(*) as n from t where capacity > 3",
+    ], { table: "t" }));
+    eq(batch.length, 3, "batch length");
+    eq(batch[0].rowCount, 5, "batch limit");
+    eq(batch[2].column("n")[0], (await db.query("select count(*) as n from t where capacity > 3", { table: "t" })).column("n")[0], "batch totals");
+    eq(batch[1].column("status").length, batch[1].rowCount, "batch dictionary key decodes");
     const info = await step("describe", () => db.describe({ table: "t" }));
     eq(info.rows, 200000, "describe rows");
     eq(info.columns.find((c) => c.name === "country").dict, 200, "describe dictionary size");

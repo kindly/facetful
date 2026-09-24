@@ -30,6 +30,7 @@ mod aggregate;
 mod plain;
 mod sort;
 mod topk;
+mod batch;
 use vector::*;
 use eval::*;
 use scalar::*;
@@ -39,6 +40,34 @@ use output::*;
 use filter::*;
 use grouping::*;
 pub use value::{compact_dict, OutCol, QueryResult, Val};
+
+/// Fused execution of a family of facet-shaped statements (design.sv d59):
+/// classify each bound query, run the fusable ones together with shared
+/// masks and lanes, and leave the rest to the caller. Returns, per
+/// statement, `Some(result)` or `None` (not fusable).
+pub fn execute_batch<S: ReadAt>(
+    table: &mut Table<S>,
+    qs: &[&BoundQuery],
+) -> Result<Vec<Option<QueryResult>>, FormatError> {
+    let mut out: Vec<Option<QueryResult>> = (0..qs.len()).map(|_| None).collect();
+    let mut family: Vec<usize> = Vec::new();
+    let mut shapes = Vec::new();
+    for (i, q) in qs.iter().enumerate() {
+        if let Some(s) = batch::shape_of(table, q) {
+            family.push(i);
+            shapes.push(s);
+        }
+    }
+    if family.is_empty() {
+        return Ok(out);
+    }
+    let members: Vec<&BoundQuery> = family.iter().map(|&i| qs[i]).collect();
+    let results = batch::execute_family(table, &members, &shapes)?;
+    for (i, r) in family.into_iter().zip(results) {
+        out[i] = Some(r);
+    }
+    Ok(out)
+}
 pub(crate) use output::sort_keyed2;
 pub(crate) use grouping::{hash_bytes, int_range, GroupMap, TextGroups, DENSE_LANES};
 pub(crate) use distinct::mix64;

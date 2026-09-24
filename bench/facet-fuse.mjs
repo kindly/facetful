@@ -56,6 +56,26 @@ function sqlRefresh(h, s, withSum = true) {
   out.pass = tot.columns[0].values[0]; out.sum = tot.columns[1].values[0];
   return out;
 }
+// the batch API: the same statements as sqlRefresh, one engine call
+function batchRefresh(h, s, withSum = true) {
+  const sqls = DIMS.map((dim) => `select ${q(dim)} as k, count(*) as n${withSum ? `, sum(${q(MEASURE)}) as mw` : ""} from t${whereExcept(s, dim)} group by ${q(dim)}`);
+  sqls.push(`select count(*) as n, sum(${q(MEASURE)}) as mw from t${whereExcept(s, null)}`);
+  // dictText: keys come back as codes into the (compacted) dictionary —
+  // what a facet UI reads; decoding a string per group would be the bench's
+  // cost, not the engine's
+  const rs = engine.queryBatch(h, sqls, { dictText: true });
+  const out = {};
+  for (let d = 0; d < DIMS.length; d++) {
+    const r = rs[d], k = r.columns[0], n = r.columns[1], m = new Map();
+    const names = []; const dn = k.dict.offsets.length - 1;
+    for (let c = 0; c < dn; c++) names.push(dec.decode(k.dict.bytes.subarray(k.dict.offsets[c], k.dict.offsets[c + 1])));
+    for (let i = 0; i < r.rowCount; i++) m.set((k.validity[i >> 3] >> (i & 7)) & 1 ? names[k.codes[i]] : null, n.values[i]);
+    out[DIMS[d]] = m;
+  }
+  const tot = rs[DIMS.length];
+  out.pass = tot.columns[0].values[0]; out.sum = tot.columns[1].values[0];
+  return out;
+}
 function fusedRefresh(h, s) {
   const codes = DIMS.map((d) => s[d] ?? []);
   const nd = DIMS.length, total = codes.reduce((a, c) => a + c.length, 0);
@@ -79,7 +99,9 @@ function fusedRefresh(h, s) {
 }
 // agreement
 for (const s of [selA, selB]) {
-  const a = sqlRefresh(t0h, s), b = fusedRefresh(t0h, s);
+  const a = sqlRefresh(t0h, s), b = fusedRefresh(t0h, s), c = batchRefresh(t0h, s);
+  for (const dim of DIMS) for (const [k, v] of a[dim]) if (c[dim].get(k) !== v) throw new Error(`${dim}: ${k} sql ${v} batch ${c[dim].get(k)}`);
+  if (a.pass !== c.pass || Math.abs(a.sum - c.sum) > 1e-6 * Math.abs(a.sum)) throw new Error(`batch totals ${c.pass}/${c.sum}`);
   for (const dim of DIMS) {
     for (const [k, v] of a[dim]) if (b[dim].get(k) !== v) throw new Error(`${dim}: ${k} sql ${v} fused ${b[dim].get(k)}`);
     for (const [k, v] of b[dim]) if ((a[dim].get(k) ?? 0) !== v) throw new Error(`${dim}: ${k} fused ${v} sql ${a[dim].get(k)}`);
@@ -99,10 +121,13 @@ line(`cold: first interaction (${DIMS.length + 1} queries)`, cs, cf);
 const h = open(); sqlRefresh(h, selA); fusedRefresh(h, selA);
 line("warm: identical interaction repeated", best(() => sqlRefresh(h, selA)), best(() => fusedRefresh(h, selA)));
 line("warm, SQL count-only (like for like)", best(() => sqlRefresh(h, selA, false)), best(() => fusedRefresh(h, selA)));
+line("warm: BATCH (count+sum) vs fused", best(() => batchRefresh(h, selA)), best(() => fusedRefresh(h, selA)));
+line("warm: BATCH count-only vs fused", best(() => batchRefresh(h, selA, false)), best(() => fusedRefresh(h, selA)));
 // next click: A -> B -> A alternating (one facet's selection changes each time)
 let flip = false;
 const alt = (f) => { flip = !flip; return f(h, flip ? selB : selA); };
 line("next click: one selection changes (A<->B)", best(() => alt(sqlRefresh), 10), best(() => alt(fusedRefresh), 10));
+line("next click: BATCH (count+sum) vs fused", best(() => alt(batchRefresh), 10), best(() => alt(fusedRefresh), 10));
 // per-query cost breakdown of the SQL path, warm
 for (const d of [DIMS[0], DIMS[3]]) { const t1 = performance.now(); for (let i = 0; i < 20; i++) engine.query(h, `select ${q(d)} as k, count(*) as n, sum(${q(MEASURE)}) as mw from t${whereExcept(selA, d)} group by ${q(d)}`); console.log(`one warm facet query (${d}, ${dicts[DIMS.indexOf(d)].length} values):`.padEnd(44), ms((performance.now() - t1) / 20)); }
 
@@ -115,3 +140,16 @@ anat("count(*) with the 2 cached filters", `select count(*) as n from t${whereEx
 anat(`group by ${DIMS[0]} no where`, `select ${q(DIMS[0])} as k, count(*) as n from t group by ${q(DIMS[0])}`);
 anat(`group by ${DIMS[0]} + filters, count only`, `select ${q(DIMS[0])} as k, count(*) as n from t${whereExcept(selA, DIMS[0])} group by ${q(DIMS[0])}`);
 anat(`group by ${DIMS[0]} + filters, count+sum`, `select ${q(DIMS[0])} as k, count(*) as n, sum(${q(MEASURE)}) as mw from t${whereExcept(selA, DIMS[0])} group by ${q(DIMS[0])}`);
+
+// batch anatomy: fixed per-statement cost vs rows visited
+{
+  const one = `select ${q(DIMS[0])} as k, count(*) as n from t${whereExcept(selA, DIMS[0])} group by ${q(DIMS[0])}`;
+  const nowhere = `select ${q(DIMS[0])} as k, count(*) as n from t group by ${q(DIMS[0])}`;
+  const b = (sqls) => best(() => engine.queryBatch(h, sqls, { dictText: true }), 15);
+  console.log("batch anatomy (warm):");
+  console.log("  1 filtered count-only statement".padEnd(44), ms(b([one])));
+  console.log("  9 identical filtered statements".padEnd(44), ms(b(Array(9).fill(one))));
+  console.log("  1 unfiltered (full scan)".padEnd(44), ms(b([nowhere])));
+  console.log("  9 unfiltered (9 full scans)".padEnd(44), ms(b(Array(9).fill(nowhere))));
+  console.log("  totals only".padEnd(44), ms(b([`select count(*) as n from t${whereExcept(selA, null)}`])));
+}
