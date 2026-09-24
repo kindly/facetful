@@ -216,11 +216,24 @@ export class Result {
     return this._find(name);
   }
 
-  /** The decoded dictionary of a `dictText` column (index by a row's code), or
-   *  null when the column came as per-row text. Decoded once per result. */
+  /** The whole decoded dictionary of a `dictText` column (index by a row's
+   *  code), or null when the column came as per-row text. Decodes every value
+   *  on first call — fine for hundreds or thousands of values; for a
+   *  dictionary of a million (a `"all"`-encoded title column) use
+   *  `dictValue`, which decodes one code at a time and caches it. */
   dictionary(name) {
     const c = this._find(name);
     return c.codes ? dictStrings(c) : null;
+  }
+
+  /** One dictionary value of a `dictText` column by code, decoded on first
+   *  use and cached — the fast path for a reader that touches a few rows of
+   *  a result with a big dictionary. Null when the column came as per-row
+   *  text or the code is out of range. */
+  dictValue(name, code) {
+    const c = this._find(name);
+    if (!c.codes || code < 0 || code >= c.dict.offsets.length - 1) return null;
+    return dictValueAt(c, code);
   }
 
   /** Materialized values with nulls, in row order. */
@@ -242,15 +255,29 @@ export class Result {
   }
 }
 
+// per column: its decoded dictionary values, filled lazily by code so that
+// touching one row of a million-value dictionary decodes one string, not all
 const dictCache = new WeakMap();
-function dictStrings(c) {
+function dictSlots(c) {
   let strs = dictCache.get(c);
   if (!strs) {
-    const n = c.dict.offsets.length - 1;
-    strs = new Array(n);
-    for (let k = 0; k < n; k++) strs[k] = dec.decode(c.dict.bytes.subarray(c.dict.offsets[k], c.dict.offsets[k + 1]));
+    strs = new Array(c.dict.offsets.length - 1);
     dictCache.set(c, strs);
   }
+  return strs;
+}
+function dictValueAt(c, k) {
+  const strs = dictSlots(c);
+  let s = strs[k];
+  if (s === undefined) {
+    s = dec.decode(c.dict.bytes.subarray(c.dict.offsets[k], c.dict.offsets[k + 1]));
+    strs[k] = s;
+  }
+  return s;
+}
+function dictStrings(c) {
+  const strs = dictSlots(c);
+  for (let k = 0; k < strs.length; k++) if (strs[k] === undefined) strs[k] = dec.decode(c.dict.bytes.subarray(c.dict.offsets[k], c.dict.offsets[k + 1]));
   return strs;
 }
 
@@ -268,7 +295,7 @@ function cellValue(c, i) {
     case "timestamp": // ms since epoch -> ISO, UTC
       return new Date(c.values[i]).toISOString().replace("T", " ").slice(0, 19);
     default:
-      if (c.codes) return dictStrings(c)[c.codes[i]];
+      if (c.codes) return dictValueAt(c, c.codes[i]);
       return dec.decode(c.bytes.subarray(c.offsets[i], c.offsets[i + 1]));
   }
 }

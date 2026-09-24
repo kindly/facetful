@@ -73,9 +73,16 @@ export declare class Result {
   elapsedMs: number;
   /** Raw transferred buffers for a column — near-zero copy, ideal for charts. */
   columnRaw(name: string): RawColumn;
-  /** The decoded dictionary of a `dictText` column (index it by a row's code),
-   *  or null when the column came as per-row text. Decoded once per result. */
+  /** The whole decoded dictionary of a `dictText` column (index it by a row's
+   *  code), or null when the column came as per-row text. Decodes every value
+   *  on first call: right for hundreds or thousands of values, wrong for a
+   *  million (an `"all"`-encoded title column took 0.7 s this way) — there,
+   *  use `dictValue` or read `dict.offsets`/`dict.bytes` yourself. */
   dictionary(name: string): string[] | null;
+  /** One dictionary value by code, decoded on first use and cached: the fast
+   *  path for readers that touch a few rows of a result with a big
+   *  dictionary. Null for a per-row text column or an out-of-range code. */
+  dictValue(name: string, code: number): string | null;
   /** Materialized values with nulls; date/timestamp as ISO strings. */
   column(name: string): CellValue[];
   /** Row objects, materialized lazily. */

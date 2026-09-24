@@ -36,6 +36,8 @@ window.__smoke = (async () => {
     if (!raw.codes || !raw.dict || raw.offsets) throw new Error("dictText: codes + dict expected on a dictionary column");
     eq(raw.codes.length, r.rowCount, "codes per row");
     eq(r.dictionary("country")[raw.codes[0]], plain.column("country")[0], "dictionary decode");
+    eq(r.dictValue("country", raw.codes[1]), plain.column("country")[1], "dictValue decode");
+    eq(r.dictValue("country", 100000), null, "dictValue out of range");
     eq(r.column("country")[r.rowCount - 1], plain.column("country")[plain.rowCount - 1], "column() through the dictionary");
     eq([...r.rows()].length, r.rowCount, "rows() through the dictionary");
     eq((await step("materialize", () => db.materialize("m", "select country, count(*) as n from t group by country", { table: "t" }))).rows, 200, "materialize rows");
