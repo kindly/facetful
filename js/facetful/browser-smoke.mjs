@@ -85,15 +85,20 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const url = `http://127.0.0.1:${server.address().port}/smoke.html`;
 
 // ---- the browser
-const candidates = [process.env.FACETFUL_BROWSER, "chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"].filter(Boolean);
-const browser = candidates.find((b) => { try { execSync(`command -v ${b}`, { stdio: "ignore" }); return true; } catch { return false; } });
-if (!browser) { console.error("browser smoke: no Chromium/Chrome found (set FACETFUL_BROWSER)"); process.exit(1); }
+// the first candidate that really is a Chrome: `command -v` is not enough
+// (on GitHub's Ubuntu image `chromium-browser` is a snap stub that exits
+// without ever opening a port; the browser there is google-chrome)
+const candidates = [process.env.FACETFUL_BROWSER, process.env.CHROME_BIN, "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"].filter(Boolean);
+const isChrome = (b) => { try { return /Chrom/.test(execSync(`${b} --version`, { stdio: ["ignore", "pipe", "ignore"], timeout: 15000 }).toString()); } catch { return false; } };
+const browser = candidates.find(isChrome);
+if (!browser) { console.error(`browser smoke: no Chromium/Chrome found among ${candidates.join(", ")} (set FACETFUL_BROWSER)`); process.exit(1); }
 const profile = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "facetful-smoke-"));
 const port = 9300 + Math.floor(Math.random() * 500);
 const chrome = spawn(browser, [
   "--headless=new", "--no-proxy-server", `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
   "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--disable-crash-reporter", `--crash-dumps-dir=${profile}`,
-  ...(process.env.CI || process.env.FACETFUL_NO_CHROME_SANDBOX ? ["--no-sandbox"] : []),
+  // CI runners: no user namespaces for Chrome's sandbox, and a tiny /dev/shm
+  ...(process.env.CI || process.env.FACETFUL_NO_CHROME_SANDBOX ? ["--no-sandbox", "--disable-dev-shm-usage"] : []),
   "about:blank",
 ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, HOME: profile, XDG_CONFIG_HOME: profile, XDG_CACHE_HOME: profile } });
 let stderr = "";
@@ -106,7 +111,7 @@ let targets = null;
 for (let i = 0; i < 80 && !targets; i++) {
   try { targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); }
 }
-if (!targets) fail(`${browser} did not open its DevTools port`);
+if (!targets) fail(`${browser} did not open its DevTools port (exit ${chrome.exitCode})`);
 const page = targets.find((t) => t.type === "page");
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
