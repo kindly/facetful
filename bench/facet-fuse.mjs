@@ -41,10 +41,13 @@ const whereExcept = (s, except) => {
 };
 const show = (s) => Object.entries(s).map(([d, c]) => `${d}=${c.map((x) => dicts[DIMS.indexOf(d)][x]).join("|")}`).join(", ");
 
-function sqlRefresh(h, s) {
+// `withSum`: count + sum per group (what a dashboard shows); the fused
+// primitive counts per group and sums the measure once overall, so the
+// like-for-like comparison is the count-only form plus the totals query
+function sqlRefresh(h, s, withSum = true) {
   const out = {};
   for (const dim of DIMS) {
-    const r = engine.query(h, `select ${q(dim)} as k, count(*) as n, sum(${q(MEASURE)}) as mw from t${whereExcept(s, dim)} group by ${q(dim)}`);
+    const r = engine.query(h, `select ${q(dim)} as k, count(*) as n${withSum ? `, sum(${q(MEASURE)}) as mw` : ""} from t${whereExcept(s, dim)} group by ${q(dim)}`);
     const k = r.columns[0], n = r.columns[1], m = new Map();
     for (let i = 0; i < r.rowCount; i++) m.set((k.validity[i >> 3] >> (i & 7)) & 1 ? dec.decode(k.bytes.subarray(k.offsets[i], k.offsets[i + 1])) : null, n.values[i]);
     out[dim] = m;
@@ -95,6 +98,7 @@ line(`cold: first interaction (${DIMS.length + 1} queries)`, cs, cf);
 // warm: same interaction repeated (mask cache fully hot)
 const h = open(); sqlRefresh(h, selA); fusedRefresh(h, selA);
 line("warm: identical interaction repeated", best(() => sqlRefresh(h, selA)), best(() => fusedRefresh(h, selA)));
+line("warm, SQL count-only (like for like)", best(() => sqlRefresh(h, selA, false)), best(() => fusedRefresh(h, selA)));
 // next click: A -> B -> A alternating (one facet's selection changes each time)
 let flip = false;
 const alt = (f) => { flip = !flip; return f(h, flip ? selB : selA); };
