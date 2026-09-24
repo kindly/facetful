@@ -259,6 +259,8 @@ self.onmessage = async (e) => {
       if (!handle) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
       const t0 = performance.now();
       const results = engine.queryBatch(handle, e.data.sqls, { dictText: e.data.dictText ?? false });
+      // the batch's time on every result: the statements run interleaved,
+      // so there is no per-statement time (index.d.ts says not to sum them)
       const elapsedMs = performance.now() - t0;
       for (const r of results) r.elapsedMs = elapsedMs;
       reply({ ok: true, results }, results.flatMap(transferables));

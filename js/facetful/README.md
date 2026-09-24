@@ -66,7 +66,8 @@ const big = await db.query("select country, mw from t", { dictText: true });
 big.columnRaw("country"); // { codes: Uint16Array, dict: { offsets, bytes }, validity }
 big.dictionary("country"); // the decoded distinct values, indexed by code (decodes them all)
 big.dictValue("country", big.columnRaw("country").codes[0]); // one value, decoded on first use — for big dictionaries
-// a facet refresh in one call: the statements share masks and lanes and run fused (3x faster than one by one)
+// a facet refresh in one call: the statements share masks and lanes and run fused (4-5x faster than
+// one by one); send a latency-critical statement such as a grid page alone, just before the batch
 const [byCountry, byStatus, totals] = await db.query([
   "select country, count(*) as n from t where status = 'operating' group by country order by n desc limit 20",
   "select status, count(*) as n from t where country = 'Germany' group by status",

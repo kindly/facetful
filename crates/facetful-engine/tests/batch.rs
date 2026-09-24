@@ -99,12 +99,19 @@ fn family_matches_single_statements() {
         "select region, count(*) as n from t group by region order by n desc, region limit 2 offset 1",
         // NULL keys form their own group; sum over no contributing row is NULL
         "select region, sum(capacity) as mw from t where capacity > 100 or region is null group by region order by region",
-        // not fusable: an expression key, a text key without a dictionary path, a projection
+        // an integer key (dense from the footer range), with filters, sums and extremes
+        "select year, count(*) as n, sum(capacity) as mw from t group by year order by year",
+        "select year, count(*) as n, min(capacity) as lo, max(capacity) as hi from t where region <> 'us' group by year order by n desc, year",
+        // extremes and count(distinct) per group and in totals; NULL when nothing contributes
+        "select region, min(capacity) as lo, max(year) as hi, count(distinct region) as d from t group by region order by region",
+        "select count(distinct region) as d, min(year) as lo, max(capacity) as hi from t where capacity > 100",
+        "select year, count(distinct region) as d from t where capacity is not null group by year order by year",
+        // not fusable: an expression key, a projection, count(distinct) over a numeric column
         "select upper(region) as r, count(*) as n from t group by upper(region) order by r",
-        "select region, min(capacity) as lo from t group by region order by region",
         "select region, year from t where capacity > 5 order by year",
+        "select region, count(distinct year) as d from t group by region order by region",
     ];
-    let ordered = [true, true, false, true, true, true, true, true, true, true];
+    let ordered = [true, true, false, true, true, true, true, true, true, true, true, true, true, true, true];
     check(&mut t, &sqls, &ordered);
 }
 
@@ -137,8 +144,11 @@ fn spike_facet_interaction_agrees() {
         .iter()
         .map(|d| format!("select {d}, count(*) as n, sum(capacity) as mw, count(capacity) as k from t{} group by {d} order by n desc, {d} limit 50", where_except(d)))
         .collect();
-    sqls.push(format!("select count(*) as n, sum(capacity) as mw from t{}", where_except("")));
+    sqls.push(format!("select count(*) as n, sum(capacity) as mw, count(distinct country) as c, min(capacity) as lo, max(capacity) as hi from t{}", where_except("")));
     sqls.push("select year, count(*) as n from t where capacity > 250 group by year order by year".into());
+    // an integer key over a 200K-wide range, and extremes per group
+    sqls.push("select id, count(*) as n, min(capacity) as lo from t where id < 40 group by id order by id".into());
+    sqls.push("select status, min(id) as first, max(id) as last, count(distinct fuel) as f from t where capacity > 100 group by status order by status".into());
     let refs: Vec<&str> = sqls.iter().map(|s| s.as_str()).collect();
     let ordered = vec![true; refs.len()];
     check(&mut t, &refs, &ordered);

@@ -251,15 +251,22 @@ export declare class Facetful {
   query(sql: string, options?: { table?: string; dictText?: boolean | "all" }): Promise<Result>;
   /**
    * Several statements in one call: one worker message, one engine call, and
-   * the statements a facet UI sends — single table, at most one dictionary
-   * GROUP BY key, `count(*)` / `count(col)` / `sum(col)` items, any WHERE,
-   * ORDER BY over the select items, LIMIT/OFFSET — run fused: the WHERE masks
-   * and column lanes are shared and each statement is one pass over them.
-   * Anything else in the array runs as it would alone, in order. Results
-   * come back in order, identical to running each statement by itself. A
-   * failing statement rejects the whole call with a diagnostic that names
-   * its index. Send a facet panel's whole refresh this way: on a 1.5M-row
-   * table eight facets plus totals went from 41 ms to 15 ms of engine time.
+   * the statements a facet UI sends run fused — single table, at most one
+   * GROUP BY key that is a dictionary column or a narrow-range integer/date
+   * column, items among the key, `count(*)`, `count(col)`, `count(distinct
+   * dictcol)`, `sum`/`min`/`max` of a numeric column, any WHERE, ORDER BY
+   * over the select items, LIMIT/OFFSET. Their WHERE masks and column lanes
+   * are shared and each is a few lean passes over them. Anything else in the
+   * array runs as it would alone, in order. Results come back in order,
+   * identical to running each statement by itself; a failing statement
+   * rejects the whole call with a diagnostic naming its index. On a 1.5M-row
+   * table eight facets plus totals went from 70 ms one by one to 17 ms.
+   *
+   * Two things to know. Every result of a batch carries the batch's whole
+   * `elapsedMs` (the statements run interleaved; there is no per-statement
+   * time), so do not sum them. And a batch answers all at once, so anything
+   * latency-critical — a grid's first page — should be sent alone, just
+   * before the batch, rather than wait for the batch's slowest member.
    */
   query(sqls: string[], options?: { table?: string; dictText?: boolean | "all" }): Promise<Result[]>;
 
