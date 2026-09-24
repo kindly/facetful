@@ -13,6 +13,8 @@ pub(super) struct Plain {
     /// with a window: every scanned group's lanes (Rc clones), so select
     /// expressions run over the rows in the window only, at finish
     ctxs: Option<Vec<Cols>>,
+    /// row group behind each slot
+    groups: Vec<usize>,
 }
 
 impl Plain {
@@ -23,6 +25,7 @@ impl Plain {
             refs: Vec::new(),
             gslot: 0,
             ctxs: defer.then(Vec::new),
+            groups: Vec::new(),
         }
     }
 
@@ -48,11 +51,12 @@ impl Plain {
         }
     }
 
-    pub(super) fn scan_group(&mut self, sh: &Shared, ctx: &GroupCtx, keep: Option<&[u8]>) -> Flow {
-        sel_srcs_for_group(sh.q, ctx, &mut self.srcs, self.ctxs.is_some());
+    pub(super) fn scan_group(&mut self, sh: &Shared, g: usize, ctx: &GroupCtx, keep: Option<&[u8]>) -> Flow {
+        sel_srcs_for_group(sh.q, ctx, &mut self.srcs, self.ctxs.is_some(), &sh.direct_text);
         if let Some(c) = &mut self.ctxs {
             c.push(ctx.cols.clone());
         }
+        self.groups.push(g);
         // a plain invariant bool unswitches out of the row loops more reliably
         // than matching the Option per row (measured 0.1 ms on 183K rows)
         let (keep_all, keep_bits) = (keep.is_none(), keep.unwrap_or(&[]));
@@ -69,10 +73,10 @@ impl Plain {
         Flow::Continue
     }
 
-    pub(super) fn finish<S: ReadAt>(self, table: &Table<S>, sh: &Shared) -> QueryResult {
+    pub(super) fn finish<S: ReadAt>(self, table: &mut Table<S>, sh: &Shared) -> Result<QueryResult, FormatError> {
         let (offset, limit) = sh.window();
         let refs: Vec<(u32, u32)> = self.refs.into_iter().skip(offset).take(limit).collect();
-        let cols = project(sh.q, &sh.sel_tys, &self.srcs, &refs, self.ctxs.as_deref());
-        sh.result(table, Vec::new(), Some(cols), refs.len())
+        let cols = project(table, sh.q, &sh.sel_tys, &self.srcs, &refs, &self.groups, self.ctxs.as_deref())?;
+        Ok(sh.result(table, Vec::new(), Some(cols), refs.len()))
     }
 }

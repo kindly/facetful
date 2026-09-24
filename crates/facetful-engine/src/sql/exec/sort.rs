@@ -11,18 +11,26 @@ pub(super) struct FullSort {
     /// with a window: every scanned group's lanes (Rc clones), so select
     /// expressions run over the rows in the window only, after the sort
     ctxs: Option<Vec<Cols>>,
+    /// row group behind each slot
+    gids: Vec<usize>,
 }
 
 impl FullSort {
     pub(super) fn new(n_select: usize, defer: bool) -> FullSort {
-        FullSort { groups: Vec::new(), srcs: (0..n_select).map(|_| None).collect(), ctxs: defer.then(Vec::new) }
+        FullSort {
+            groups: Vec::new(),
+            srcs: (0..n_select).map(|_| None).collect(),
+            ctxs: defer.then(Vec::new),
+            gids: Vec::new(),
+        }
     }
 
-    pub(super) fn scan_group(&mut self, sh: &Shared, ctx: &GroupCtx, keep: Option<&[u8]>) {
-        sel_srcs_for_group(sh.q, ctx, &mut self.srcs, self.ctxs.is_some());
+    pub(super) fn scan_group(&mut self, sh: &Shared, g: usize, ctx: &GroupCtx, keep: Option<&[u8]>) {
+        sel_srcs_for_group(sh.q, ctx, &mut self.srcs, self.ctxs.is_some(), &sh.direct_text);
         if let Some(c) = &mut self.ctxs {
             c.push(ctx.cols.clone());
         }
+        self.gids.push(g);
         let ord_vvs: Vec<VV> = sh.q.order_by.iter().map(|(e, _)| eval_vec(e, ctx)).collect();
         // a plain invariant bool unswitches out of the row loops more reliably
         // than matching the Option per row (measured 0.1 ms on 183K rows)
@@ -32,7 +40,7 @@ impl FullSort {
         self.groups.push((ord_vvs, kept_rows));
     }
 
-    pub(super) fn finish<S: ReadAt>(self, table: &Table<S>, sh: &Shared) -> QueryResult {
+    pub(super) fn finish<S: ReadAt>(self, table: &mut Table<S>, sh: &Shared) -> Result<QueryResult, FormatError> {
         let q = sh.q;
         let groups = &self.groups;
         // flatten refs: (group slot, row)
@@ -99,7 +107,7 @@ impl FullSort {
 
         let (offset, limit) = sh.window();
         let final_refs: Vec<(u32, u32)> = order_refs.into_iter().skip(offset).take(limit).collect();
-        let cols = project(q, &sh.sel_tys, &self.srcs, &final_refs, self.ctxs.as_deref());
-        sh.result(table, Vec::new(), Some(cols), final_refs.len())
+        let cols = project(table, q, &sh.sel_tys, &self.srcs, &final_refs, &self.gids, self.ctxs.as_deref())?;
+        Ok(sh.result(table, Vec::new(), Some(cols), final_refs.len()))
     }
 }

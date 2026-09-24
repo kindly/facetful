@@ -259,6 +259,10 @@ struct Shared<'q> {
     sel_tys: Vec<Ty>,
     ord_tys: Vec<Ty>,
     scanned_groups: usize,
+    /// per select item: the plain-text column it is, when it is one selected
+    /// as-is — gathered off the resident image segments at finish, never
+    /// copied into a lane (the copy doubled the memory of every text result)
+    direct_text: Vec<Option<usize>>,
 }
 
 impl<'q> Shared<'q> {
@@ -270,7 +274,25 @@ impl<'q> Shared<'q> {
             v.dedup();
             v
         };
-        let sel: Vec<&Bound> = q.select.iter().map(|s| &s.expr).collect();
+        let direct_text: Vec<Option<usize>> = q
+            .select
+            .iter()
+            .map(|s| match &s.expr {
+                Bound::Column { index, ty: Ty::Text } if !q.is_aggregate => {
+                    let def = &table.catalog().schema.columns[*index];
+                    (def.ty == ColumnType::Utf8 && !def.is_dict()).then_some(*index)
+                }
+                _ => None,
+            })
+            .collect();
+        // lanes: every select expression except the direct text columns
+        let sel: Vec<&Bound> = q
+            .select
+            .iter()
+            .zip(&direct_text)
+            .filter(|(_, d)| d.is_none())
+            .map(|(s, _)| &s.expr)
+            .collect();
         let ord: Vec<&Bound> = q.order_by.iter().map(|(e, _)| e).collect();
         let grp: Vec<&Bound> = q.group_by.iter().collect();
         let proj_needed = cols_of(&[sel.as_slice(), grp.as_slice(), ord.as_slice()].concat());
@@ -296,6 +318,7 @@ impl<'q> Shared<'q> {
             sel_tys: q.select.iter().map(|s| s.expr.ty()).collect(),
             ord_tys: q.order_by.iter().map(|(e, _)| e.ty()).collect(),
             scanned_groups: 0,
+            direct_text,
         })
     }
 
@@ -392,8 +415,8 @@ impl Strategy {
         match self {
             Strategy::Aggregate(a) => a.scan_group(sh, ctx, keep),
             Strategy::TopK(t) => t.scan_group(sh, g, ctx, keep),
-            Strategy::FullSort(f) => f.scan_group(sh, ctx, keep),
-            Strategy::Plain(p) => return p.scan_group(sh, ctx, keep),
+            Strategy::FullSort(f) => f.scan_group(sh, g, ctx, keep),
+            Strategy::Plain(p) => return p.scan_group(sh, g, ctx, keep),
         }
         Flow::Continue
     }
@@ -402,8 +425,8 @@ impl Strategy {
         match self {
             Strategy::Aggregate(a) => a.finish(table, sh),
             Strategy::TopK(t) => t.finish(table, sh),
-            Strategy::FullSort(f) => Ok(f.finish(table, sh)),
-            Strategy::Plain(p) => Ok(p.finish(table, sh)),
+            Strategy::FullSort(f) => f.finish(table, sh),
+            Strategy::Plain(p) => p.finish(table, sh),
         }
     }
 }

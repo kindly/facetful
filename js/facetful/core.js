@@ -368,7 +368,9 @@ export class Engine {
     const sqlBytes = this.enc.encode(sql);
     const sqlPtr = u32(this.w.alloc(sqlBytes.byteLength));
     new Uint8Array(this.mem(), sqlPtr, sqlBytes.byteLength).set(sqlBytes);
-    const h = this.w.query_run(tableHandle, sqlPtr, sqlBytes.byteLength);
+    // bit 0: keep dictionary columns as codes (every allocation the result
+    // needs happens inside this call; the col_* getters never grow memory)
+    const h = this.w.query_run_opts(tableHandle, sqlPtr, sqlBytes.byteLength, dictText ? 1 : 0);
     try {
       if (this.w.outcome_is_err(h)) {
         const n = this.w.outcome_error(h, this.scratch, 4096);
@@ -391,21 +393,27 @@ export class Engine {
         } else if (kind === "bool") {
           col.values = new Uint8Array(this.mem(), u32(this.w.col_bools_ptr(h, i)), rowCount).slice();
         } else {
-          const dn = dictText ? this.w.col_dict_len(h, i) : 0;
+          // pointers first, memory view last: a view taken before a call
+          // into the wasm is detached if that call grows the memory
+          const dn = this.w.col_dict_len(h, i);
           if (dn > 0) {
-            col.codes = new Uint16Array(this.mem(), u32(this.w.col_codes_ptr(h, i)), rowCount).slice();
+            const codesP = u32(this.w.col_codes_ptr(h, i));
+            const dictOffP = u32(this.w.col_dict_offsets_ptr(h, i));
+            const dictBytesP = u32(this.w.col_dict_bytes_ptr(h, i));
+            const dictBytesN = u32(this.w.col_dict_bytes_len(h, i));
+            const mem = this.mem();
+            col.codes = new Uint16Array(mem, codesP, rowCount).slice();
             col.dict = {
-              offsets: new Uint32Array(this.mem(), u32(this.w.col_dict_offsets_ptr(h, i)), dn + 1).slice(),
-              bytes: new Uint8Array(
-                this.mem(), u32(this.w.col_dict_bytes_ptr(h, i)), u32(this.w.col_dict_bytes_len(h, i)),
-              ).slice(),
+              offsets: new Uint32Array(mem, dictOffP, dn + 1).slice(),
+              bytes: new Uint8Array(mem, dictBytesP, dictBytesN).slice(),
             };
           } else {
-            // asking for offsets expands a dictionary column inside the wasm
-            col.offsets = new Uint32Array(this.mem(), u32(this.w.col_offsets_ptr(h, i)), rowCount + 1).slice();
-            col.bytes = new Uint8Array(
-              this.mem(), u32(this.w.col_bytes_ptr(h, i)), u32(this.w.col_bytes_len(h, i)),
-            ).slice();
+            const offP = u32(this.w.col_offsets_ptr(h, i));
+            const bytesP = u32(this.w.col_bytes_ptr(h, i));
+            const bytesN = u32(this.w.col_bytes_len(h, i));
+            const mem = this.mem();
+            col.offsets = new Uint32Array(mem, offP, rowCount + 1).slice();
+            col.bytes = new Uint8Array(mem, bytesP, bytesN).slice();
           }
         }
         columns.push(col);

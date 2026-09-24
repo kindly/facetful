@@ -15,6 +15,9 @@ pub(super) enum SelSrc {
     /// keeps each group's lanes and `project` runs it over the surviving
     /// rows only (a paged query pays for its page, not for every kept row)
     Deferred,
+    /// a plain-text column selected as-is: gathered at finish straight off
+    /// the image's resident segments (no lane is ever copied for it)
+    Segments(usize),
 }
 
 pub(super) fn gather_outcol(src: &SelSrc, refs: &[(u32, u32)], ty: Ty) -> OutCol {
@@ -49,7 +52,7 @@ pub(super) fn gather_outcol(src: &SelSrc, refs: &[(u32, u32)], ty: Ty) -> OutCol
             }
             OutCol::Dict { codes, dict: dict.clone(), valid }
         }
-        SelSrc::Deferred => unreachable!("deferred sources are evaluated by `project`"),
+        SelSrc::Deferred | SelSrc::Segments(_) => unreachable!("evaluated by `project`"),
         SelSrc::Vv(vvs) => match ty {
             Ty::Float => {
                 let mut v = vec![0f64; n];
@@ -111,8 +114,13 @@ pub(super) fn sel_srcs_for_group(
     ctx: &GroupCtx,
     srcs: &mut [Option<SelSrc>],
     defer: bool,
+    direct_text: &[Option<usize>],
 ) {
     for (si, sel) in q.select.iter().enumerate() {
+        if let Some(col) = direct_text[si] {
+            srcs[si] = Some(SelSrc::Segments(col));
+            continue;
+        }
         let lane = match &sel.expr {
             Bound::Column { index, ty: Ty::Text } => ctx.cols.get(index),
             _ => None,
@@ -137,7 +145,7 @@ pub(super) fn sel_srcs_for_group(
             (Some((GroupCol::Text { .. } | GroupCol::Dict { .. }, _)), Some(_)) => {
                 unreachable!("select expr shape is stable across groups")
             }
-            (_, Some(SelSrc::Deferred)) => {}
+            (_, Some(SelSrc::Deferred | SelSrc::Segments(_))) => {}
             (_, Some(SelSrc::Vv(v))) => v.push(eval_vec(&sel.expr, ctx)),
             (_, None) if defer => *slot = Some(SelSrc::Deferred),
             (_, None) => *slot = Some(SelSrc::Vv(vec![eval_vec(&sel.expr, ctx)])),
@@ -146,16 +154,101 @@ pub(super) fn sel_srcs_for_group(
     }
 }
 
-/// The output columns for `refs` (group slot, row): direct sources gather by
-/// reference; deferred expressions evaluate over the surviving rows only,
-/// in contexts gathered from the kept groups' lanes (`ctxs[gslot]`).
-pub(super) fn project(
+/// Run `f` over one group's plain-text column as `(offset(k), blob, validity)`:
+/// borrowed from the resident image segments when they are, else from a lane
+/// loaded for the purpose (tiny positional-cache budgets).
+fn with_texts<S: ReadAt, R>(
+    table: &mut Table<S>,
+    g: usize,
+    col: usize,
+    rows: usize,
+    f: impl FnOnce(&dyn Fn(usize) -> u32, &[u8], Option<&[u8]>) -> R,
+) -> Result<R, FormatError> {
+    let mut f = Some(f);
+    let got = table.with_text_segments(g, col, |offs, blob, valid| {
+        let at = |k: usize| u32::from_le_bytes(offs[k * 4..k * 4 + 4].try_into().unwrap());
+        (f.take().unwrap())(&at, blob, valid)
+    })?;
+    match got {
+        Some(r) => Ok(r),
+        None => {
+            let (offs, blob) = table.texts_raw(g, col, rows)?;
+            let valid = table.validity(g, col)?;
+            let at = |k: usize| offs[k];
+            Ok((f.take().unwrap())(&at, &blob, valid.as_deref()))
+        }
+    }
+}
+
+/// A plain-text column for `refs`, gathered straight off the image: one pass
+/// for lengths and validity, one to copy the bytes into place. Nothing but
+/// the output is allocated.
+fn gather_segments<S: ReadAt>(
+    table: &mut Table<S>,
+    col: usize,
+    refs: &[(u32, u32)],
+    groups: &[usize],
+) -> Result<OutCol, FormatError> {
+    let n = refs.len();
+    let mut by_group: Vec<Vec<u32>> = vec![Vec::new(); groups.len()];
+    for (i, &(gs, _)) in refs.iter().enumerate() {
+        by_group[gs as usize].push(i as u32);
+    }
+    let mut valid = vec![0u8; n.div_ceil(8)];
+    let mut offsets = vec![0u32; n + 1];
+    for (gs, idxs) in by_group.iter().enumerate() {
+        if idxs.is_empty() {
+            continue;
+        }
+        let rows = idxs.iter().map(|&i| refs[i as usize].1 as usize + 1).max().unwrap();
+        with_texts(table, groups[gs], col, rows, |at, _blob, v| {
+            for &i in idxs {
+                let (i, r) = (i as usize, refs[i as usize].1 as usize);
+                if v.is_some_and(|v| v[r / 8] >> (r % 8) & 1 == 0) {
+                    continue; // NULL: zero length, bit clear
+                }
+                valid[i / 8] |= 1 << (i % 8);
+                offsets[i + 1] = at(r + 1) - at(r);
+            }
+        })?;
+    }
+    for i in 0..n {
+        offsets[i + 1] += offsets[i];
+    }
+    let mut bytes = vec![0u8; offsets[n] as usize];
+    for (gs, idxs) in by_group.iter().enumerate() {
+        if idxs.is_empty() {
+            continue;
+        }
+        let rows = idxs.iter().map(|&i| refs[i as usize].1 as usize + 1).max().unwrap();
+        with_texts(table, groups[gs], col, rows, |at, blob, _v| {
+            for &i in idxs {
+                let (i, r) = (i as usize, refs[i as usize].1 as usize);
+                let (o, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+                if e > o {
+                    let a = at(r) as usize;
+                    bytes[o..e].copy_from_slice(&blob[a..a + (e - o)]);
+                }
+            }
+        })?;
+    }
+    Ok(OutCol::Text { offsets, bytes, valid })
+}
+
+/// The output columns for `refs` (group slot, row): lane sources gather by
+/// reference; direct text columns gather off the image (`groups[gslot]` is
+/// the row group behind a slot); deferred expressions evaluate over the
+/// surviving rows only, in contexts gathered from the kept groups' lanes
+/// (`ctxs[gslot]`).
+pub(super) fn project<S: ReadAt>(
+    table: &mut Table<S>,
     q: &crate::sql::binder::BoundQuery,
     sel_tys: &[Ty],
     srcs: &[Option<SelSrc>],
     refs: &[(u32, u32)],
+    groups: &[usize],
     ctxs: Option<&[Cols]>,
-) -> Vec<OutCol> {
+) -> Result<Vec<OutCol>, FormatError> {
     let deferred: Vec<usize> = srcs
         .iter()
         .enumerate()
@@ -193,15 +286,16 @@ pub(super) fn project(
             late.insert(si, gather_outcol(&SelSrc::Vv(vvs), &local, sel_tys[si]));
         }
     }
-    srcs.iter()
-        .zip(sel_tys)
-        .enumerate()
-        .map(|(si, (src, ty))| match (late.remove(&si), src) {
+    let mut out = Vec::with_capacity(srcs.len());
+    for (si, (src, ty)) in srcs.iter().zip(sel_tys).enumerate() {
+        out.push(match (late.remove(&si), src) {
             (Some(c), _) => c,
+            (None, Some(SelSrc::Segments(col))) => gather_segments(table, *col, refs, groups)?,
             (None, Some(src)) => gather_outcol(src, refs, *ty),
             (None, None) => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty), // zero groups scanned
-        })
-        .collect()
+        });
+    }
+    Ok(out)
 }
 
 
