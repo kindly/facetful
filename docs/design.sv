@@ -1271,3 +1271,28 @@ The handoff measured 508 vs 79; the 430 ms it worked around is gone. Without a L
 
 **+13.9 KB for the release, 82.8% of budget.** The unoptimized deltas in d56–d58 (+7.1, +1.7, +4.1) were close on the whole but not per step: wasm-opt recovers less of the new code than of the old. David found the jump larger than expected; the history says it is the same size as the last one — 0.4.0 → 0.5.0 was +14.6 KB (the UDF ABI 7.3, the streaming converter 7.4), 0.3 → 0.4 about +30 (joins, CTEs, subqueries, EXISTS). Two releases at ~14 KB each is the rate; three more at that rate hit the budget. Where the bytes are, by inspection: the generic `project`/`gather_segments`/`gather_ctx` monomorphize once per table source type, the two hashbrown instantiations for the encoder and its probe, and `table_describe`'s string building. Candidates if a trim is wanted later: one map type for probe and encoder (~1 KB), `describe` emitting a compact binary the JS formats instead of JSON (~1 KB), and the lite-build gate that has been on the list since d51 for callers who want none of the UDF, converter or dictionary machinery. The release is what the tree holds: d54–d58.
 </sv-prose>
+
+<sv-prose id="d59">
+## Position — fusing a facet refresh behind standard SQL: measured, and the batch shape (2026-09-24, discussion with David)
+
+**The question.** A facet UI's interaction is N GROUP BY queries with filters-except-own semantics plus a totals query. Two ways to fuse them into one pass were on the table. A custom aggregate (a `facet(...)` with a FILTER clause) was rejected: agents unfamiliar with the engine would have to learn non-standard SQL. The other — David's preference — is to let a caller hand over all the interaction's SQL at once, single table only, and fuse behind the scenes. The open doubt was whether fusing is worth much once the mask cache already shares the filter work. So it was measured before anything was designed: the M1 primitive `facet_refresh` (one pass over dictionary codes, filters-except-own, still exported from the wasm) against the SQL path a dashboard issues today, counts cross-checked identical on every facet first. `bench/facet-fuse.mjs` reproduces it.
+
+| refresh: 8 facets + totals, engine time in Node | SQL (9 queries) | fused | ratio |
+|---|---|---|---|
+| PUDL 183K rows, cold (empty mask cache) | 7.3–7.7 ms | 1.5 ms | 4.7× |
+| PUDL, warm (identical interaction) | 6.0–6.3 ms | 1.3 ms | 4.5× |
+| PUDL, next click (one selection changes) | 6.0–6.4 ms | 1.4 ms | 4.5× |
+| grantnav 1.52M rows, cold | 73 ms | 18 ms | 4.1× |
+| grantnav, warm | 69 ms | 15 ms | 4.6× |
+| grantnav, next click | 69 ms | 15 ms | 4.6× |
+
+Engine time only; in a page the SQL path also pays nine worker round trips against the fused path's one.
+
+**Where the SQL path's time goes** (anatomy of one warm facet query, PUDL / grantnav): a `count(*)` under the two cached filters 0.3 / 1.5 ms; `group by dim` with no filter at all 0.9 / 7.4 ms; with the filters, count only 0.8 / 4.5 ms; count + sum 1.2 / 8.1 ms. The aggregation kernel is not the cost — the fused pass does the same code counting in ~0.17 / 1.9 ms per dimension. Each SQL query loads its lanes afresh (`codes()` copies the dimension's segment into a `Vec<u16>` per row group, `f64s()` the measure's 12 MB), plans, builds a group table and marshals a result; N queries do that N times, and the measure column is copied once per facet. `facet_refresh` reads segments in place and touches every row's mask once. The mask cache does share the filters, which is why cold and warm barely differ for SQL: the filters were never the expensive part.
+
+**Answer to the doubt: yes, it is much faster — 4.5× on engine time on both datasets, 5 ms per interaction on PUDL and 55 ms on grantnav, before the worker hops.** Not a case of micro-optimizing something already fast: 69 ms per click at gratnav's scale is the difference between a facet panel that feels instant and one that does not.
+
+**The shape, when it is built.** `db.query([sql, sql, …], { table })` — an array in, an array of `Result`s out in the same order, one worker message, one engine call. Agents write the same standard SQL they write now; "send the whole interaction in one call" is how they already think. In the engine, `query_batch` parses and binds every statement; when each one is single-table, has no join/CTE/subquery, and is either `select <dict column>, count(*) [, sum(x) …] … group by <that column>` or an ungrouped `select count(*) [, sum(x) …]`, with a WHERE that is a conjunction of `col = lit` / `col in (…)` / numeric ranges, the batch runs as one fused pass — lanes loaded once, masks from the cache, one scan per dimension over (mask, codes, measure) — and its results are marshalled into ordinary columnar results. Anything else in the array runs as it does today, in order. Errors are per statement (the agent fixes one query, not the batch). The fused executor can start life as the existing `facet_refresh`, already verified identical, generalized to arbitrary aggregates over the group table later. Materialize the shared-lane loading first and measure against the 15 ms ceiling before generalizing further.
+
+**Not in 0.6** (d58 closed that release); the next item after it.
+</sv-prose>
