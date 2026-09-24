@@ -81,6 +81,12 @@ r = await ok({ cmd: "query", table: "t", sql: "select twice(count(*)) as n from 
 if (r.result.columns[0].values[0] !== 400000) throw new Error("registered function");
 if (!(await ok({ cmd: "unregisterFunction", name: "twice" })).ok) throw new Error("unregister");
 
+// memoryStats: the worker's wasm high-water and table count
+{
+  const m = await ok({ cmd: "memoryStats" });
+  if (!(m.wasmBytes > 1 << 20) || m.tables !== 3) throw new Error(`memoryStats ${JSON.stringify(m)}`);
+}
+
 // errors come back as replies, with the query flag set for SQL errors
 let e = await send({ cmd: "query", table: "nope", sql: "select 1" });
 if (e.ok || !/no table loaded: 'nope'/.test(e.error)) throw new Error(`missing table: ${e.error}`);

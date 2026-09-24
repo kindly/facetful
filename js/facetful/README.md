@@ -63,6 +63,7 @@ r.columnRaw("mw"); // Float64Array + validity bitmap, near-zero copy (charts)
 const big = await db.query("select country, mw from t", { dictText: true });
 big.columnRaw("country"); // { codes: Uint16Array, dict: { offsets, bytes }, validity }
 big.dictionary("country"); // the decoded distinct values, indexed by code
+await db.memoryStats(); // { wasmBytes, tables }: the worker's memory high-water, from the page
 console.log(r.elapsedMs, r.stats); // ms in worker, row groups pruned
 ```
 

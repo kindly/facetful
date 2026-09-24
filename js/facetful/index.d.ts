@@ -184,6 +184,15 @@ export declare class Facetful {
   /** Current segment-cache occupancy for a table. */
   cacheStats(options?: { table?: string }): Promise<{ segments: number; bytes: number }>;
 
+  /**
+   * The worker's wasm memory size in bytes and the number of tables it holds.
+   * Wasm linear memory never shrinks, so `wasmBytes` is the worker's
+   * high-water mark: image copies, segment and mask caches, and the largest
+   * result built so far. Attaching DevTools to a dedicated worker is flaky;
+   * this answers the same question from the page.
+   */
+  memoryStats(): Promise<{ wasmBytes: number; tables: number }>;
+
   /** Filter-mask cache byte budget for a table (default 16 MB); 0 disables it. */
   setMaskBudget(bytes: number, options?: { table?: string }): Promise<void>;
 

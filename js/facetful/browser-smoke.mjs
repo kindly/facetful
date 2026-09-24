@@ -52,6 +52,8 @@ window.__smoke = (async () => {
     await step("removeOpfs", () => db.removeOpfs("smoke/t.facetful"));
     await step("registerFunction", () => db.registerFunction("twice", { params: ["int"], returns: "int", perRow: true }, (x) => x * 2));
     eq((await db.query("select twice(count(*)) as n from t", { table: "t" })).column("n")[0], 400000, "registered function");
+    const mem = await step("memoryStats", () => db.memoryStats());
+    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 4) throw new Error("memoryStats: " + JSON.stringify(mem));
     let msg = "";
     try { await db.query("select contry from t", { table: "t" }); } catch (e) { msg = String(e.message); }
     if (!/unknown column 'contry'/.test(msg)) throw new Error("error path: " + msg);

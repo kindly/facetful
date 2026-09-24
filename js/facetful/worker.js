@@ -242,6 +242,10 @@ self.onmessage = async (e) => {
       if (!handle) throw new Error("no table loaded");
       engine.setMaskBudget(handle, e.data.bytes);
       reply({ ok: true });
+    } else if (cmd === "memoryStats") {
+      // the worker's whole footprint in one number: wasm linear memory never
+      // shrinks, so this is its high-water (image copies, caches, results)
+      reply({ ok: true, wasmBytes: engine.mem().byteLength, tables: tables.size });
     } else if (cmd === "cacheStats") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");

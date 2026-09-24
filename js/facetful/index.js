@@ -147,6 +147,14 @@ export class Facetful {
   }
 
   /** { segments, bytes } currently held by a table's segment cache. */
+  /** The worker's wasm memory size in bytes (its high-water: wasm memory never
+   *  shrinks) and how many tables it holds. For reporting a page's memory
+   *  split between the worker and the page's own result buffers. */
+  async memoryStats() {
+    const { wasmBytes, tables } = await this._call({ cmd: "memoryStats" });
+    return { wasmBytes, tables };
+  }
+
   async cacheStats({ table } = {}) {
     const { segments, bytes } = await this._call({ cmd: "cacheStats", table });
     return { segments, bytes };
