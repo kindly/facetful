@@ -19,3 +19,18 @@ node_modules/
 docs/*.sv.lock
 bench/results.tsv
 bench/baseline.tsv
+
+# never part of the project: home-directory names that a sandboxed `git add -A`
+# once picked up as empty files (the sandbox masks these paths as /dev/null)
+/.bash_profile
+/.bashrc
+/.claude/
+/.gitconfig
+/.gitmodules
+/.idea
+/.mcp.json
+/.profile
+/.ripgreprc
+/.vscode
+/.zprofile
+/.zshrc
