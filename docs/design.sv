@@ -1256,5 +1256,18 @@ The handoff measured 508 vs 79; the 430 ms it worked around is gone. Without a L
 | d57: text gathers off the image, `query_run_opts` | 249,908 | +2.3 KB |
 | d58: `"all"`, `table_describe` | 254,469 | +4.6 KB |
 
+**Every release, measured the same way** (each tag rebuilt and optimized with binaryen 119, gz bytes):
+
+| release | date | gz optimized | step |
+|---|---|---|---|
+| 0.1.0 | Sep 11 | 162,683 | |
+| 0.2.0 | Sep 12 | 172,976 | +10.3 KB |
+| 0.3.0 | Sep 13 | 183,842 | +10.9 KB |
+| 0.3.1 | Sep 18 | 184,464 | +0.6 KB |
+| 0.4.0 | Sep 19 | 225,887 | **+41.4 KB** (joins, CTEs, subqueries, IN/EXISTS, materialize, the catalog) |
+| 0.5.0 | Sep 20 | 240,543 | +14.7 KB (UDF ABI, streaming converter) |
+| 0.5.1 | Sep 23 | 240,543 | 0 |
+| this tree | Sep 24 | 254,469 | +13.9 KB |
+
 **+13.9 KB for the release, 82.8% of budget.** The unoptimized deltas in d56–d58 (+7.1, +1.7, +4.1) were close on the whole but not per step: wasm-opt recovers less of the new code than of the old. David found the jump larger than expected; the history says it is the same size as the last one — 0.4.0 → 0.5.0 was +14.6 KB (the UDF ABI 7.3, the streaming converter 7.4), 0.3 → 0.4 about +30 (joins, CTEs, subqueries, EXISTS). Two releases at ~14 KB each is the rate; three more at that rate hit the budget. Where the bytes are, by inspection: the generic `project`/`gather_segments`/`gather_ctx` monomorphize once per table source type, the two hashbrown instantiations for the encoder and its probe, and `table_describe`'s string building. Candidates if a trim is wanted later: one map type for probe and encoder (~1 KB), `describe` emitting a compact binary the JS formats instead of JSON (~1 KB), and the lite-build gate that has been on the list since d51 for callers who want none of the UDF, converter or dictionary machinery. The release is what the tree holds: d54–d58.
 </sv-prose>
