@@ -157,9 +157,11 @@ export class Facetful {
     await this._call({ cmd: "setMaskBudget", bytes, table });
   }
 
-  /** Run SQL. `table` selects a loaded table (defaults to the last loaded). */
-  async query(sql, { table } = {}) {
-    const { result } = await this._call({ cmd: "query", sql, table });
+  /** Run SQL. `table` selects a loaded table (defaults to the last loaded).
+   *  `dictText`: text columns backed by a dictionary come back as codes + a
+   *  dictionary on `columnRaw` (rows()/column() still return strings). */
+  async query(sql, { table, dictText } = {}) {
+    const { result } = await this._call({ cmd: "query", sql, table, dictText });
     return new Result(result);
   }
 
@@ -192,9 +194,16 @@ export class Result {
     return c;
   }
 
-  /** Raw buffers: { kind, values | offsets+bytes, validity }. */
+  /** Raw buffers: { kind, values | offsets+bytes | codes+dict, validity }. */
   columnRaw(name) {
     return this._find(name);
+  }
+
+  /** The decoded dictionary of a `dictText` column (index by a row's code), or
+   *  null when the column came as per-row text. Decoded once per result. */
+  dictionary(name) {
+    const c = this._find(name);
+    return c.codes ? dictStrings(c) : null;
   }
 
   /** Materialized values with nulls, in row order. */
@@ -216,6 +225,18 @@ export class Result {
   }
 }
 
+const dictCache = new WeakMap();
+function dictStrings(c) {
+  let strs = dictCache.get(c);
+  if (!strs) {
+    const n = c.dict.offsets.length - 1;
+    strs = new Array(n);
+    for (let k = 0; k < n; k++) strs[k] = dec.decode(c.dict.bytes.subarray(c.dict.offsets[k], c.dict.offsets[k + 1]));
+    dictCache.set(c, strs);
+  }
+  return strs;
+}
+
 function cellValue(c, i) {
   if ((c.validity[i >> 3] & (1 << (i & 7))) === 0) return null;
   switch (c.kind) {
@@ -230,6 +251,7 @@ function cellValue(c, i) {
     case "timestamp": // ms since epoch -> ISO, UTC
       return new Date(c.values[i]).toISOString().replace("T", " ").slice(0, 19);
     default:
+      if (c.codes) return dictStrings(c)[c.codes[i]];
       return dec.decode(c.bytes.subarray(c.offsets[i], c.offsets[i + 1]));
   }
 }

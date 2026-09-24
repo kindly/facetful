@@ -107,6 +107,68 @@ impl VV {
     }
 }
 
+/// `valid` at `rows`, as a fresh bitmap (None stays None).
+fn gather_valid(valid: &Option<Rc<Vec<u8>>>, rows: &[u32]) -> Option<Rc<Vec<u8>>> {
+    let b = valid.as_ref()?;
+    let mut out = vec![0u8; rows.len().div_ceil(8)];
+    for (i, &r) in rows.iter().enumerate() {
+        let r = r as usize;
+        if b[r / 8] >> (r % 8) & 1 != 0 {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    Some(Rc::new(out))
+}
+
+fn pick<T: Copy>(v: &[T], rows: &[u32]) -> Rc<Vec<T>> {
+    Rc::new(rows.iter().map(|&r| v[r as usize]).collect())
+}
+
+impl VV {
+    /// This lane at `rows`, in that order.
+    pub(super) fn gather(&self, rows: &[u32]) -> VV {
+        let data = match &self.data {
+            Data::I64(v) => Data::I64(pick(v, rows)),
+            Data::F64(v) => Data::F64(pick(v, rows)),
+            Data::Bool(v) => Data::Bool(pick(v, rows)),
+            Data::Codes { codes, dict } => Data::Codes { codes: pick(codes, rows), dict: dict.clone() },
+            Data::Text(v) => Data::Text(Rc::new(rows.iter().map(|&r| v[r as usize].clone()).collect())),
+            Data::Const(c) => Data::Const(c.clone()),
+        };
+        VV { data, valid: gather_valid(&self.valid, rows) }
+    }
+}
+
+/// One group's lanes restricted to `rows` (in that order): the context in
+/// which select expressions evaluate for the rows that survived the window,
+/// not for every row the scan kept. Only the chosen rows' bytes are copied.
+pub(super) fn gather_ctx(cols: &Cols, rows: &[u32]) -> GroupCtx {
+    let cols = cols
+        .iter()
+        .map(|(&k, (c, valid))| {
+            let sub = match c {
+                GroupCol::Ready(vv) => GroupCol::Ready(vv.gather(rows)),
+                GroupCol::I64(v) => GroupCol::I64(pick(v, rows)),
+                GroupCol::F64(v) => GroupCol::F64(pick(v, rows)),
+                GroupCol::Dict { codes, dict } => GroupCol::Dict { codes: pick(codes, rows), dict: dict.clone() },
+                GroupCol::Text { offsets, bytes, .. } => {
+                    let mut o = Vec::with_capacity(rows.len() + 1);
+                    o.push(0u32);
+                    let mut b = Vec::new();
+                    for &r in rows {
+                        let r = r as usize;
+                        b.extend_from_slice(&bytes[offsets[r] as usize..offsets[r + 1] as usize]);
+                        o.push(b.len() as u32);
+                    }
+                    GroupCol::Text { strs: std::cell::OnceCell::new(), offsets: Rc::new(o), bytes: Rc::new(b) }
+                }
+            };
+            (k, (sub, gather_valid(valid, rows)))
+        })
+        .collect();
+    GroupCtx { cols, rows: rows.len() }
+}
+
 /// intersect validities (arithmetic null propagation)
 pub(super) fn valid_and(rows: usize, a: &VV, b: &VV) -> Option<Rc<Vec<u8>>> {
     let an = matches!(&a.data, Data::Const(v) if v.is_null());
@@ -123,6 +185,7 @@ pub(super) fn valid_and(rows: usize, a: &VV, b: &VV) -> Option<Rc<Vec<u8>>> {
 
 // ---------------- group context ----------------
 
+#[derive(Clone)]
 pub(super) enum GroupCol {
     /// an already-built lane (the group table's aggregate and key columns)
     Ready(VV),

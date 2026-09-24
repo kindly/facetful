@@ -1,7 +1,7 @@
 // Drives core.js directly (no worker) against the 200K spike image:
 // protocol correctness incl. error path, nulls, text marshalling.
 import { readFileSync } from "node:fs";
-import { instantiate, QueryError } from "./core.js";
+import { instantiate, QueryError, transferables } from "./core.js";
 
 const root = new URL("../../", import.meta.url);
 const engine = await instantiate(readFileSync(new URL("target/wasm32-unknown-unknown/release/facetful_wasm.wasm", root)));
@@ -231,6 +231,32 @@ try {
   if (r.rowCount !== 2 || !/^COUNTRY_\d+$/.test(text(r.columns[0], 0))) throw new Error("udfs in GROUP BY");
   for (const u of udfs) engine.unregisterFunction(u.name);
   console.log(`udfs module: OK (${udfs.length} functions)`);
+}
+
+// dictionary results: a dict-backed text column as codes + compacted dictionary
+{
+  const sql = "select country, owner || '' as o, capacity from t where capacity > 3 order by id";
+  const plain = engine.query(handle, sql);
+  const d = engine.query(handle, sql, { dictText: true });
+  const c = d.columns[0];
+  if (!c.codes || c.codes.length !== d.rowCount || !c.dict || c.offsets) throw new Error("dictText: country should be codes + dict");
+  if (d.columns[1].codes || !d.columns[1].offsets) throw new Error("dictText: a computed text column stays per-row text");
+  const dn = c.dict.offsets.length - 1;
+  const strs = Array.from({ length: dn }, (_, k) => dec.decode(c.dict.bytes.subarray(c.dict.offsets[k], c.dict.offsets[k + 1])));
+  const distinct = new Set();
+  for (let i = 0; i < d.rowCount; i++) {
+    const want = text(plain.columns[0], i);
+    distinct.add(want);
+    if (strs[c.codes[i]] !== want) throw new Error(`dictText: row ${i} decodes to ${strs[c.codes[i]]}, text path says ${want}`);
+  }
+  if (dn !== distinct.size) throw new Error(`dictText: dictionary has ${dn} entries for ${distinct.size} distinct values`);
+  const one = engine.query(handle, "select country from t where country = 'country_7'", { dictText: true }).columns[0];
+  if (one.dict.offsets.length !== 2 || one.codes.some((x) => x !== 0)) throw new Error("dictText: compaction to the one value present");
+  const t = transferables(d);
+  if (t.length !== 9) throw new Error(`dictText: ${t.length} transferables (3 validity + codes + dict offsets + dict bytes + text offsets + text bytes + float values)`);
+  const bytesNow = (d.rowCount * 2) + c.dict.offsets.byteLength + c.dict.bytes.byteLength;
+  const bytesText = plain.columns[0].offsets.byteLength + plain.columns[0].bytes.byteLength;
+  console.log(`dict results: OK (${d.rowCount} rows, ${dn} values; ${(bytesText / 1e6).toFixed(1)} MB as text -> ${(bytesNow / 1e6).toFixed(2)} MB as codes)`);
 }
 
 console.log("js protocol smoke: OK");

@@ -81,6 +81,14 @@ const QUERIES: &[&str] = &[
     "select count(*) from t where not (capacity > 50)",
     // NULL ordering (both put NULL first ascending) with tiebreak
     "select capacity, id from t order by capacity, id limit 25",
+    // windowed projection: select expressions evaluate for the window only
+    // (d55) — the full-sort path (offset past the top-k bound), the plain
+    // path, and top-k, each with computed columns and NULLs in the inputs
+    "select upper(country) || ':' || status as tag, capacity * 2 as c2, coalesce(capacity, -1) as c \
+     from t order by capacity desc, id limit 7 offset 150000",
+    "select country || '-' || owner as co, id * 2 as d, capacity + 1 as c1 from t limit 5 offset 150003",
+    "select substr(owner, 1, 6) as o, capacity * 10 as c10, length(status) as l from t \
+     where capacity is null or capacity > 500 order by id limit 9 offset 40",
     // empty aggregate
     "select count(*), sum(capacity), avg(capacity) from t where id < 0",
     // expression over aggregates

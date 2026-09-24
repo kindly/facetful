@@ -6,12 +6,15 @@ cd "$(dirname "$0")/.."
 ./scripts/size-check.sh   # builds + wasm-opt (when available) + enforces budget
 
 WASM=target/wasm32-unknown-unknown/release/facetful_wasm.wasm
-[ -f "$WASM.opt" ] && WASM="$WASM.opt"
+# an .opt from an earlier build must not shadow a fresh raw build (it did once:
+# the worker and browser smokes ran against a wasm without the new exports)
+[ "$WASM.opt" -nt "$WASM" ] && WASM="$WASM.opt"
 cp "$WASM" js/facetful/facetful_wasm.wasm
 
 node js/facetful/node-smoke.mjs
 node js/facetful/node-parquet-diff.mjs
 node js/facetful/node-worker-smoke.mjs   # worker.js through its message protocol
+node js/facetful/browser-smoke.mjs       # the public API in headless Chromium: module worker, OPFS, Blob streaming
 
 # the command itself: a streamed conversion must reproduce the checked-in image,
 # and a query with a ready-made function must run without flags

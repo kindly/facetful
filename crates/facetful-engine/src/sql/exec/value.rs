@@ -99,6 +99,39 @@ pub enum OutCol {
     F64 { v: Vec<f64>, valid: Vec<u8> },
     Bool { v: Vec<u8>, valid: Vec<u8> },
     Text { offsets: Vec<u32>, bytes: Vec<u8>, valid: Vec<u8> },
+    /// A dictionary column selected as-is: the image's codes into the column's
+    /// shared dictionary, never expanded to a string per row here. Consumers
+    /// expand (`outcol_val`), compact (`compact_dict`) or pass the codes on.
+    /// Codes of NULL rows are unspecified and may be out of range.
+    Dict { codes: Vec<u16>, dict: Rc<Vec<Rc<String>>>, valid: Vec<u8> },
+}
+
+/// Remap a dictionary column onto only the entries its valid rows use, in
+/// dictionary order: `(codes, used entries)`. NULL rows get code 0. Linear in
+/// rows + dictionary; no string is copied (the entries are shared `Rc`s).
+pub fn compact_dict(codes: &[u16], dict: &[Rc<String>], valid: &[u8], n: usize) -> (Vec<u16>, Vec<Rc<String>>) {
+    let mut used = vec![false; dict.len()];
+    for i in 0..n {
+        if valid[i / 8] >> (i % 8) & 1 != 0 {
+            if let Some(u) = used.get_mut(codes[i] as usize) {
+                *u = true;
+            }
+        }
+    }
+    let mut remap = vec![0u16; dict.len()];
+    let mut out_dict = Vec::new();
+    for (k, &u) in used.iter().enumerate() {
+        if u {
+            remap[k] = out_dict.len() as u16;
+            out_dict.push(dict[k].clone());
+        }
+    }
+    let out_codes = (0..n)
+        .map(|i| {
+            if valid[i / 8] >> (i % 8) & 1 != 0 { remap.get(codes[i] as usize).copied().unwrap_or(0) } else { 0 }
+        })
+        .collect();
+    (out_codes, out_dict)
 }
 
 impl QueryResult {
@@ -153,6 +186,16 @@ pub(super) fn outcol_val(c: &OutCol, i: usize, ty: Ty) -> Val {
                     String::from_utf8_lossy(&bytes[offsets[i] as usize..offsets[i + 1] as usize])
                         .into_owned(),
                 )
+            }
+        }
+        OutCol::Dict { codes, dict, valid } => {
+            if !ok(valid) {
+                Val::Null
+            } else {
+                match dict.get(codes[i] as usize) {
+                    Some(s) => Val::Text(s.clone()),
+                    None => Val::Null,
+                }
             }
         }
     }

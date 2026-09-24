@@ -250,7 +250,7 @@ self.onmessage = async (e) => {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
       const t0 = performance.now();
-      const result = engine.query(handle, e.data.sql);
+      const result = engine.query(handle, e.data.sql, { dictText: e.data.dictText === true });
       result.elapsedMs = performance.now() - t0;
       reply({ ok: true, result }, transferables(result));
     } else {

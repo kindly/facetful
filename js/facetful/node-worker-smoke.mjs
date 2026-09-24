@@ -65,6 +65,16 @@ if (c.rows !== 200000) throw new Error(`loadCsv rows ${c.rows}`);
 r = await ok({ cmd: "query", table: "c", sql: "select country from c order by country limit 1" });
 if (text(r.result.columns[0], 0) !== "country_0") throw new Error(`loadCsv query ${text(r.result.columns[0], 0)}`);
 
+// dictText: codes + dictionary cross the boundary, decoded on the page side
+r = await ok({ cmd: "query", table: "t", sql: "select country from t where capacity > 3 order by id", dictText: true });
+{
+  const c = r.result.columns[0];
+  if (!c.codes || c.codes.length !== r.result.rowCount || !c.dict) throw new Error("dictText through the worker");
+  const first = dec.decode(c.dict.bytes.subarray(c.dict.offsets[c.codes[0]], c.dict.offsets[c.codes[0] + 1]));
+  const plain = await ok({ cmd: "query", table: "t", sql: "select country from t where capacity > 3 order by id limit 1" });
+  if (first !== text(plain.result.columns[0], 0)) throw new Error(`dictText decode ${first}`);
+}
+
 // registerFunction from source text (functions don't cross postMessage)
 await ok({ cmd: "registerFunction", name: "twice", signature: { params: ["int"], returns: "int", perRow: true }, source: "(x) => x * 2" });
 r = await ok({ cmd: "query", table: "t", sql: "select twice(count(*)) as n from t" });
@@ -77,4 +87,4 @@ if (e.ok || !/no table loaded: 'nope'/.test(e.error)) throw new Error(`missing t
 e = await send({ cmd: "query", sql: "select contry from t" });
 if (e.ok || !e.isQueryError || !/unknown column 'contry'/.test(e.error)) throw new Error(`query error: ${e.error}`);
 
-console.log("worker smoke: OK (load, query, materialize, join, loadCsv, registerFunction, errors)");
+console.log("worker smoke: OK (load, query, materialize, join, loadCsv, dictText, registerFunction, errors)");

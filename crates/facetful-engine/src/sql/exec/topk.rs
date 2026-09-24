@@ -140,31 +140,36 @@ impl TopK {
         lane_cols.sort_unstable();
         lane_cols.dedup();
 
-        let mut sel_cache: HashMap<u32, Vec<Option<VV>>> = HashMap::new();
+        // per group: lanes as deep as its deepest winner, then gathered at the
+        // winners' rows so expressions evaluate over those rows only (a page
+        // of 50 spread over 40 groups is 50 evaluations, not 40 groups' worth)
+        let mut sel_cache: HashMap<u32, (HashMap<u32, u32>, Vec<Option<VV>>)> = HashMap::new();
         let mut rows: Vec<Vec<Val>> = Vec::with_capacity(winners.len());
         for (wi, &(cg, crow)) in winners.iter().enumerate() {
             if !sel_cache.contains_key(&cg) {
                 let g = cg as usize;
-                // lanes only as deep as this group's deepest winner
-                let cap = winners.iter().filter(|w| w.0 == cg).map(|w| w.1 as usize + 1).max().unwrap();
+                let rows_g: Vec<u32> = winners.iter().filter(|w| w.0 == cg).map(|w| w.1).collect();
+                let cap = rows_g.iter().map(|&r| r as usize + 1).max().unwrap();
                 let mut cols: Cols = HashMap::new();
                 sh.load(table, g, &mut cols, &lane_cols, cap)?;
-                let ctx = GroupCtx { cols, rows: cap };
+                let ctx = gather_ctx(&cols, &rows_g);
                 let sel_vvs: Vec<Option<VV>> = q
                     .select
                     .iter()
                     .enumerate()
                     .map(|(si, s)| (!gathered.contains_key(&si)).then(|| eval_vec(&s.expr, &ctx)))
                     .collect();
-                sel_cache.insert(cg, sel_vvs);
+                let pos: HashMap<u32, u32> = rows_g.iter().enumerate().map(|(i, &r)| (r, i as u32)).collect();
+                sel_cache.insert(cg, (pos, sel_vvs));
             }
-            let sel = &sel_cache[&cg];
+            let (pos, sel) = &sel_cache[&cg];
+            let at = pos[&crow] as usize;
             rows.push(
                 sel.iter()
                     .zip(&sh.sel_tys)
                     .enumerate()
                     .map(|(si, (v, t))| match v {
-                        Some(v) => v.val_at(crow as usize, *t),
+                        Some(v) => v.val_at(at, *t),
                         None => gathered[&si][wi].clone(),
                     })
                     .collect(),

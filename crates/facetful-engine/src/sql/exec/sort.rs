@@ -8,15 +8,21 @@ pub(super) struct FullSort {
     /// per scanned group: its ORDER BY lanes and the rows the WHERE kept
     groups: Vec<(Vec<VV>, Vec<u32>)>,
     srcs: Vec<Option<SelSrc>>,
+    /// with a window: every scanned group's lanes (Rc clones), so select
+    /// expressions run over the rows in the window only, after the sort
+    ctxs: Option<Vec<Cols>>,
 }
 
 impl FullSort {
-    pub(super) fn new(n_select: usize) -> FullSort {
-        FullSort { groups: Vec::new(), srcs: (0..n_select).map(|_| None).collect() }
+    pub(super) fn new(n_select: usize, defer: bool) -> FullSort {
+        FullSort { groups: Vec::new(), srcs: (0..n_select).map(|_| None).collect(), ctxs: defer.then(Vec::new) }
     }
 
     pub(super) fn scan_group(&mut self, sh: &Shared, ctx: &GroupCtx, keep: Option<&[u8]>) {
-        sel_srcs_for_group(sh.q, ctx, &mut self.srcs);
+        sel_srcs_for_group(sh.q, ctx, &mut self.srcs, self.ctxs.is_some());
+        if let Some(c) = &mut self.ctxs {
+            c.push(ctx.cols.clone());
+        }
         let ord_vvs: Vec<VV> = sh.q.order_by.iter().map(|(e, _)| eval_vec(e, ctx)).collect();
         // a plain invariant bool unswitches out of the row loops more reliably
         // than matching the Option per row (measured 0.1 ms on 183K rows)
@@ -93,15 +99,7 @@ impl FullSort {
 
         let (offset, limit) = sh.window();
         let final_refs: Vec<(u32, u32)> = order_refs.into_iter().skip(offset).take(limit).collect();
-        let cols: Vec<OutCol> = self
-            .srcs
-            .iter()
-            .zip(&sh.sel_tys)
-            .map(|(src, ty)| match src {
-                Some(src) => gather_outcol(src, &final_refs, *ty),
-                None => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty),
-            })
-            .collect();
+        let cols = project(q, &sh.sel_tys, &self.srcs, &final_refs, self.ctxs.as_deref());
         sh.result(table, Vec::new(), Some(cols), final_refs.len())
     }
 }

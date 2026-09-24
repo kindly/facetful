@@ -35,6 +35,13 @@ export interface RawColumn {
   offsets?: Uint32Array;
   /** text only: UTF-8 blob. */
   bytes?: Uint8Array;
+  /** text queried with `dictText`, when the column is dictionary-backed: one
+   *  code per row into `dict` (NULL rows per `validity`); `offsets`/`bytes`
+   *  are then absent. Uint32Array is reserved for dictionaries past 65,535. */
+  codes?: Uint16Array | Uint32Array;
+  /** with `codes`: the distinct values present, in dictionary order, laid out
+   *  like a text column (`offsets` has one more entry than there are values). */
+  dict?: { offsets: Uint32Array; bytes: Uint8Array };
 }
 
 export type CellValue = number | string | boolean | null;
@@ -47,6 +54,9 @@ export declare class Result {
   elapsedMs: number;
   /** Raw transferred buffers for a column — near-zero copy, ideal for charts. */
   columnRaw(name: string): RawColumn;
+  /** The decoded dictionary of a `dictText` column (index it by a row's code),
+   *  or null when the column came as per-row text. Decoded once per result. */
+  dictionary(name: string): string[] | null;
   /** Materialized values with nulls; date/timestamp as ISO strings. */
   column(name: string): CellValue[];
   /** Row objects, materialized lazily. */
@@ -181,8 +191,15 @@ export declare class Facetful {
    * Run SQL (SELECT-only; the table is always `t`). `table` picks a loaded
    * table by name, defaulting to the most recently loaded. Rejects with an
    * Error whose message is a rendered diagnostic (caret + hint) on SQL errors.
+   *
+   * `dictText`: a text column that is dictionary-encoded in the image (and
+   * selected as-is) comes back as `codes` + `dict` on `columnRaw` instead of
+   * one string per row — for a 1.5M-row result over a 372-value column that is
+   * 3 MB instead of 52 MB, and nothing per row is built or copied. `rows()`,
+   * `column()` and `dictionary()` decode it; existing `columnRaw` readers only
+   * see a change when they pass the option.
    */
-  query(sql: string, options?: { table?: string }): Promise<Result>;
+  query(sql: string, options?: { table?: string; dictText?: boolean }): Promise<Result>;
 
   /** Terminate the worker. */
   close(): void;

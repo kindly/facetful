@@ -8,6 +8,13 @@ use super::*;
 pub(super) enum SelSrc {
     Vv(Vec<VV>),
     RawText(Vec<(Rc<Vec<u32>>, Rc<Vec<u8>>, Option<Rc<Vec<u8>>>)>),
+    /// a dictionary column selected as-is: per group its codes + validity,
+    /// one dictionary shared by every group (the image's is table-wide)
+    Dict { groups: Vec<(Rc<Vec<u16>>, Option<Rc<Vec<u8>>>)>, dict: Rc<Vec<VStr>> },
+    /// an expression whose evaluation waits for the window: the strategy
+    /// keeps each group's lanes and `project` runs it over the surviving
+    /// rows only (a paged query pays for its page, not for every kept row)
+    Deferred,
 }
 
 pub(super) fn gather_outcol(src: &SelSrc, refs: &[(u32, u32)], ty: Ty) -> OutCol {
@@ -29,6 +36,20 @@ pub(super) fn gather_outcol(src: &SelSrc, refs: &[(u32, u32)], ty: Ty) -> OutCol
             }
             OutCol::Text { offsets, bytes, valid }
         }
+        SelSrc::Dict { groups, dict } => {
+            // codes copy at memcpy-like speed; no string is touched
+            let mut codes = Vec::with_capacity(n);
+            for (i, &(g, r)) in refs.iter().enumerate() {
+                let (c, v) = &groups[g as usize];
+                let r = r as usize;
+                if v.as_deref().map_or(true, |vb| vb[r / 8] >> (r % 8) & 1 != 0) {
+                    valid[i / 8] |= 1 << (i % 8);
+                }
+                codes.push(c[r]);
+            }
+            OutCol::Dict { codes, dict: dict.clone(), valid }
+        }
+        SelSrc::Deferred => unreachable!("deferred sources are evaluated by `project`"),
         SelSrc::Vv(vvs) => match ty {
             Ty::Float => {
                 let mut v = vec![0f64; n];
@@ -82,31 +103,105 @@ pub(super) fn gather_outcol(src: &SelSrc, refs: &[(u32, u32)], ty: Ty) -> OutCol
     }
 }
 
-/// Build per-select sources for one group: direct plain-text columns give raw
-/// blob access, everything else evaluates to a VV.
+/// Build per-select sources for one group: direct text and dictionary
+/// columns give lane access; everything else evaluates to a VV now, or —
+/// with `defer` — waits for the window (the caller keeps the group's lanes).
 pub(super) fn sel_srcs_for_group(
     q: &crate::sql::binder::BoundQuery,
     ctx: &GroupCtx,
     srcs: &mut [Option<SelSrc>],
+    defer: bool,
 ) {
     for (si, sel) in q.select.iter().enumerate() {
-        let raw = match &sel.expr {
-            Bound::Column { index, ty: Ty::Text } => match ctx.cols.get(index) {
-                Some((GroupCol::Text { offsets, bytes, .. }, validity)) => {
-                    Some((offsets.clone(), bytes.clone(), validity.clone()))
-                }
-                _ => None,
-            },
+        let lane = match &sel.expr {
+            Bound::Column { index, ty: Ty::Text } => ctx.cols.get(index),
             _ => None,
         };
-        match (&mut srcs[si], raw) {
-            (Some(SelSrc::RawText(v)), Some(r)) => v.push(r),
-            (slot @ None, Some(r)) => *slot = Some(SelSrc::RawText(vec![r])),
-            (Some(SelSrc::Vv(v)), None) => v.push(eval_vec(&sel.expr, ctx)),
-            (slot @ None, None) => *slot = Some(SelSrc::Vv(vec![eval_vec(&sel.expr, ctx)])),
-            _ => unreachable!("select expr shape is stable across groups"),
+        let slot = &mut srcs[si];
+        match (lane, &mut *slot) {
+            (Some((GroupCol::Text { offsets, bytes, .. }, validity)), Some(SelSrc::RawText(v))) => {
+                v.push((offsets.clone(), bytes.clone(), validity.clone()))
+            }
+            (Some((GroupCol::Text { offsets, bytes, .. }, validity)), None) => {
+                *slot = Some(SelSrc::RawText(vec![(offsets.clone(), bytes.clone(), validity.clone())]))
+            }
+            (Some((GroupCol::Dict { codes, .. }, validity)), Some(SelSrc::Dict { groups, .. })) => {
+                groups.push((codes.clone(), validity.clone()))
+            }
+            (Some((GroupCol::Dict { codes, dict }, validity)), None) => {
+                *slot = Some(SelSrc::Dict {
+                    groups: vec![(codes.clone(), validity.clone())],
+                    dict: dict.clone(),
+                })
+            }
+            (Some((GroupCol::Text { .. } | GroupCol::Dict { .. }, _)), Some(_)) => {
+                unreachable!("select expr shape is stable across groups")
+            }
+            (_, Some(SelSrc::Deferred)) => {}
+            (_, Some(SelSrc::Vv(v))) => v.push(eval_vec(&sel.expr, ctx)),
+            (_, None) if defer => *slot = Some(SelSrc::Deferred),
+            (_, None) => *slot = Some(SelSrc::Vv(vec![eval_vec(&sel.expr, ctx)])),
+            (_, Some(_)) => unreachable!("select expr shape is stable across groups"),
         }
     }
+}
+
+/// The output columns for `refs` (group slot, row): direct sources gather by
+/// reference; deferred expressions evaluate over the surviving rows only,
+/// in contexts gathered from the kept groups' lanes (`ctxs[gslot]`).
+pub(super) fn project(
+    q: &crate::sql::binder::BoundQuery,
+    sel_tys: &[Ty],
+    srcs: &[Option<SelSrc>],
+    refs: &[(u32, u32)],
+    ctxs: Option<&[Cols]>,
+) -> Vec<OutCol> {
+    let deferred: Vec<usize> = srcs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Some(SelSrc::Deferred)))
+        .map(|(i, _)| i)
+        .collect();
+    let mut late: HashMap<usize, OutCol> = HashMap::new();
+    if !deferred.is_empty() {
+        let ctxs = ctxs.expect("deferred select sources need the groups' lanes");
+        // the surviving rows of each group, in ref order; a ref becomes
+        // (sub-context index, position) so gather_outcol reads the small lanes
+        let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); ctxs.len()];
+        for &(g, r) in refs {
+            rows_of[g as usize].push(r);
+        }
+        let mut sub_of: Vec<u32> = vec![u32::MAX; ctxs.len()];
+        let mut subs: Vec<GroupCtx> = Vec::new();
+        for (g, rows) in rows_of.iter().enumerate() {
+            if !rows.is_empty() {
+                sub_of[g] = subs.len() as u32;
+                subs.push(gather_ctx(&ctxs[g], rows));
+            }
+        }
+        let mut next: Vec<u32> = vec![0; ctxs.len()];
+        let local: Vec<(u32, u32)> = refs
+            .iter()
+            .map(|&(g, _)| {
+                let pos = next[g as usize];
+                next[g as usize] += 1;
+                (sub_of[g as usize], pos)
+            })
+            .collect();
+        for &si in &deferred {
+            let vvs: Vec<VV> = subs.iter().map(|sub| eval_vec(&q.select[si].expr, sub)).collect();
+            late.insert(si, gather_outcol(&SelSrc::Vv(vvs), &local, sel_tys[si]));
+        }
+    }
+    srcs.iter()
+        .zip(sel_tys)
+        .enumerate()
+        .map(|(si, (src, ty))| match (late.remove(&si), src) {
+            (Some(c), _) => c,
+            (None, Some(src)) => gather_outcol(src, refs, *ty),
+            (None, None) => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty), // zero groups scanned
+        })
+        .collect()
 }
 
 

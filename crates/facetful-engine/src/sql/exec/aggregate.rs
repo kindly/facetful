@@ -356,9 +356,17 @@ impl Aggregate {
                 // a text key selected as-is gathers off its raw lane: no
                 // Rc<String> is ever built for it
                 if let Bound::Column { index, ty: Ty::Text } = &expr {
-                    if let Some((GroupCol::Text { offsets, bytes, .. }, valid)) = gctx.cols.get(index) {
-                        let src = SelSrc::RawText(vec![(offsets.clone(), bytes.clone(), valid.clone())]);
-                        return gather_outcol(&src, &refs, *ty);
+                    match gctx.cols.get(index) {
+                        Some((GroupCol::Text { offsets, bytes, .. }, valid)) => {
+                            let src = SelSrc::RawText(vec![(offsets.clone(), bytes.clone(), valid.clone())]);
+                            return gather_outcol(&src, &refs, *ty);
+                        }
+                        // a dictionary key stays codes: the group table already holds them
+                        Some((GroupCol::Dict { codes, dict }, valid)) => {
+                            let src = SelSrc::Dict { groups: vec![(codes.clone(), valid.clone())], dict: dict.clone() };
+                            return gather_outcol(&src, &refs, *ty);
+                        }
+                        _ => {}
                     }
                 }
                 gather_outcol(&SelSrc::Vv(vec![eval_vec(&expr, &gctx)]), &refs, *ty)

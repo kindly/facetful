@@ -358,8 +358,13 @@ export class Engine {
     this.w.dealloc(p, b.byteLength);
   }
 
-  /** Run SQL; returns { columns, rowCount, stats } with copied-out buffers. */
-  query(tableHandle, sql) {
+  /** Run SQL; returns { columns, rowCount, stats } with copied-out buffers.
+   *  `dictText`: a text column backed by a dictionary arrives as `codes`
+   *  (Uint16Array, one per row) + `dict` ({ offsets, bytes }: the distinct
+   *  values present, in dictionary order) instead of a string per row — the
+   *  wasm side never builds the per-row form. Plain text columns are
+   *  unaffected. */
+  query(tableHandle, sql, { dictText = false } = {}) {
     const sqlBytes = this.enc.encode(sql);
     const sqlPtr = u32(this.w.alloc(sqlBytes.byteLength));
     new Uint8Array(this.mem(), sqlPtr, sqlBytes.byteLength).set(sqlBytes);
@@ -386,10 +391,22 @@ export class Engine {
         } else if (kind === "bool") {
           col.values = new Uint8Array(this.mem(), u32(this.w.col_bools_ptr(h, i)), rowCount).slice();
         } else {
-          col.offsets = new Uint32Array(this.mem(), u32(this.w.col_offsets_ptr(h, i)), rowCount + 1).slice();
-          col.bytes = new Uint8Array(
-            this.mem(), u32(this.w.col_bytes_ptr(h, i)), u32(this.w.col_bytes_len(h, i)),
-          ).slice();
+          const dn = dictText ? this.w.col_dict_len(h, i) : 0;
+          if (dn > 0) {
+            col.codes = new Uint16Array(this.mem(), u32(this.w.col_codes_ptr(h, i)), rowCount).slice();
+            col.dict = {
+              offsets: new Uint32Array(this.mem(), u32(this.w.col_dict_offsets_ptr(h, i)), dn + 1).slice(),
+              bytes: new Uint8Array(
+                this.mem(), u32(this.w.col_dict_bytes_ptr(h, i)), u32(this.w.col_dict_bytes_len(h, i)),
+              ).slice(),
+            };
+          } else {
+            // asking for offsets expands a dictionary column inside the wasm
+            col.offsets = new Uint32Array(this.mem(), u32(this.w.col_offsets_ptr(h, i)), rowCount + 1).slice();
+            col.bytes = new Uint8Array(
+              this.mem(), u32(this.w.col_bytes_ptr(h, i)), u32(this.w.col_bytes_len(h, i)),
+            ).slice();
+          }
         }
         columns.push(col);
       }
@@ -414,6 +431,9 @@ export function transferables(result) {
     if (c.values) t.push(c.values.buffer);
     if (c.offsets) {
       t.push(c.offsets.buffer, c.bytes.buffer);
+    }
+    if (c.codes) {
+      t.push(c.codes.buffer, c.dict.offsets.buffer, c.dict.bytes.buffer);
     }
   }
   return t;

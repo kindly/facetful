@@ -58,6 +58,11 @@ const r = await db.query(`
 
 for (const row of r.rows()) console.log(row);
 r.columnRaw("mw"); // Float64Array + validity bitmap, near-zero copy (charts)
+
+// big results: a dictionary-encoded text column as codes + dictionary, not a string per row
+const big = await db.query("select country, mw from t", { dictText: true });
+big.columnRaw("country"); // { codes: Uint16Array, dict: { offsets, bytes }, validity }
+big.dictionary("country"); // the decoded distinct values, indexed by code
 console.log(r.elapsedMs, r.stats); // ms in worker, row groups pruned
 ```
 

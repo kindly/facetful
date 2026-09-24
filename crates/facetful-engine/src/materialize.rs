@@ -11,7 +11,7 @@ use crate::format::compile::{compile_sorted, InCol};
 use crate::format::read::ReadAt;
 use crate::format::SortKey;
 use crate::sql::binder::{BoundQuery, Ty};
-use crate::sql::exec::{OutCol, QueryResult, Val};
+use crate::sql::exec::{compact_dict, OutCol, QueryResult, Val};
 use crate::sql::{execute_sql_with, span::Span, Catalog, Diagnostic, NoCatalog};
 use crate::Table;
 
@@ -109,6 +109,12 @@ fn from_outcol(c: &OutCol, ty: Ty, n: usize) -> InCol {
                 })
                 .collect();
             InCol::Text { v, valid: valid_of(valid, n) }
+        }
+        // a dictionary column keeps its codes: no string is built or re-encoded,
+        // and the new table's dictionary holds only the entries the rows use
+        (OutCol::Dict { codes, dict, valid }, _) => {
+            let (codes, used) = compact_dict(codes, dict, valid, n);
+            InCol::Dict { codes, dict: used.iter().map(|s| s.to_string()).collect(), valid: valid_of(valid, n) }
         }
     }
 }

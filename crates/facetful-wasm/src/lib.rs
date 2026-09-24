@@ -514,6 +514,38 @@ pub struct ColBuf {
     offsets: Vec<u32>,
     bytes: Vec<u8>,
     validity: Vec<u8>, // bit i set = present
+    /// text from a dictionary column: one code per row into a dictionary
+    /// compacted to the entries the rows use (`dict_offsets` has len+1
+    /// entries). `offsets`/`bytes` stay empty until a caller asks for them,
+    /// then expand once — a caller that takes the codes never pays for the
+    /// per-row strings.
+    codes: Vec<u16>,
+    dict_offsets: Vec<u32>,
+    dict_bytes: Vec<u8>,
+}
+
+impl ColBuf {
+    fn dict_len(&self) -> usize {
+        self.dict_offsets.len().saturating_sub(1)
+    }
+
+    /// Expand codes + dictionary into the per-row offsets/bytes form (idempotent).
+    fn expand_text(&mut self) {
+        if self.dict_offsets.is_empty() || !self.offsets.is_empty() {
+            return;
+        }
+        let n = self.codes.len();
+        self.offsets.reserve(n + 1);
+        self.offsets.push(0);
+        for (i, &c) in self.codes.iter().enumerate() {
+            let c = c as usize;
+            if self.validity[i / 8] >> (i % 8) & 1 != 0 && c < self.dict_len() {
+                let (a, b) = (self.dict_offsets[c] as usize, self.dict_offsets[c + 1] as usize);
+                self.bytes.extend_from_slice(&self.dict_bytes[a..b]);
+            }
+            self.offsets.push(self.bytes.len() as u32);
+        }
+    }
 }
 
 pub enum Outcome {
@@ -544,6 +576,9 @@ fn columnize(mut r: QueryResult) -> Outcome {
                 offsets: Vec::new(),
                 bytes: Vec::new(),
                 validity: Vec::new(),
+                codes: Vec::new(),
+                dict_offsets: Vec::new(),
+                dict_bytes: Vec::new(),
             };
             match oc {
                 OutCol::F64 { v, valid } => {
@@ -565,6 +600,17 @@ fn columnize(mut r: QueryResult) -> Outcome {
                     c.kind = 4;
                     c.offsets = offsets;
                     c.bytes = bytes;
+                    c.validity = valid;
+                }
+                OutCol::Dict { codes, dict, valid } => {
+                    c.kind = 4;
+                    let (codes, used) = facetful_engine::sql::exec::compact_dict(&codes, &dict, &valid, rows);
+                    c.codes = codes;
+                    c.dict_offsets.push(0);
+                    for s in &used {
+                        c.dict_bytes.extend_from_slice(s.as_bytes());
+                        c.dict_offsets.push(c.dict_bytes.len() as u32);
+                    }
                     c.validity = valid;
                 }
             }
@@ -611,6 +657,9 @@ fn columnize(mut r: QueryResult) -> Outcome {
             offsets: Vec::new(),
             bytes: Vec::new(),
             validity: vec![0u8; (rows + 7) / 8],
+            codes: Vec::new(),
+            dict_offsets: Vec::new(),
+            dict_bytes: Vec::new(),
         };
         if kind == 4 {
             c.offsets.push(0);
@@ -778,19 +827,67 @@ pub extern "C" fn col_bools_ptr(h: usize, i: usize) -> *const u8 {
     col(h, i).map_or(core::ptr::null(), |c| c.bools.as_ptr())
 }
 
+fn col_mut(h: usize, i: usize) -> Option<&'static mut ColBuf> {
+    match unsafe { &mut *(h as *mut Outcome) } {
+        Outcome::Ok { cols, .. } => cols.get_mut(i),
+        _ => None,
+    }
+}
+
+// Text columns come in two forms. A dictionary column arrives as codes +
+// a compacted dictionary (`col_dict_len` > 0); the per-row offsets/bytes
+// form is built on first request, so a caller taking the codes never pays
+// for it. Plain text columns have `col_dict_len` == 0.
+
 #[no_mangle]
 pub extern "C" fn col_offsets_ptr(h: usize, i: usize) -> *const u32 {
-    col(h, i).map_or(core::ptr::null(), |c| c.offsets.as_ptr())
+    col_mut(h, i).map_or(core::ptr::null(), |c| {
+        c.expand_text();
+        c.offsets.as_ptr()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn col_bytes_ptr(h: usize, i: usize) -> *const u8 {
-    col(h, i).map_or(core::ptr::null(), |c| c.bytes.as_ptr())
+    col_mut(h, i).map_or(core::ptr::null(), |c| {
+        c.expand_text();
+        c.bytes.as_ptr()
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn col_bytes_len(h: usize, i: usize) -> u32 {
-    col(h, i).map_or(0, |c| c.bytes.len() as u32)
+    col_mut(h, i).map_or(0, |c| {
+        c.expand_text();
+        c.bytes.len() as u32
+    })
+}
+
+/// Dictionary entries behind a text column (0 = plain text, per-row form only).
+#[no_mangle]
+pub extern "C" fn col_dict_len(h: usize, i: usize) -> u32 {
+    col(h, i).map_or(0, |c| c.dict_len() as u32)
+}
+
+/// One u16 code per row (valid when `col_dict_len` > 0).
+#[no_mangle]
+pub extern "C" fn col_codes_ptr(h: usize, i: usize) -> *const u16 {
+    col(h, i).map_or(core::ptr::null(), |c| c.codes.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn col_dict_offsets_ptr(h: usize, i: usize) -> *const u32 {
+    col(h, i).map_or(core::ptr::null(), |c| c.dict_offsets.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn col_dict_bytes_ptr(h: usize, i: usize) -> *const u8 {
+    col(h, i).map_or(core::ptr::null(), |c| c.dict_bytes.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn col_dict_bytes_len(h: usize, i: usize) -> u32 {
+    col(h, i).map_or(0, |c| c.dict_bytes.len() as u32)
 }
 
 #[no_mangle]

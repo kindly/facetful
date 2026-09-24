@@ -23,3 +23,26 @@ jobs:
           curl -sL https://github.com/WebAssembly/binaryen/releases/download/version_119/binaryen-version_119-x86_64-linux.tar.gz | tar xz
           echo "$PWD/binaryen-version_119/bin" >> "$GITHUB_PATH"
       - run: ./scripts/size-check.sh
+
+  # the JS side on every push — the gate release day runs, minus nothing:
+  # node smokes, the worker protocol, the parquet differential, the command,
+  # and the public API in headless Chrome (0.4.0/0.5.0 shipped a worker that
+  # could not load a table because only the release workflow ran these)
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: install wasm-opt
+        run: |
+          curl -sL https://github.com/WebAssembly/binaryen/releases/download/version_119/binaryen-version_119-x86_64-linux.tar.gz | tar xz
+          echo "$PWD/binaryen-version_119/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: hyparquet (parquet differential dependency)
+        run: npm install --prefix web/spike-bench
+      - name: release gate (budget + smokes + browser + differential + pack)
+        run: ./scripts/build-package.sh

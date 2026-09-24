@@ -10,11 +10,20 @@ pub(super) struct Plain {
     srcs: Vec<Option<SelSrc>>,
     refs: Vec<(u32, u32)>,
     gslot: u32,
+    /// with a window: every scanned group's lanes (Rc clones), so select
+    /// expressions run over the rows in the window only, at finish
+    ctxs: Option<Vec<Cols>>,
 }
 
 impl Plain {
-    pub(super) fn new(n_select: usize, scan_cap: Option<usize>) -> Plain {
-        Plain { scan_cap, srcs: (0..n_select).map(|_| None).collect(), refs: Vec::new(), gslot: 0 }
+    pub(super) fn new(n_select: usize, scan_cap: Option<usize>, defer: bool) -> Plain {
+        Plain {
+            scan_cap,
+            srcs: (0..n_select).map(|_| None).collect(),
+            refs: Vec::new(),
+            gslot: 0,
+            ctxs: defer.then(Vec::new),
+        }
     }
 
     /// How deep this group's projection lanes must go: just far enough to
@@ -40,7 +49,10 @@ impl Plain {
     }
 
     pub(super) fn scan_group(&mut self, sh: &Shared, ctx: &GroupCtx, keep: Option<&[u8]>) -> Flow {
-        sel_srcs_for_group(sh.q, ctx, &mut self.srcs);
+        sel_srcs_for_group(sh.q, ctx, &mut self.srcs, self.ctxs.is_some());
+        if let Some(c) = &mut self.ctxs {
+            c.push(ctx.cols.clone());
+        }
         // a plain invariant bool unswitches out of the row loops more reliably
         // than matching the Option per row (measured 0.1 ms on 183K rows)
         let (keep_all, keep_bits) = (keep.is_none(), keep.unwrap_or(&[]));
@@ -60,15 +72,7 @@ impl Plain {
     pub(super) fn finish<S: ReadAt>(self, table: &Table<S>, sh: &Shared) -> QueryResult {
         let (offset, limit) = sh.window();
         let refs: Vec<(u32, u32)> = self.refs.into_iter().skip(offset).take(limit).collect();
-        let cols: Vec<OutCol> = self
-            .srcs
-            .iter()
-            .zip(&sh.sel_tys)
-            .map(|(src, ty)| match src {
-                Some(src) => gather_outcol(src, &refs, *ty),
-                None => gather_outcol(&SelSrc::Vv(Vec::new()), &[], *ty), // zero groups scanned
-            })
-            .collect();
+        let cols = project(sh.q, &sh.sel_tys, &self.srcs, &refs, self.ctxs.as_deref());
         sh.result(table, Vec::new(), Some(cols), refs.len())
     }
 }

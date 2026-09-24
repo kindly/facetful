@@ -1172,3 +1172,46 @@ d51 built. The converter first, because everything else sits on it.
 
 **Rule.** A module that ships must have a gate that imports *that module*, not the one beneath it.
 </sv-prose>
+
+<sv-prose id="d55">
+## Position — results carry dictionaries; projection evaluates survivors only; the browser is a gate (2026-09-24, from a gratnav handoff)
+
+**The ask.** gratnav's grid loads its entire filtered result — up to all 1,520,378 grants — through `columnRaw` after every filter change, and David wants to keep that. The payload is 255.7 MB, and most of it is repeated text: `Funding Org:Name` (372 distinct values) costs 52 MB as one string per row, `Best Available Region` (14 values) 23 MB. Both are dictionary columns in the image. The engine expanded them on output, so a value repeated 1.5M times was built, copied out of wasm memory (`core.js` `.slice()`s every column while the wasm result is still alive, so the worker briefly holds both) and transferred 1.5M times. Handoff: `~/projects/gratnav/docs/handoff-facetful-dict-results.md`.
+
+**Decision 1 — the columnar channel keeps codes.** `OutCol::Dict { codes: Vec<u16>, dict: Rc<Vec<Rc<String>>>, valid }` joins the output enum. A dictionary column selected as-is (plain, sorted and grouped paths alike — a GROUP BY key is already codes in the group table) gathers its codes at memcpy speed; no string is touched. Every consumer is better off, not only the one that asked: `materialize` feeds the codes straight into the compiler as `InCol::Dict` (no strings built, no re-encoding; the compiler applies its usual payoff test, so two rows over a three-entry dictionary still land as text), `ensure_rows` decodes lazily for the CLI and the differential, and the wasm side expands to per-row offsets/bytes only when the JS caller asks for that form. The engine has no option for this; the choice lives at the boundary.
+
+**Decision 2 — the JS opt-in is `query(sql, { dictText: true })`.** Off, nothing changes shape: `col_offsets_ptr` on a dictionary column expands it inside the wasm, once, on demand. On, `columnRaw` carries `codes` (Uint16Array) + `dict` ({ offsets, bytes }) for dictionary-backed text columns; computed text is still per row. `rows()`, `column()` and the new `Result.dictionary(name)` decode through the dictionary, each entry once — cheaper per scroll frame than decoding a string per row. The dictionary is **compacted** to the values present (linear in rows + entries, no string copied, image order kept): a ten-row filtered result does not carry a 60,000-entry dictionary, and codes are dense. `Uint32Array` is reserved in the type for dictionaries past 65,535 — the handoff's Stage 2 (dictionary-encoding plain text columns in the result builder, worth another 46 MB on gratnav's title and recipient) waits until gratnav has measured Stage 1; it needs u32 codes and a hash pass over every string, and the cheap win is taken first.
+
+**Measured** (grantnav.facetful, 1.52M rows, whole grid result in Node): 255.7 MB → 186.7 MB, and the query itself 436 → 382 ms — expanding two dictionary columns was 50 ms of the old query. The handoff predicted ~187. Size: +2.6 KB gz.
+
+**Decision 3 — select expressions run on survivors only.** The handoff's second finding was correct and worse than described: a paged grid query (`order by … limit 50 offset 800000`) took 65 ms bare and 530 ms with `substr(coalesce(…), 1, 140)`, because every path evaluated select expressions over every kept row before the window was known — the full-sort path at scan time, the plain path at scan time, the top-k path over whole groups at finish. The fix is one rule: **when the query has a window (a LIMIT), expressions are evaluated only for the rows in it.** Plain and full-sort keep each scanned group's lanes (Rc clones — nothing loads twice) and mark expression slots deferred; at finish the surviving rows are gathered out of their groups into small contexts and the expressions run over those. Top-k does the same with its winners instead of whole groups. Direct columns (text, dictionary, numeric) never needed this; they gather by reference. Without a LIMIT nothing changes: every row is output, so eager evaluation frees a group's inputs as the scan goes, which is the right trade for memory.
+
+**Decision 4 — the browser is a gate.** The 0.4.0/0.5.0 worker bug (d54) and this feature's changes to `core.js`, `worker.js` and `transferables` share a lesson: the worker and the page-side API must run under a gate, in a browser, with the real APIs Node cannot imitate — module workers, transferables, OPFS sync access handles, `Blob.stream()`. `browser-smoke.mjs` drives headless Chromium over the DevTools protocol (the pattern gratnav's `tests/cdp.mjs` uses; no dependency), serves the repo over localhost, and calls the public API as a user does: open, load, query, `dictText`, materialize, loadCsv from a Blob, storeOpfs/loadOpfs/removeOpfs, registerFunction, close. The release gate runs it, and so does CI on every push — the JS side had green CI for four days with a dead worker because only the release workflow ran the JS checks.
+</sv-prose>
+
+<sv-prose id="d56">
+## Build log 34 — dictionary results, windowed projection, the browser gate (2026-09-24)
+
+**Dictionary results (d55, decisions 1–2).** Engine: `OutCol::Dict`, `SelSrc::Dict` (plain/sorted/grouped), `compact_dict`, `outcol_val` decoding; `materialize` maps it to `InCol::Dict`, and the compiler now applies its payoff test (`dict.len() * 2 < rows`) to pre-encoded input too — a dictionary of 3 over 2 rows lands as text, as it did when the strings went through. wasm: `ColBuf` grows `codes` + a compacted `dict_offsets`/`dict_bytes`; `col_offsets_ptr`/`col_bytes_ptr` expand on demand (memoized), new exports `col_dict_len`, `col_codes_ptr`, `col_dict_offsets_ptr`, `col_dict_bytes_ptr`, `col_dict_bytes_len`. JS: `core.js query(handle, sql, { dictText })`, `transferables` carries the three new buffers, the worker passes the flag, `index.js` `query(sql, { table, dictText })` + `Result.dictionary(name)` with the dictionary decoded once per result; types and README updated. Tests: `tests/dict_results.rs` (every path keeps codes; NULL codes ignored by compaction; materialize with and without payoff), node-smoke (decode equality, compaction, transferables), the worker smoke, the browser smoke.
+
+| grantnav.facetful, 1,520,378 rows, whole grid result in Node | text | dictText |
+|---|---|---|
+| payload | 255.7 MB | 186.7 MB |
+| query | 436 ms | 382 ms |
+| funder (372 values) | 52 MB | 3 MB |
+| region (14 values) | 23 MB | 3 MB |
+
+**Windowed projection (d55, decision 3).** `GroupCtx` lanes can be `gather`ed at chosen rows (`gather_ctx`, `VV::gather`; text copies only the chosen strings). Plain and full-sort take `defer` = the query has a LIMIT: expression slots become `SelSrc::Deferred`, each scanned group's `Cols` map is kept (Rc clones), and `project` evaluates the deferred expressions over per-group sub-contexts built from the surviving refs. Top-k gathers each group's lanes at its winners before evaluating. The SQLite differential gained three windowed queries with computed columns and NULL inputs across the three paths (39 queries agree).
+
+| grantnav.facetful, 50-row page | bare | + `substr(coalesce(…), 1, 140)` before | after |
+|---|---|---|---|
+| `order by date desc … offset 800000` (full sort) | 63 ms | 530 ms | 78 ms |
+| `order by date desc … offset 50000` (top-k) | 50 ms | 224 ms | 56 ms |
+| `limit 50 offset 800000` (plain) | 13 ms | 215 ms | 18 ms |
+
+The handoff measured 508 vs 79; the 430 ms it worked around is gone. Without a LIMIT nothing changed (whole-result query 426 → 426 ms).
+
+**Browser gate (d55, decision 4).** `js/facetful/browser-smoke.mjs`: a Node static server for the repo, headless Chromium found on PATH (`FACETFUL_BROWSER` overrides; `--no-sandbox` under `CI`), DevTools over WebSocket, a generated page that imports `index.js` and runs open → load → query with a ready-made function → `dictText` (codes, `dictionary()`, `column()`, `rows()`) → materialize → join → `loadCsv` from a Blob (two passes over `Blob.stream()`) → storeOpfs/loadOpfs/removeOpfs → registerFunction → the error path → close, reporting per-step times. Against the 0.5.0 worker it fails with the shipped error, "Maximum call stack size exceeded". The release gate runs it after the worker smoke, and `ci.yml` gained a `js` job that runs the whole gate on every push (Chrome is on the runner image).
+
+**Size.** Unoptimized 246,084 → 253,161 gz (+7.1 KB: +2.6 dictionary results, +4.5 windowed projection). wasm-opt is not on this machine any more; CI measures the optimized build — expect ~247.5 KB, 81% of budget.
+</sv-prose>

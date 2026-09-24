@@ -18,6 +18,7 @@ if command -v wasm-opt >/dev/null 2>&1; then
     WASM="$WASM.opt"
 else
     echo "note: wasm-opt not found — measuring unoptimized build (CI uses wasm-opt)"
+    rm -f "$WASM.opt" # a stale optimized build would otherwise be packed instead of this one
 fi
 
 RAW=$(stat -c%s "$WASM")

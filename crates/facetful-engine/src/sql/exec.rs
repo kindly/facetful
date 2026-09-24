@@ -38,7 +38,7 @@ use agg::*;
 use output::*;
 use filter::*;
 use grouping::*;
-pub use value::{OutCol, QueryResult, Val};
+pub use value::{compact_dict, OutCol, QueryResult, Val};
 pub(crate) use output::sort_keyed2;
 pub(crate) use grouping::{hash_bytes, int_range, GroupMap, TextGroups, DENSE_LANES};
 pub(crate) use distinct::mix64;
@@ -363,12 +363,15 @@ impl Strategy {
             return Ok(Strategy::Aggregate(aggregate::Aggregate::plan(table, sh)?));
         }
         let cap = q.limit.map(|l| l as usize + q.offset.unwrap_or(0) as usize);
+        // a window means most kept rows are never output: select expressions
+        // then wait for it (d55) instead of running over every kept row
+        let defer = q.limit.is_some();
         if q.order_by.is_empty() {
-            return Ok(Strategy::Plain(plain::Plain::new(q.select.len(), cap)));
+            return Ok(Strategy::Plain(plain::Plain::new(q.select.len(), cap, defer)));
         }
         Ok(match cap.filter(|c| *c <= 100_000) {
             Some(cap) => Strategy::TopK(topk::TopK::new(cap)),
-            None => Strategy::FullSort(sort::FullSort::new(q.select.len())),
+            None => Strategy::FullSort(sort::FullSort::new(q.select.len(), defer)),
         })
     }
 

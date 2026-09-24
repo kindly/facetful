@@ -62,7 +62,21 @@ pub(crate) fn narrowest_int(min: i64, max: i64) -> ColumnType {
 
 fn plan(col: InCol) -> Planned {
     match col {
-        InCol::Dict { codes, dict, valid } => Planned::Dict { codes, dict, valid },
+        // pre-encoded input takes the same payoff test as text: a handful of
+        // rows over a big dictionary is smaller (and no slower) as plain text
+        InCol::Dict { codes, dict, valid } => {
+            if dict.len() * 2 < codes.len() {
+                Planned::Dict { codes, dict, valid }
+            } else {
+                let present = |i: usize| valid.as_ref().map_or(true, |b| b[i]);
+                let v = codes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| if present(i) { dict.get(c as usize).cloned().unwrap_or_default() } else { String::new() })
+                    .collect();
+                Planned::Text { v, valid }
+            }
+        }
         InCol::Int { v, valid } => {
             let present = |i: usize| valid.as_ref().map_or(true, |b| b[i]);
             let mut min = i64::MAX;
