@@ -143,6 +143,15 @@ fn binding_and_lanes() {
     assert_eq!(calls.get(), after_first, "cached conjunct: the host is not called again");
     // non-strict sees the NULL
     assert_eq!(q(&mut t, "select sum(zero_if_null(n)) from t"), vec![vec!["Float(18.0)"]]);
+    // strict with a NULL literal: every row is NULL and the host is never called —
+    // on the row path and on the dictionary path alike
+    let (calls, _) = setup();
+    assert_eq!(q(&mut t, "select plus(n, null) from t limit 2"), vec![vec!["Null"], vec!["Null"]]);
+    assert_eq!(q(&mut t, "select count(*) from t where has(name, null)"), vec![vec!["Int(0)"]]);
+    assert_eq!(q(&mut t, "select shout(null) from t limit 1"), vec![vec!["Null"]]);
+    assert_eq!(calls.get(), 0, "strict + NULL literal: no host call");
+    // non-strict still receives the NULL literal (as an invalid broadcast value)
+    assert_eq!(q(&mut t, "select zero_if_null(null) from t limit 1"), vec![vec!["Float(0.0)"]]);
     // variadic: the last parameter repeats
     assert_eq!(q(&mut t, "select count_args(1, 2, 3) from t limit 1"), vec![vec!["Int(3)"]]);
     let err = run_query(&mut t, "select count_args(1, 'x') from t").err().unwrap().render("");

@@ -215,6 +215,8 @@ try {
     ["select round(geo_distance(51.5074 + 0 * capacity, -0.1278, 48.8566 + 0 * capacity, 2.3522))", 343557], // general path
     ["select round(geo_distance(0, 0, 0, 180))", 20015114], // half the equator: the asin clamp
     ["select geo_distance(nullif(capacity, capacity), 0, 0, 0)", undefined], // a NULL coordinate is NULL, not 0
+    ["select geo_distance(null, 0, 0, 0)", undefined], // a NULL literal too (strict UDFs skip the call)
+    ["select weekday(null)", undefined],
     ["select regexp('Coal Creek', '^coal', 'i')", 1],
     ["select regexp('Coal Creek', '^coal')", 0],
     ["select regexp_extract('Unit 12 of 30', '\\d+')", "12"],

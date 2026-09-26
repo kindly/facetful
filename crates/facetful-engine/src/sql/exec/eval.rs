@@ -740,6 +740,11 @@ fn udf_call_vec(id: u32, strict: bool, args: &[Bound], ty: Ty, ctx: &GroupCtx) -
     use crate::udf::{Arg, Kind, Lane, Out, Output};
     let rows = ctx.rows;
     let items: Vec<VV> = args.iter().map(|a| eval_vec(a, ctx)).collect();
+    // strict + a NULL literal: every row is NULL, the host is never called (a
+    // literal carries no validity bitmap, so the null_any mask below misses it)
+    if strict && items.iter().any(|v| matches!(v.data, Data::Const(Val::Null))) {
+        return lanes_to_vv(rows, ty, &|_| Val::Null);
+    }
     // the dictionary path
     let dict_arg = items.iter().position(|v| matches!(v.data, Data::Codes { .. }));
     let over_dict = dict_arg.is_some_and(|d| {
