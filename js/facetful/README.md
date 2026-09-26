@@ -182,7 +182,7 @@ opts out; the list is importable from `facetful/udfs`): `regexp(s, pattern[, fla
 (Intl's time-zone tables — hundreds of KB the wasm never has to carry),
 `date_trunc('month', ts)`, `date_add(d, 1, 'month')`, `weekday`, `quarter`,
 `country_name('DE')`, `format_number(x, 'en-US:compact')`, `unaccent('Zürich')`,
-`url_host(url)`. Each is a few lines of ordinary JavaScript over what the
+`url_host(url)`, `geo_distance(lat1, lon1, lat2, lon2)` (metres, haversine). Each is a few lines of ordinary JavaScript over what the
 browser already ships; they're as much a set of patterns as a library.
 
 Kinds: `int`, `float`, `bool`, `text`, `date`, `timestamp` (dates and timestamps

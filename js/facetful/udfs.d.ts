@@ -9,7 +9,7 @@ export interface ReadyMadeUdf {
 /**
  * The ready-made functions Facetful.open() registers by default: regexp,
  * json_extract, to_tz, date_trunc, date_add, weekday, quarter, country_name,
- * format_number, unaccent, url_host.
+ * format_number, unaccent, url_host, geo_distance.
  */
 export const udfs: ReadyMadeUdf[];
 export default udfs;

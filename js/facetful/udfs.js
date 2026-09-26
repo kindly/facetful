@@ -200,6 +200,36 @@ export const udfs = [
   { name: "unaccent", signature: { params: ["text"], returns: "text" }, fn: (args, len, out) => { for (let i = 0; i < len; i++) out.values[i] = args[0].values[i].normalize("NFD").replace(/\p{M}+/gu, ""); } },
   // url_host('https://www.eia.gov/x?y') -> 'www.eia.gov' (null when not a URL)
   { name: "url_host", signature: { params: ["text"], returns: "text", perRow: true }, fn: (s) => { try { return new URL(s).hostname; } catch { return null; } } },
+  // --- geography ---------------------------------------------------------------
+  // geo_distance(lat1, lon1, lat2, lon2) -> metres: haversine on the 6,371,008.8 m mean-radius
+  // sphere (within ~0.5% of the ellipsoid). Fused on purpose: V8's inline Math beats libm in
+  // wasm, and one call per lane beats trig composed in SQL (spikes/geo-bench)
+  {
+    name: "geo_distance",
+    signature: { params: ["float", "float", "float", "float"], returns: "float" },
+    fn: (args, len, out) => {
+      const K = Math.PI / 180, D = 2 * 6371008.8;
+      const o = out.values;
+      const [la, lo, la2, lo2] = args;
+      if (!la.broadcast && !lo.broadcast && la2.broadcast && lo2.broadcast) {
+        // column points vs one fixed point (the search-radius shape): its trig hoists
+        const lat = la.values, lon = lo.values, lon0 = lo2.values[0];
+        const p2 = la2.values[0] * K, cp2 = Math.cos(p2);
+        for (let i = 0; i < len; i++) {
+          const p1 = lat[i] * K;
+          const dp = Math.sin((p2 - p1) * 0.5), dl = Math.sin((lon0 - lon[i]) * K * 0.5);
+          o[i] = D * Math.asin(Math.min(1, Math.sqrt(dp * dp + Math.cos(p1) * cp2 * dl * dl)));
+        }
+        return;
+      }
+      const at = (a, i) => a.values[a.broadcast ? 0 : i];
+      for (let i = 0; i < len; i++) {
+        const p1 = at(la, i) * K, p2 = at(la2, i) * K;
+        const dp = Math.sin((p2 - p1) * 0.5), dl = Math.sin((at(lo2, i) - at(lo, i)) * K * 0.5);
+        o[i] = D * Math.asin(Math.min(1, Math.sqrt(dp * dp + Math.cos(p1) * Math.cos(p2) * dl * dl)));
+      }
+    },
+  },
 ];
 
 export default udfs;
