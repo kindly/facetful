@@ -153,7 +153,8 @@ pub(super) fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) 
                     (Bound::Column { index, .. }, Bound::Str(p))
                         if !table.catalog().schema.columns[*index].is_dict() =>
                     {
-                        match classify_like(p) {
+                        // ASCII needles only: the narrowing rescan is the byte kernel
+                        match classify_like(p).ascii() {
                             LikeShape::Contains(n) => Some(LikeKey { col: *index, needle: n }),
                             _ => None,
                         }
@@ -162,7 +163,7 @@ pub(super) fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) 
                 },
                 _ => None,
             };
-            // LIKE is ASCII-case-insensitive, so `%Coal%` and `%coal%` are one
+            // LIKE is case-insensitive, so `%Coal%` and `%coal%` are one
             // mask: key those on the folded needle rather than the literal
             let key = match &like {
                 Some(lk) => format!("like:{}:{}", lk.col, lk.needle),

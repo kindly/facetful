@@ -96,6 +96,7 @@ pub const KEYWORDS: &[(&str, Tok)] = &[
     ("null", Tok::Null),
     ("between", Tok::Between),
     ("like", Tok::Like),
+    ("ilike", Tok::Like), // Postgres spelling; LIKE is already case-insensitive
     ("case", Tok::Case),
     ("when", Tok::When),
     ("then", Tok::Then),

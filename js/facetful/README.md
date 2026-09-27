@@ -216,9 +216,11 @@ browser transcoder (the native CLI has no such limit).
 
 SELECT-only, SQLite semantics (3-valued logic, null-skipping aggregates,
 truncating integer division, NULL-first ascending sorts). Idioms: `IN`,
-`BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE`, `CASE WHEN`, `CAST`,
-`COUNT(DISTINCT x)`, `||`, `select *`, `JOIN`/`WITH`/subqueries and
-user-defined functions as above. Aggregates: count, sum, avg, min, max,
+`BETWEEN`, `IS [NOT] NULL`, `[NOT] LIKE` (case-insensitive for every
+alphabet, as with SQLite's ICU build: `'%SÃO%'` finds "São"; accents are not
+folded, so `'%sao%'` does not; `ILIKE` is accepted as the same operator),
+`CASE WHEN`, `CAST`, `COUNT(DISTINCT x)`, `||`, `select *`,
+`JOIN`/`WITH`/subqueries and user-defined functions as above. Aggregates: count, sum, avg, min, max,
 count(distinct), median, stddev, group_concat. Scalars: math (abs, round,
 floor, ceil, sqrt, pow, exp, ln, sign), text (lower, upper, length, substr,
 trim/ltrim/rtrim, replace, instr, concat), null handling (coalesce, ifnull,

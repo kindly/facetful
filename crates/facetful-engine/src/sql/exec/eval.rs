@@ -293,10 +293,35 @@ pub(super) fn cmp_vec(op: BinOp, a: VV, b: VV, rows: usize) -> VV {
     VV { data: Data::Bool(Rc::new(out)), valid }
 }
 
-/// SQL LIKE (%/_ wildcards, ascii-case-insensitive)
+/// LIKE's case folding, one character to one character: ASCII folds as
+/// ASCII, anything else through its Unicode lowercase — unless that
+/// lowercase contains ASCII (the Kelvin sign, long s, dotted capital I),
+/// which keeps the character as it is. So a non-ASCII character never folds
+/// onto an ASCII one, and the byte kernels (which fold ASCII only) agree
+/// with every other path. `%` and `_` fold to themselves.
+#[inline]
+pub(super) fn like_fold(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    let mut l = c.to_lowercase();
+    match (l.next(), l.next()) {
+        (Some(x), None) if !x.is_ascii() => x,
+        _ => c,
+    }
+}
+
+pub(super) fn like_fold_str(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    s.chars().map(like_fold).collect()
+}
+
+/// SQL LIKE (%/_ wildcards, case-insensitive through like_fold)
 pub(super) fn like_match(pattern: &str, s: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let sc: Vec<char> = s.chars().collect();
+    let p: Vec<char> = pattern.chars().map(like_fold).collect();
+    let sc: Vec<char> = s.chars().map(like_fold).collect();
     like_rec(&p, &sc)
 }
 
@@ -305,7 +330,7 @@ pub(super) fn like_rec(p: &[char], s: &[char]) -> bool {
         None => s.is_empty(),
         Some('%') => (0..=s.len()).any(|k| like_rec(&p[1..], &s[k..])),
         Some('_') => !s.is_empty() && like_rec(&p[1..], &s[1..]),
-        Some(c) => !s.is_empty() && s[0].eq_ignore_ascii_case(c) && like_rec(&p[1..], &s[1..]),
+        Some(c) => !s.is_empty() && s[0] == *c && like_rec(&p[1..], &s[1..]),
     }
 }
 
@@ -344,13 +369,28 @@ pub(super) fn dict_like_table(dict: &Rc<Vec<VStr>>, p: &str) -> Rc<Vec<u8>> {
     t
 }
 
-/// The literal shapes of a LIKE pattern (needle stored lowercase for Contains).
+/// The literal shapes of a LIKE pattern (needles stored folded, like_fold_str).
 pub(super) enum LikeShape {
     Contains(String),
     Prefix(String),
     Suffix(String),
     Exact(String),
     General,
+}
+
+impl LikeShape {
+    /// Only shapes whose needle is ASCII (the byte kernels' domain); a
+    /// non-ASCII needle becomes General, which routes through folding.
+    pub(super) fn ascii(self) -> LikeShape {
+        match &self {
+            LikeShape::Contains(n) | LikeShape::Prefix(n) | LikeShape::Suffix(n) | LikeShape::Exact(n)
+                if !n.is_ascii() =>
+            {
+                LikeShape::General
+            }
+            _ => self,
+        }
+    }
 }
 
 pub(super) fn classify_like(p: &str) -> LikeShape {
@@ -367,10 +407,10 @@ pub(super) fn classify_like(p: &str) -> LikeShape {
         return LikeShape::General;
     }
     match (starts, ends) {
-        (true, true) => LikeShape::Contains(core.to_ascii_lowercase()),
-        (true, false) => LikeShape::Suffix(core.to_ascii_lowercase()),
-        (false, true) => LikeShape::Prefix(core.to_ascii_lowercase()),
-        (false, false) => LikeShape::Exact(core.to_ascii_lowercase()),
+        (true, true) => LikeShape::Contains(like_fold_str(core)),
+        (true, false) => LikeShape::Suffix(like_fold_str(core)),
+        (false, true) => LikeShape::Prefix(like_fold_str(core)),
+        (false, false) => LikeShape::Exact(like_fold_str(core)),
     }
 }
 
@@ -393,9 +433,28 @@ pub(super) fn substr_bounds(s: &str, start: usize, len: Option<usize>) -> (usize
     (b0, end)
 }
 
-/// One string against a classified pattern (needles are lowercase).
+/// One string against a classified pattern (needles are folded). ASCII
+/// needles run the byte kernels; a needle with non-ASCII letters folds the
+/// string first — and can never match a pure-ASCII string, since no
+/// non-ASCII character folds onto ASCII.
 pub(super) fn like_shape_match(shape: &LikeShape, s: &str, full_pattern: &str) -> bool {
     let b = s.as_bytes();
+    let needle = match shape {
+        LikeShape::Contains(n) | LikeShape::Prefix(n) | LikeShape::Suffix(n) | LikeShape::Exact(n) => n,
+        LikeShape::General => return like_match(full_pattern, s),
+    };
+    if !needle.is_ascii() {
+        if s.is_ascii() {
+            return false;
+        }
+        let f = like_fold_str(s);
+        return match shape {
+            LikeShape::Contains(n) => f.contains(n.as_str()),
+            LikeShape::Prefix(n) => f.starts_with(n.as_str()),
+            LikeShape::Suffix(n) => f.ends_with(n.as_str()),
+            _ => f == *needle,
+        };
+    }
     match shape {
         LikeShape::Contains(n) => crate::text::contains_ci(b, n.as_bytes()),
         LikeShape::Prefix(n) => crate::text::prefix_ci(b, n.as_bytes()),
@@ -479,7 +538,7 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
                 if let Some((GroupCol::Text { offsets, bytes, .. }, validity)) =
                     ctx.cols.get(index)
                 {
-                    if let LikeShape::Contains(n) = classify_like(p) {
+                    if let LikeShape::Contains(n) = classify_like(p).ascii() {
                         let n = n.as_bytes();
                         let blob = &bytes[..offsets[rows] as usize];
                         let mut out = vec![0u8; rows];
@@ -498,6 +557,43 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
                             }
                         }
                         return VV { data: Data::Bool(Rc::new(out)), valid: validity.clone() };
+                    }
+                    // a literal needle with non-ASCII letters: every ASCII
+                    // character of the folded needle must appear ASCII-folded
+                    // in a match (nothing non-ASCII folds onto ASCII), so its
+                    // longest ASCII run prefilters the blob scan and only the
+                    // strings holding it are folded and checked
+                    let shape = classify_like(p);
+                    if let LikeShape::Contains(n) | LikeShape::Prefix(n) | LikeShape::Suffix(n) | LikeShape::Exact(n) = &shape {
+                        if !n.is_ascii() {
+                            let run = n.split(|c: char| !c.is_ascii()).max_by_key(|s| s.len()).unwrap_or("");
+                            let blob = &bytes[..offsets[rows] as usize];
+                            let s_at = |r: usize| {
+                                core::str::from_utf8(&blob[offsets[r] as usize..offsets[r + 1] as usize]).unwrap_or("")
+                            };
+                            let mut out = vec![0u8; rows];
+                            if run.is_empty() {
+                                for (r, o) in out.iter_mut().enumerate() {
+                                    *o = like_shape_match(&shape, s_at(r), p) as u8;
+                                }
+                            } else {
+                                let rb = run.as_bytes();
+                                let (mut row, mut pos) = (0usize, 0usize);
+                                while let Some(hit) = crate::text::find_ci(blob, pos, rb) {
+                                    while (offsets[row + 1] as usize) <= hit {
+                                        row += 1;
+                                    }
+                                    let end = offsets[row + 1] as usize;
+                                    if hit + rb.len() <= end {
+                                        out[row] = like_shape_match(&shape, s_at(row), p) as u8;
+                                        pos = end;
+                                    } else {
+                                        pos = hit + 1;
+                                    }
+                                }
+                            }
+                            return VV { data: Data::Bool(Rc::new(out)), valid: validity.clone() };
+                        }
                     }
                 }
             }

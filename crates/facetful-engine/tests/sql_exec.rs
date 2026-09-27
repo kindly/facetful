@@ -1031,3 +1031,78 @@ fn dictionary_like_tables_are_per_dictionary_and_pattern() {
     assert_eq!(count(&mut c, "select count(*) from t where s like '%solar%'"), 0);
     assert_eq!(count(&mut c, "select count(*) from t where s like 'c%'"), 3);
 }
+
+/// The same strings as a dictionary column `d` and a plain column `p`, split
+/// over two row groups — LIKE takes different paths over each.
+fn text_table(strs: &[&str]) -> Table<Vec<u8>> {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef { name: "d".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY | flags::CODES_U8 },
+            ColumnDef { name: "p".into(), ty: ColumnType::Utf8, flags: 0 },
+        ],
+    };
+    let pack = |ss: &[&str]| {
+        let mut offs = vec![0u32];
+        let mut bytes = Vec::new();
+        for s in ss {
+            bytes.extend_from_slice(s.as_bytes());
+            offs.push(bytes.len() as u32);
+        }
+        (offs, bytes)
+    };
+    let (doffs, dbytes) = pack(strs);
+    let half = strs.len().div_ceil(2);
+    let mut w = Writer::new(schema, vec![], half as u32, &[Some(DictData { offsets: doffs, bytes: dbytes }), None]);
+    for (g, part) in strs.chunks(half).enumerate() {
+        let codes: Vec<u8> = (0..part.len()).map(|i| (g * half + i) as u8).collect();
+        let (po, pb) = pack(part);
+        w.write_group(part.len() as u32, &[
+            ColumnChunk { data: SegmentData::Codes8(&codes), validity: None, null_count: 0 },
+            ColumnChunk { data: SegmentData::Utf8 { offsets: &po, bytes: &pb }, validity: None, null_count: 0 },
+        ]);
+    }
+    Table::open(w.finish()).unwrap()
+}
+
+#[test]
+fn like_folds_unicode_case_and_ilike_is_an_alias() {
+    let strs = ["São Paulo", "SAO PAULO", "École Énergie", "école énergie", "München", "MUNCHEN", "Zürich", "\u{212A}elvin", "ΑΘΉΝΑ", "Αθήνα"];
+    let mut t = text_table(&strs);
+    let hits = |t: &mut Table<Vec<u8>>, col: &str, cond: &str| -> Vec<String> {
+        let sql = format!("select {col} from t where {col} {cond} order by {col}");
+        let mut r = run_query(t, &sql).unwrap_or_else(|d| panic!("{}", d.render(&sql)));
+        r.ensure_rows();
+        r.rows.iter().map(|row| match &row[0] { Val::Text(s) => s.to_string(), v => panic!("{v:?}") }).collect()
+    };
+    let cases: &[(&str, &[&str])] = &[
+        ("like '%sao%'", &["SAO PAULO"]),                         // ASCII folds; ã is not a
+        ("like '%SÃO%'", &["São Paulo"]),                         // non-ASCII letters fold now
+        ("like '%são%'", &["São Paulo"]),
+        ("like 'ÉCOLE%'", &["École Énergie", "école énergie"]),   // prefix
+        ("like '%ÉNERGIE'", &["École Énergie", "école énergie"]), // suffix
+        ("like 'MÜNCHEN'", &["München"]),                         // exact
+        ("like '%unch%'", &["MUNCHEN"]),                          // no accent folding
+        ("like 'm_nchen'", &["MUNCHEN", "München"]),              // general matcher: _ is one character
+        ("like '_COLE %'", &["École Énergie", "école énergie"]),
+        ("like 'z_r%'", &["Zürich"]),
+        ("like '%kelvin%'", &[]),                                 // the Kelvin sign keeps its own case
+        ("like '%\u{212A}elvin%'", &["\u{212A}elvin"]),
+        ("ilike '%SÃO%'", &["São Paulo"]),                        // ILIKE is LIKE
+        ("not ilike '%A%'", &["École Énergie", "école énergie", "München", "MUNCHEN", "Zürich", "\u{212A}elvin", "ΑΘΉΝΑ", "Αθήνα"]),
+        ("like '%θήν%'", &["ΑΘΉΝΑ", "Αθήνα"]),                   // no ASCII in the needle at all
+        ("like 'αθήνα'", &["ΑΘΉΝΑ", "Αθήνα"]),
+    ];
+    for col in ["d", "p"] {
+        for (cond, want) in cases {
+            let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            let mut got = hits(&mut t, col, cond);
+            got.sort();
+            assert_eq!(got, want, "{col} {cond}");
+        }
+    }
+    // the function spelling, and case variants of one pattern served from one mask
+    assert_eq!(count(&mut t, "select count(*) from t where ilike(p, 'münchen')"), 1);
+    assert_eq!(count(&mut t, "select count(*) from t where p like '%ÜRICH'"), 1);
+    assert_eq!(count(&mut t, "select count(*) from t where p like '%ürich'"), 1);
+}
