@@ -10,6 +10,11 @@ pub(super) enum AggAcc {
     /// bitmap arms sharing this match.
     DistinctNum(Box<DistinctU64>),
     DistinctStr { sets: Vec<std::collections::HashSet<VStr, FxBuild>>, last: Vec<Option<VStr>> },
+    /// Over a clustered column (`layout::CLUSTERED`): every value is one run
+    /// in file order, and so in the kept rows of any group, which arrive in
+    /// file order too. A value differing from its group's last one is new,
+    /// so a count and the last value per group are the whole state.
+    DistinctRuns { last: Vec<u64>, n: Vec<i64> },
     SumI { v: Vec<i64>, any: Vec<bool> },
     SumF { v: Vec<f64>, any: Vec<bool> },
     Avg { sum: Vec<f64>, n: Vec<i64> },
@@ -31,14 +36,17 @@ pub(super) enum RowsSrc<'a> {
 }
 
 impl AggAcc {
-    /// `dict_len`: cardinality when the argument is a direct dictionary column.
-    pub(super) fn new(call: &Bound, dict_len: Option<usize>) -> AggAcc {
+    /// `dict_len`: cardinality when the argument is a direct dictionary column;
+    /// `clustered`: the argument is a direct column flagged clustered.
+    pub(super) fn new(call: &Bound, dict_len: Option<usize>, clustered: bool) -> AggAcc {
         let Bound::Call { func, args, .. } = call else { unreachable!() };
         let aty = args[0].ty();
         match func.name {
             "count" => AggAcc::Count(Vec::new()),
             "count_distinct" => {
-                if let Some(len) = dict_len {
+                if clustered {
+                    AggAcc::DistinctRuns { last: Vec::new(), n: Vec::new() }
+                } else if let Some(len) = dict_len {
                     AggAcc::DistinctCodes { bits: Vec::new(), words: (len + 63) / 64 }
                 } else if matches!(aty, Ty::Int | Ty::Float | Ty::Bool | Ty::Date | Ty::Timestamp) {
                     AggAcc::DistinctNum(Box::new(DistinctU64::new()))
@@ -105,6 +113,10 @@ impl AggAcc {
             AggAcc::Count(v) => v.resize(n, 0),
             AggAcc::DistinctCodes { bits, words } => bits.resize_with(n, || vec![0; *words]),
             AggAcc::DistinctNum(v) => v.grow(n),
+            AggAcc::DistinctRuns { last, n: c } => {
+                last.resize(n, 0);
+                c.resize(n, 0);
+            }
             AggAcc::DistinctStr { sets, last } => {
                 sets.resize_with(n, Default::default);
                 last.resize(n, None);
@@ -290,6 +302,23 @@ impl AggAcc {
                     sets.insert(g, x[i].to_bits());
                 }
             }),
+            // n == 0 doubles as "no value yet", so `last` needs no flag
+            (AggAcc::DistinctRuns { last, n }, Data::I64(x)) => for_kept!(|i, g| {
+                if arg.is_valid(i) {
+                    let v = x[i] as u64;
+                    // branchless: a new run starts too often to predict
+                    n[g] += (n[g] == 0 || last[g] != v) as i64;
+                    last[g] = v;
+                }
+            }),
+            (AggAcc::DistinctRuns { last, n }, Data::Codes { codes, dict }) => for_kept!(|i, g| {
+                if arg.is_valid(i) && (codes[i] as usize) < dict.len() {
+                    let v = codes[i] as u64;
+                    // branchless: a new run starts too often to predict
+                    n[g] += (n[g] == 0 || last[g] != v) as i64;
+                    last[g] = v;
+                }
+            }),
             (AggAcc::DistinctStr { sets, last }, _) => for_kept!(|i, g| {
                 if let Some(t) = arg.text_at(i) {
                     // dictionary lanes hand back the same Rc on every row, so
@@ -383,6 +412,17 @@ impl AggAcc {
                             };
                             sets.insert(g, bits);
                         }
+                        AggAcc::DistinctRuns { last, n } => {
+                            let v = match lane_val(arg, i) {
+                                Val::Int(x) => x as u64,
+                                Val::Bool(b) => b as u64,
+                                _ => continue,
+                            };
+                            if n[g] == 0 || last[g] != v {
+                                n[g] += 1;
+                                last[g] = v;
+                            }
+                        }
                         AggAcc::Count(c) => c[g] += 1,
                         // these have shape-generic arms above the fallback
                         AggAcc::DistinctCodes { .. }
@@ -417,6 +457,7 @@ impl AggAcc {
                 ints(bits[..n].iter().map(|b| b.iter().map(|w| w.count_ones() as i64).sum()).collect())
             }
             AggAcc::DistinctNum(d) => ints(d.counts[..n].to_vec()),
+            AggAcc::DistinctRuns { n: c, .. } => ints(c[..n].to_vec()),
             AggAcc::DistinctStr { sets, .. } => ints(sets[..n].iter().map(|s| s.len() as i64).collect()),
             AggAcc::SumI { v, any } => VV { data: Data::I64(Rc::new(v[..n].to_vec())), valid: bools(any, n) },
             AggAcc::SumF { v, any } => VV { data: Data::F64(Rc::new(v[..n].to_vec())), valid: bools(any, n) },
@@ -447,6 +488,7 @@ impl AggAcc {
                 Val::Int(bits[gid].iter().map(|word| word.count_ones() as i64).sum())
             }
             AggAcc::DistinctNum(v) => Val::Int(v.counts[gid]),
+            AggAcc::DistinctRuns { n, .. } => Val::Int(n[gid]),
             AggAcc::DistinctStr { sets, .. } => Val::Int(sets[gid].len() as i64),
             AggAcc::SumI { v, any } => {
                 if any[gid] { Val::Int(v[gid]) } else { Val::Null }

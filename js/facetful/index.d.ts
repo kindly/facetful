@@ -62,6 +62,9 @@ export interface TableInfo {
     min?: number;
     max?: number;
     dict?: number;
+    /** True when each non-NULL value forms one run in file order: then
+     *  `count(distinct)` over it counts runs instead of hashing values. */
+    clustered?: boolean;
   }[];
 }
 

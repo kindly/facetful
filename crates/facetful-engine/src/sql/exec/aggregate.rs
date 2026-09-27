@@ -37,7 +37,13 @@ impl Aggregate {
             let Bound::Column { index, .. } = &args[0] else { return None };
             sh.dicts.get(index).map(|dict| dict.len())
         };
-        let accs: Vec<AggAcc> = calls.iter().map(|c| AggAcc::new(c, arg_dict_len(c))).collect();
+        let clustered = table.catalog().clustered.clone();
+        let arg_clustered = |call: &Bound| -> bool {
+            let Bound::Call { args, .. } = call else { return false };
+            let Bound::Column { index, .. } = &args[0] else { return false };
+            clustered.get(*index).copied().unwrap_or(false)
+        };
+        let accs: Vec<AggAcc> = calls.iter().map(|c| AggAcc::new(c, arg_dict_len(c), arg_clustered(c))).collect();
         let count_only = accs.iter().all(|a| matches!(a, AggAcc::Count(_)))
             && calls.iter().all(|c| {
                 let Bound::Call { args, .. } = c else { return false };

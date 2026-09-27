@@ -220,8 +220,20 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
         }
         groups.push(GroupMeta { offset, row_count, cols });
     }
+    // the layout trailer, absent in older files
+    let mut clustered = vec![false; ncols];
+    if c.p < c.b.len() {
+        let n = c.u16()? as usize;
+        if n != ncols {
+            return Err(FormatError::Corrupt("layout trailer column count"));
+        }
+        for flag in clustered.iter_mut() {
+            *flag = c.u8()? & layout::CLUSTERED != 0;
+        }
+    }
 
     Ok(Catalog {
+        clustered,
         version,
         row_group_target,
         schema,
@@ -376,6 +388,20 @@ mod tests {
         assert!(cat.schema.columns[2].is_dict());
         assert_eq!(cat.schema.columns[2].code_width(), 1);
         assert_eq!(cat.schema.columns[3].code_width(), 2);
+        // only `id` keeps each value in one run; floats and plain text are not tracked
+        assert_eq!(cat.clustered, vec![true, false, false, false, false]);
+
+        // a file from before the layout trailer: same footer minus its last
+        // 2 + ncols bytes, and every column reads as unclustered
+        let flen = u32::from_le_bytes(file[file.len() - 8..file.len() - 4].try_into().unwrap()) as usize;
+        let cut = file.len() - 8 - 7;
+        let mut old = file[..cut].to_vec();
+        old.extend_from_slice(&((flen - 7) as u32).to_le_bytes());
+        old.extend_from_slice(&MAGIC);
+        let old_src: &[u8] = &old;
+        let old_cat = open(&old_src).unwrap();
+        assert_eq!(old_cat.clustered, vec![false; 5]);
+        assert_eq!(old_cat.total_rows, 8);
 
         // dictionaries decode from the dict block
         assert_eq!(read_dictionary(&src, &cat, 2).unwrap(), vec!["ok", "closed", "pending"]);

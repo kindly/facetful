@@ -325,9 +325,10 @@ fn json_str(out: &mut String, s: &str) {
 
 /// The table's catalog as JSON: `{version, rows, groups, target, sortedBy:
 /// [{column, descending}], columns: [{name, kind, bytes, nulls, min?, max?,
-/// dict?}]}` — kind as the converter reports it, bytes the column's on-disk
-/// total across groups, min/max folded over every group's stats, dict the
-/// dictionary's entry count. Returns the full length; when it exceeds `cap`
+/// dict?, clustered?}]}` — kind as the converter reports it, bytes the
+/// column's on-disk total across groups, min/max folded over every group's
+/// stats, dict the dictionary's entry count, clustered present (true) when
+/// each value forms one run in file order. Returns the full length; when it exceeds `cap`
 /// nothing is written and the caller retries with a bigger buffer.
 #[no_mangle]
 pub extern "C" fn table_describe(t: usize, out: *mut u8, cap: usize) -> u32 {
@@ -377,6 +378,9 @@ pub extern "C" fn table_describe(t: usize, out: *mut u8, cap: usize) -> u32 {
         if c.is_dict() {
             let n = t.dictionary(ci).map(|d| d.len()).unwrap_or(0);
             s.push_str(&format!(",\"dict\":{n}"));
+        }
+        if cat.clustered.get(ci).copied().unwrap_or(false) {
+            s.push_str(",\"clustered\":true");
         }
         s.push('}');
     }

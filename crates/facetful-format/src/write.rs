@@ -44,6 +44,8 @@ pub struct Writer {
     flushed: u64,
     groups: Vec<GroupMeta>,
     total_rows: u64,
+    /// per column: whether its values still form one run each (footer trailer)
+    clusters: Vec<crate::cluster::Cluster>,
 }
 
 impl Writer {
@@ -59,7 +61,14 @@ impl Writer {
         for (c, d) in schema.columns.iter().zip(dicts) {
             assert_eq!(c.is_dict(), d.is_some(), "dict presence must match DICTIONARY flag");
         }
+        let clusters = schema
+            .columns
+            .iter()
+            .zip(dicts)
+            .map(|(c, d)| crate::cluster::Cluster::new(c, d.as_ref().map_or(0, |d| d.offsets.len().saturating_sub(1))))
+            .collect();
         let mut w = Self {
+            clusters,
             schema,
             sorted_by,
             row_group_target,
@@ -152,6 +161,7 @@ impl Writer {
 
         for (ci, chunk) in cols.iter().enumerate() {
             let def = &self.schema.columns[ci];
+            self.clusters[ci].feed(&chunk.data, def.ty, chunk.validity, row_count as usize);
             if let Some(v) = chunk.validity {
                 assert_eq!(v.len(), (row_count as usize + 7) / 8, "col {ci} validity length");
                 assert!(chunk.null_count > 0, "validity present but null_count = 0");
@@ -280,6 +290,13 @@ impl Writer {
                     }
                 }
             }
+        }
+        // trailer: per-column layout flags (readers that predate it stop
+        // after the group directory)
+        let clusters = core::mem::take(&mut self.clusters);
+        self.put_u16(clusters.len() as u16);
+        for c in &clusters {
+            self.buf.push(if c.clustered() { layout::CLUSTERED } else { 0 });
         }
         let footer_len = (self.buf.len() - footer_start) as u32;
         self.put_u32(footer_len);

@@ -29,6 +29,9 @@ enum Item {
     CountCol(usize),
     /// `count(distinct col)` over a dictionary column (a bitset per lane)
     CountDistinct(usize),
+    /// `count(distinct col)` over a clustered int or dictionary column: a
+    /// count and the last value per lane (see `AggAcc::DistinctRuns`)
+    CountRuns(usize),
     /// `sum` / `min` / `max` over an int lane (NULL when no row contributes)
     SumInt(usize),
     MinInt(usize),
@@ -45,7 +48,8 @@ pub(super) struct Shape {
     /// lanes including the NULL lane (the last)
     lanes: usize,
     items: Vec<Item>,
-    /// per item: the dictionary size behind a `CountDistinct`
+    /// per item: the dictionary size behind a `CountDistinct`, or behind a
+    /// `CountRuns` over a dictionary column
     cards: Vec<usize>,
     /// (select item index, descending) per ORDER BY key
     order: Vec<(usize, bool)>,
@@ -104,6 +108,22 @@ pub(super) fn shape_of<S: ReadAt>(table: &mut Table<S>, q: &BoundQuery) -> Optio
             Bound::Call { func, args, .. } if func.kind == FuncKind::Aggregate && args.len() == 1 => match (func.name, &args[0]) {
                 ("count", Bound::Number(_, false)) => Item::CountStar,
                 ("count", Bound::Column { index, .. }) => Item::CountCol(*index),
+                ("count_distinct", Bound::Column { index, .. })
+                    if table.catalog().clustered.get(*index).copied().unwrap_or(false)
+                        && (schema.columns[*index].is_dict() || numeric(*index) == Some(false)) =>
+                {
+                    // unfiltered, the ordinary path's run count over its
+                    // group ids beats this kernel's per-item pass (measured
+                    // 201 vs 267 ms on a 13-facet batch over 1.8M rows);
+                    // filtered, walking only the kept rows wins (31 vs 109)
+                    if q.filter.is_none() {
+                        return None;
+                    }
+                    if schema.columns[*index].is_dict() {
+                        card = table.dictionary(*index).ok()?.len();
+                    }
+                    Item::CountRuns(*index)
+                }
                 ("count_distinct", Bound::Column { index, .. }) => {
                     if !schema.columns[*index].is_dict() {
                         return None;
@@ -150,6 +170,9 @@ struct Acc {
     floats: Vec<Vec<f64>>,
     contrib: Vec<Vec<u64>>,
     distinct: Vec<Vec<u64>>,
+    /// per `CountRuns` item, by lane: the last value counted (its count is in
+    /// `counts`, and a zero count means no value yet)
+    last: Vec<Vec<u64>>,
 }
 
 impl Acc {
@@ -158,7 +181,8 @@ impl Acc {
         let on = |f: &dyn Fn(&Item) -> bool| -> Vec<Vec<u64>> { shape.items.iter().map(|i| if f(i) { vec![0; lanes] } else { Vec::new() }).collect() };
         Acc {
             rows: vec![0; lanes],
-            counts: on(&|i| matches!(i, Item::CountCol(_))),
+            counts: on(&|i| matches!(i, Item::CountCol(_) | Item::CountRuns(_))),
+            last: on(&|i| matches!(i, Item::CountRuns(_))),
             ints: shape
                 .items
                 .iter()
@@ -269,7 +293,7 @@ pub(super) fn execute_family<S: ReadAt>(
             for it in &shape.items {
                 match it {
                     Item::Key | Item::CountStar => {}
-                    Item::CountCol(c) | Item::CountDistinct(c) | Item::SumInt(c) | Item::MinInt(c) | Item::MaxInt(c) | Item::SumFloat(c) | Item::MinFloat(c) | Item::MaxFloat(c) => need.push(*c),
+                    Item::CountCol(c) | Item::CountDistinct(c) | Item::CountRuns(c) | Item::SumInt(c) | Item::MinInt(c) | Item::MaxInt(c) | Item::SumFloat(c) | Item::MinFloat(c) | Item::MaxFloat(c) => need.push(*c),
                 }
             }
             need.sort_unstable();
@@ -347,6 +371,27 @@ pub(super) fn execute_family<S: ReadAt>(
                             bits[b / 64] |= 1u64 << (b % 64);
                         });
                     }
+                    Item::CountRuns(c) => {
+                        let (out, last) = (&mut acc.counts[si], &mut acc.last[si]);
+                        match lane_for(*c) {
+                            Lane::I64(vals, v) => visit!(|row: usize| if v[row / 8] >> (row % 8) & 1 != 0 {
+                                // branchless: a new run starts about once per
+                                // few rows, too often to predict
+                                let (l, x) = (lane_of(row), vals[row] as u64);
+                                out[l] += (out[l] == 0 || last[l] != x) as u64;
+                                last[l] = x;
+                            }),
+                            Lane::Codes(codes, v) => {
+                                let card = shape.cards[si];
+                                visit!(|row: usize| if v[row / 8] >> (row % 8) & 1 != 0 && (codes[row] as usize) < card {
+                                    let (l, x) = (lane_of(row), codes[row] as u64);
+                                    out[l] += (out[l] == 0 || last[l] != x) as u64;
+                                    last[l] = x;
+                                });
+                            }
+                            Lane::F64(..) => unreachable!("a float column is never tracked as clustered"),
+                        }
+                    }
                     Item::SumInt(c) | Item::MinInt(c) | Item::MaxInt(c) => {
                         let Lane::I64(vals, v) = lane_for(*c) else { unreachable!() };
                         let (out, nn) = (&mut acc.ints[si], &mut acc.contrib[si]);
@@ -395,7 +440,7 @@ pub(super) fn execute_family<S: ReadAt>(
                     _ => Val::Int(l as i64), // a dictionary key sorts by its string, handled below
                 },
                 Item::CountStar => Val::Int(acc.rows[l] as i64),
-                Item::CountCol(_) => Val::Int(acc.counts[si][l] as i64),
+                Item::CountCol(_) | Item::CountRuns(_) => Val::Int(acc.counts[si][l] as i64),
                 Item::CountDistinct(_) => Val::Int(distinct_count(si, l)),
                 Item::SumInt(_) | Item::MinInt(_) | Item::MaxInt(_) => if acc.contrib[si][l] > 0 { Val::Int(acc.ints[si][l]) } else { Val::Null },
                 Item::SumFloat(_) | Item::MinFloat(_) | Item::MaxFloat(_) => if acc.contrib[si][l] > 0 { Val::Float(acc.floats[si][l]) } else { Val::Null },
@@ -456,7 +501,7 @@ pub(super) fn execute_family<S: ReadAt>(
                     },
                 },
                 Item::CountStar => OutCol::I64 { v: present.iter().map(|&l| acc.rows[l] as i64).collect(), valid: valid_all.clone() },
-                Item::CountCol(_) => OutCol::I64 { v: present.iter().map(|&l| acc.counts[si][l] as i64).collect(), valid: valid_all.clone() },
+                Item::CountCol(_) | Item::CountRuns(_) => OutCol::I64 { v: present.iter().map(|&l| acc.counts[si][l] as i64).collect(), valid: valid_all.clone() },
                 Item::CountDistinct(_) => OutCol::I64 { v: present.iter().map(|&l| distinct_count(si, l)).collect(), valid: valid_all.clone() },
                 Item::SumInt(_) | Item::MinInt(_) | Item::MaxInt(_) => OutCol::I64 {
                     v: present.iter().map(|&l| acc.ints[si][l]).collect(),

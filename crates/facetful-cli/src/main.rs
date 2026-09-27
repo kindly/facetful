@@ -411,7 +411,8 @@ fn inspect(args: &[String]) {
                 Stats::None => String::new(),
             }
         });
-        println!("  {:20} {:?}{} {:>10} bytes  {}", c.name, c.ty, if c.is_dict() { " dict" } else { "" }, bytes_total, stats);
+        let clustered = if cat.clustered.get(i).copied().unwrap_or(false) { "  clustered" } else { "" };
+        println!("  {:20} {:?}{} {:>10} bytes  {}{}", c.name, c.ty, if c.is_dict() { " dict" } else { "" }, bytes_total, stats, clustered);
     }
 }
 

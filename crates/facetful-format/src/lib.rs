@@ -5,7 +5,8 @@
 //! [header: magic "FCT1", header_len, version, row-group target, schema, sorted_by]
 //! [row-group 0: group header (row count, per-column null counts + segment lengths) + segments…]
 //! …
-//! [footer: total rows, group directory (offsets, row counts, per-column lens + min/max stats)]
+//! [footer: total rows, group directory (offsets, row counts, per-column lens + min/max stats),
+//!          layout trailer (column count: u16, then one layout flag byte per column)]
 //! [footer_len: u32 LE] [magic "FCT1"]
 //! ```
 //! Readable from both ends: the header + self-framing groups serve streaming readers;
@@ -14,6 +15,7 @@
 //! the on-disk bytes of a segment ARE the in-memory representation (zero-decode).
 //! No serde anywhere: the codec is hand-rolled little-endian.
 
+mod cluster;
 pub mod compile;
 pub mod stream;
 pub mod time;
@@ -83,6 +85,15 @@ pub mod flags {
     pub const KNOWN: u16 = DICTIONARY | CODES_U8;
 }
 
+/// Per-column layout flag bits, from the footer's trailer. Files written
+/// before the trailer existed read as all zero. Unknown bits are ignored:
+/// these are hints, and a reader that misses one only loses a fast path.
+pub mod layout {
+    /// Every non-NULL value forms one contiguous run in file order
+    /// (`cluster.rs`).
+    pub const CLUSTERED: u8 = 1 << 0;
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
@@ -148,6 +159,9 @@ pub struct Catalog {
     pub dicts: Vec<Option<DictLoc>>,
     pub total_rows: u64,
     pub groups: Vec<GroupMeta>,
+    /// Per column: each non-NULL value forms one run in file order
+    /// (`layout::CLUSTERED`).
+    pub clustered: Vec<bool>,
 }
 
 pub fn align_up(n: usize) -> usize {

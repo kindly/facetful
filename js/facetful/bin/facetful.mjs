@@ -85,8 +85,8 @@ function inspect(path, json) {
     const f = c.kind === "date" ? isoDate : c.kind === "timestamp" ? isoTs : String;
     return `${f(c.min)} … ${f(c.max)}`;
   };
-  const rows = info.columns.map((c) => [c.name, c.kind, human(c.bytes), c.nulls ? String(c.nulls) : "", range(c)]);
-  const head = ["column", "kind", "bytes", "nulls", "range / dictionary"];
+  const rows = info.columns.map((c) => [c.name, c.kind, human(c.bytes), c.nulls ? String(c.nulls) : "", range(c), c.clustered ? "clustered" : ""]);
+  const head = ["column", "kind", "bytes", "nulls", "range / dictionary", "layout"];
   const widths = head.map((h, j) => Math.max(h.length, ...rows.map((r) => r[j].length)));
   const line = (cells) => cells.map((s, j) => j === 2 ? s.padStart(widths[j]) : s.padEnd(widths[j])).join("  ");
   console.log(line(head));
