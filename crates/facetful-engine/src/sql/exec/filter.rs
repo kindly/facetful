@@ -198,9 +198,32 @@ pub(super) fn pack_bits(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// AND a cached packed mask (bit i = byte i/8, bit i%8) into 64-bit words.
+/// Words past the end of `bits` are cleared.
+pub(super) fn and_words(words: &mut [u64], bits: &[u8]) {
+    let mut chunks = bits.chunks_exact(8);
+    let mut n = 0;
+    for (w, c) in words.iter_mut().zip(&mut chunks) {
+        *w &= u64::from_le_bytes(c.try_into().unwrap());
+        n += 1;
+    }
+    let rest = chunks.remainder();
+    if let Some(w) = words.get_mut(n).filter(|_| !rest.is_empty()) {
+        let mut b = [0u8; 8];
+        b[..rest.len()].copy_from_slice(rest);
+        *w &= u64::from_le_bytes(b);
+        n += 1;
+    }
+    let len = words.len();
+    words[n.min(len)..].iter_mut().for_each(|w| *w = 0);
+}
+
 /// The WHERE mask for row group `g`, per conjunct: from the mask cache when
-/// present, else evaluated and cached. `None` when there is no WHERE. Columns
-/// a conjunct had to load stay in `cols` for the strategy to reuse.
+/// present, else evaluated and cached. One byte per row (1 = kept); `None`
+/// when there is no WHERE; an EMPTY vector when every conjunct was cached
+/// and no row survives — callers treat that as "skip the group" (`all(== 0)`
+/// holds). Columns a conjunct had to load stay in `cols` for the strategy
+/// to reuse.
 pub(super) fn where_mask<S: ReadAt>(
     table: &mut Table<S>,
     g: usize,
@@ -212,21 +235,42 @@ pub(super) fn where_mask<S: ReadAt>(
     if conjuncts.is_empty() {
         return Ok(None);
     }
-    let mut keep = vec![1u8; rows];
+    let mut cached: Vec<Rc<Vec<u8>>> = Vec::new();
     let mut pending: Vec<&Conjunct> = Vec::new();
     for c in conjuncts {
         match table.masks().get(&c.key, g) {
-            Some(bits) => {
-                // byte-parallel: one mask byte drives eight keep bytes; the
-                // per-row `i / 8, i % 8` form stopped vectorizing once this
-                // moved out of the driver (+0.1 ms on 183K rows)
-                for (chunk, &b) in keep.chunks_mut(8).zip(bits.iter()) {
-                    for (j, k) in chunk.iter_mut().enumerate() {
-                        *k &= (b >> j) & 1;
-                    }
-                }
-            }
+            Some(bits) => cached.push(bits),
             None => pending.push(c),
+        }
+    }
+    if pending.is_empty() {
+        // every conjunct cached: AND the packed masks word by word first, so
+        // a group that keeps nothing is skipped without a per-row mask — a
+        // selective filter leaves most groups empty, which used to cost an
+        // unpack plus an all-zero scan of one byte per row (grantnav: 1.6 ms
+        // per query). A group that keeps rows unpacks below as before (the
+        // byte loop vectorizes; unpacking from the words measured slower)
+        let nw = rows.div_ceil(64);
+        let mut words = vec![u64::MAX; nw];
+        for bits in &cached {
+            and_words(&mut words, bits);
+        }
+        if rows % 64 != 0 {
+            words[nw - 1] &= (1u64 << (rows % 64)) - 1;
+        }
+        if words.iter().all(|&w| w == 0) {
+            return Ok(Some(Vec::new())); // nothing kept (see the contract above)
+        }
+    }
+    let mut keep = vec![1u8; rows];
+    for bits in &cached {
+        // byte-parallel: one mask byte drives eight keep bytes; the
+        // per-row `i / 8, i % 8` form stopped vectorizing once this
+        // moved out of the driver (+0.1 ms on 183K rows)
+        for (chunk, &b) in keep.chunks_mut(8).zip(bits.iter()) {
+            for (j, k) in chunk.iter_mut().enumerate() {
+                *k &= (b >> j) & 1;
+            }
         }
     }
     if pending.is_empty() {

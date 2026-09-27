@@ -199,15 +199,6 @@ enum Lane<'a> {
     Codes(&'a [u16], &'a [u8]),
 }
 
-/// AND a cached packed mask (bit i = byte i/8, bit i%8) into 64-bit words.
-fn and_words(words: &mut [u64], bits: &[u8]) {
-    for (i, w) in words.iter_mut().enumerate() {
-        let s = &bits[(i * 8).min(bits.len())..(i * 8 + 8).min(bits.len())];
-        let mut b = [0u8; 8];
-        b[..s.len()].copy_from_slice(s);
-        *w &= u64::from_le_bytes(b);
-    }
-}
 
 /// The rows a statement keeps in group `g`, as packed words (all set when
 /// there is no WHERE): the cached conjunct masks ANDed word by word; a cache

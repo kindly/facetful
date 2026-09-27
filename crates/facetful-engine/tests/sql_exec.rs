@@ -3,7 +3,7 @@
 use facetful_engine::format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_engine::format::{flags, ColumnDef, ColumnType, Schema};
 use facetful_engine::sql::exec::Val;
-use facetful_engine::sql::run_query;
+use facetful_engine::sql::{run_batch, run_query};
 use facetful_engine::Table;
 
 /// 10 rows over 2 groups: region dict, capacity float (one null), year int16.
@@ -1105,4 +1105,42 @@ fn like_folds_unicode_case_and_ilike_is_an_alias() {
     assert_eq!(count(&mut t, "select count(*) from t where ilike(p, 'münchen')"), 1);
     assert_eq!(count(&mut t, "select count(*) from t where p like '%ÜRICH'"), 1);
     assert_eq!(count(&mut t, "select count(*) from t where p like '%ürich'"), 1);
+}
+
+#[test]
+fn cached_conjuncts_skip_groups_they_empty() {
+    // every conjunct cached: groups whose ANDed masks keep nothing are skipped
+    // on the packed words — including a group where each mask alone keeps rows
+    let dict = ["Wind", "Coal", "Wood", "Solar"];
+    let mut t = dict_table(&dict, &[&[0, 1, 1], &[2, 2, 1], &[3, 3, 3], &[0, 3, 2]]);
+    let groups = |t: &mut Table<Vec<u8>>, sql: &str| -> Vec<(String, i64)> {
+        let mut r = run_query(t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+        r.ensure_rows();
+        r.rows.iter().map(|row| match (&row[0], &row[1]) {
+            (Val::Text(s), Val::Int(n)) => (s.to_string(), *n),
+            v => panic!("{v:?}"),
+        }).collect()
+    };
+    let cases: &[(&str, i64)] = &[
+        ("s like 'w%'", 5),                    // Wind, Wood: groups 0, 1, 3
+        ("s like '%nd'", 2),                   // Wind: groups 0, 3
+        ("s like 'w%' and s like '%nd'", 2),   // group 1 keeps rows for 'w%' alone, none ANDed
+        ("s = 'Coal' and s like 'w%'", 0),     // empty in every group
+    ];
+    for round in ["building masks", "cached masks"] {
+        for (w, n) in cases {
+            assert_eq!(count(&mut t, &format!("select count(*) from t where {w}")), *n, "{round}: {w}");
+            let g = groups(&mut t, &format!("select s, count(*) from t where {w} group by s order by s"));
+            assert_eq!(g.iter().map(|(_, c)| c).sum::<i64>(), *n, "{round}: {w} grouped {g:?}");
+        }
+        // the fused batch reads the same masks (an empty group mask is "no rows")
+        let sqls: Vec<String> = cases.iter().map(|(w, _)| format!("select s, count(*) from t where {w} group by s")).collect();
+        let refs: Vec<&str> = sqls.iter().map(|s| s.as_str()).collect();
+        for ((sql, res), (_, n)) in refs.iter().zip(run_batch(&mut t, &refs)).zip(cases) {
+            let mut r = res.unwrap_or_else(|d| panic!("{}", d.render(sql)));
+            r.ensure_rows();
+            let total: i64 = r.rows.iter().map(|row| match row[1] { Val::Int(c) => c, ref v => panic!("{v:?}") }).sum();
+            assert_eq!(total, *n, "{round}: batch {sql}");
+        }
+    }
 }
