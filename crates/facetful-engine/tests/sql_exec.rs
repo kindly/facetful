@@ -984,3 +984,50 @@ fn mask_cache_survives_eviction() {
     }
     assert!(t.masks().stats().1 <= 1, "budget respected: {:?}", t.masks().stats());
 }
+
+/// One dictionary column `s`, one row group per `groups` entry.
+fn dict_table(dict: &[&str], groups: &[&[u8]]) -> Table<Vec<u8>> {
+    let schema = Schema {
+        columns: vec![ColumnDef { name: "s".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY | flags::CODES_U8 }],
+    };
+    let mut offs = vec![0u32];
+    let mut bytes = Vec::new();
+    for s in dict {
+        bytes.extend_from_slice(s.as_bytes());
+        offs.push(bytes.len() as u32);
+    }
+    let mut w = Writer::new(schema, vec![], groups[0].len() as u32, &[Some(DictData { offsets: offs, bytes })]);
+    for codes in groups {
+        w.write_group(codes.len() as u32, &[ColumnChunk { data: SegmentData::Codes8(codes), validity: None, null_count: 0 }]);
+    }
+    Table::open(w.finish()).unwrap()
+}
+
+fn count(t: &mut Table<Vec<u8>>, sql: &str) -> i64 {
+    let mut r = run_query(t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+    r.ensure_rows();
+    match r.rows[0][0] {
+        Val::Int(n) => n,
+        ref v => panic!("{v:?}"),
+    }
+}
+
+#[test]
+fn dictionary_like_tables_are_per_dictionary_and_pattern() {
+    // the truth table is built once per (dictionary, pattern) and reused across
+    // row groups and queries — never across dictionaries or patterns
+    let mut a = dict_table(&["Solar Farm", "Wind", "Coal"], &[&[0, 1, 2], &[0, 0, 1], &[2, 2, 0]]);
+    let mut b = dict_table(&["Wind", "Solar Park", "Hydro"], &[&[0, 1, 2], &[1, 1, 1]]);
+    for _ in 0..2 {
+        assert_eq!(count(&mut a, "select count(*) from t where s like '%solar%'"), 4);
+        assert_eq!(count(&mut b, "select count(*) from t where s like '%solar%'"), 4);
+        assert_eq!(count(&mut a, "select count(*) from t where s like 'wind'"), 2);
+        assert_eq!(count(&mut b, "select count(*) from t where s like 'wind'"), 1);
+        assert_eq!(count(&mut a, "select count(*) from t where s like '%SOLAR%' or s like 'c%'"), 7);
+    }
+    // a table dropped and another opened in its place: no stale table served
+    drop(a);
+    let mut c = dict_table(&["Coal", "Solar Farm", "Wind"], &[&[0, 0, 0]]);
+    assert_eq!(count(&mut c, "select count(*) from t where s like '%solar%'"), 0);
+    assert_eq!(count(&mut c, "select count(*) from t where s like 'c%'"), 3);
+}

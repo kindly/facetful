@@ -309,6 +309,41 @@ pub(super) fn like_rec(p: &[char], s: &[char]) -> bool {
     }
 }
 
+thread_local! {
+    /// Dictionary LIKE truth tables, most recent first. A dictionary is one
+    /// table-level Rc shared by every row group, so (its address, the
+    /// pattern) names a table; holding a Weak keeps that address from being
+    /// reused by another dictionary while the entry lives.
+    static DICT_LIKE: std::cell::RefCell<Vec<(std::rc::Weak<Vec<VStr>>, String, Rc<Vec<u8>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+const DICT_LIKE_ENTRIES: usize = 16;
+
+/// `LIKE p` over every entry of `dict`, computed once and reused across row
+/// groups and queries (grantnav: 24 row groups rebuilt a 65K-entry table 24x).
+pub(super) fn dict_like_table(dict: &Rc<Vec<VStr>>, p: &str) -> Rc<Vec<u8>> {
+    let hit = DICT_LIKE.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = c.iter().position(|(d, q, _)| core::ptr::eq(d.as_ptr(), Rc::as_ptr(dict)) && q == p)?;
+        let e = c.remove(i);
+        let t = e.2.clone();
+        c.insert(0, e);
+        Some(t)
+    });
+    if let Some(t) = hit {
+        return t;
+    }
+    let shape = classify_like(p);
+    let t: Rc<Vec<u8>> = Rc::new(dict.iter().map(|s| like_shape_match(&shape, s, p) as u8).collect());
+    DICT_LIKE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(d, _, _)| d.strong_count() > 0); // dictionaries of closed tables
+        c.insert(0, (Rc::downgrade(dict), p.to_string(), t.clone()));
+        c.truncate(DICT_LIKE_ENTRIES);
+    });
+    t
+}
+
 /// The literal shapes of a LIKE pattern (needle stored lowercase for Contains).
 pub(super) enum LikeShape {
     Contains(String),
@@ -469,11 +504,9 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
             let a = eval_vec(&args[0], ctx);
             let pat = eval_vec(&args[1], ctx);
             if let (Data::Codes { codes, dict }, Data::Const(Val::Text(p))) = (&a.data, &pat.data) {
-                // pattern evaluated once per dictionary entry — through the
-                // same no-allocation fast paths as string lanes
-                let shape = classify_like(p);
-                let table: Vec<u8> =
-                    dict.iter().map(|s| like_shape_match(&shape, s, p) as u8).collect();
+                // pattern evaluated once per dictionary entry — and once per
+                // dictionary, not per row group (dict_like_table)
+                let table = dict_like_table(dict, p);
                 let out: Vec<u8> = codes.iter().map(|&c| table[c as usize]).collect();
                 return VV { data: Data::Bool(Rc::new(out)), valid: a.valid.clone() };
             }
