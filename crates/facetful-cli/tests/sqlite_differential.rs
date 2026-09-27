@@ -30,6 +30,28 @@ const QUERIES: &[&str] = &[
      group by fuel order by fuel",
     "select fuel, count(*) as n from t where (fuel, status) in (('fuel_0', 'status_0'), ('fuel_2', 'status_0')) \
      group by fuel order by fuel",
+    // one-key IN / EXISTS: a value set tested per row (keyset.rs) — ints,
+    // floats with NULLs in the set, text, an OR of two, an expression key,
+    // a qualified own alias
+    "select count(*) as n, sum(capacity) as mw from t where id in (select id from t where capacity > 250 and fuel = 'fuel_1')",
+    "select fuel, count(*) as n from t where id not in (select id from t where capacity > 100) group by fuel order by fuel",
+    "select count(*) as n from t where capacity in (select capacity from t where id < 500)",
+    "select count(*) as n from t where capacity not in (select capacity from t where id < 500)",
+    "select count(*) as n from t where capacity not in (select capacity from t where id < 500 and capacity is not null)",
+    "select count(*) as n from t where country in (select country from dim where country_rows > 500) or id in (select id from t where capacity > 290)",
+    "select count(*) as n from t where upper(country) in (select upper(country) from dim where country_rows > 500)",
+    "select count(*) as n from t f where f.id in (select id from t where capacity > 290) and f.fuel <> 'fuel_0'",
+    // empty subqueries: IN / EXISTS are FALSE, NOT IN / NOT EXISTS TRUE
+    "select count(*) as n from t where country in (select country from t where id < 0)",
+    "select count(*) as n from t where country not in (select country from t where id < 0)",
+    "select count(*) as n from t where (country, fuel) in (select country, fuel from t where id < 0)",
+    "select count(*) as n from t where (country, fuel) not in (select country, fuel from t where id < 0)",
+    "select count(*) as n from t where exists (select 1 from dim d where d.country = t.country and d.country_rows < 0)",
+    "select count(*) as n from t where not exists (select 1 from dim d where d.country = t.country and d.country_rows < 0)",
+    // long literal lists bind as sets too
+    "select count(*) as n from t where id in (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60)",
+    "select count(*) as n from t where id not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, null)",
+    "select fuel, count(*) as n from t where country in ('country_0', 'country_2', 'country_4', 'country_6', 'country_8', 'country_10', 'country_12', 'country_14', 'country_16', 'country_18', 'country_20', 'country_22', 'country_24', 'country_26', 'country_28', 'country_30', 'country_32', 'country_34', 'country_36', 'country_38') group by fuel order by fuel",
     // JOINs: a cached materialization here, a hash join in SQLite — same answers
     "select t.country, d.country_rows, count(*) as n, sum(t.capacity) as mw \
      from t left join dim d on t.country = d.country \

@@ -42,6 +42,16 @@ pub(super) fn walk_and(b: &Bound, out: &mut Vec<Range>) {
                 _ => {}
             }
         }
+        // a value set's numeric range (an empty set keeps no row at all)
+        Bound::Call { func, args, .. } if matches!(func.name, "in_set" | "exists_set") => {
+            if let (Bound::Column { index, .. }, Bound::Set(set)) = (&args[0], &args[1]) {
+                match set.range() {
+                    Some((lo, hi)) => out.push((*index, Some(lo), Some(hi))),
+                    None if set.is_empty() => out.push((*index, Some(f64::INFINITY), Some(f64::NEG_INFINITY))),
+                    None => {}
+                }
+            }
+        }
         Bound::Call { func, args, .. } if func.name == "between" => {
             if let (Bound::Column { index, .. }, Bound::Number(lo, _), Bound::Number(hi, _)) =
                 (&args[0], &args[1], &args[2])
@@ -81,6 +91,24 @@ pub(super) struct Conjunct {
     pub(super) key: String,
     pub(super) cols: Vec<usize>,
     pub(super) like: Option<LikeKey>,
+}
+
+/// `in_set` / `exists_set` over a stored integer column: the mask can test
+/// the raw segment against the set without widening the lane. Only TRUE
+/// sets a mask bit, so the two forms are the same test here.
+pub(super) fn int_in_set<S: ReadAt>(table: &Table<S>, b: &Bound) -> Option<(usize, Rc<crate::sql::keyset::KeySet>)> {
+    let Bound::Call { func, args, .. } = b else { return None };
+    if !matches!(func.name, "in_set" | "exists_set") {
+        return None;
+    }
+    match (&args[0], &args[1]) {
+        (Bound::Column { index, ty: Ty::Int | Ty::Date | Ty::Timestamp }, Bound::Set(set))
+            if !table.catalog().schema.columns[*index].is_dict() =>
+        {
+            Some((*index, set.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// `col <cmp> integral-literal` (either side) over a stored integer column,
@@ -345,6 +373,34 @@ pub(super) fn where_mask<S: ReadAt>(
                         _ => sweep!(i64, 8, |i, ch| i64::from_le_bytes([
                             ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7]
                         ])),
+                    }
+                    if let Some(vb) = valid {
+                        for (i, mi) in m.iter_mut().enumerate() {
+                            *mi &= vb[i / 8] >> (i % 8) & 1;
+                        }
+                    }
+                    m
+                })
+                .ok()
+                .flatten()
+        });
+        let int_fast = int_fast.or_else(|| {
+            let (col, set) = int_in_set(table, &c.expr)?;
+            table
+                .with_fixed_segments(g, col, |vals, w, valid| {
+                    let mut m = vec![0u8; rows];
+                    macro_rules! sweep {
+                        ($w:expr, |$ch:ident| $x:expr) => {
+                            for (mi, $ch) in m.iter_mut().zip(vals[..rows * $w].chunks_exact($w)) {
+                                *mi = set.contains_i64($x) as u8;
+                            }
+                        };
+                    }
+                    match w {
+                        1 => sweep!(1, |ch| ch[0] as i8 as i64),
+                        2 => sweep!(2, |ch| i16::from_le_bytes([ch[0], ch[1]]) as i64),
+                        4 => sweep!(4, |ch| i32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]) as i64),
+                        _ => sweep!(8, |ch| i64::from_le_bytes([ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7]])),
                     }
                     if let Some(vb) = valid {
                         for (i, mi) in m.iter_mut().enumerate() {

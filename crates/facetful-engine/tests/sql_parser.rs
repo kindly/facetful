@@ -27,6 +27,7 @@ fn shape(e: &Expr) -> String {
             let a: Vec<String> = cols.iter().map(shape).collect();
             format!("in_subquery(({}) from {})", a.join(","), query.from)
         }
+        Expr::Set(set, _) => format!("{set:?}"),
     }
 }
 

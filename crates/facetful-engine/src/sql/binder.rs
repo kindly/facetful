@@ -72,6 +72,8 @@ pub enum Bound {
     Call { func: &'static FuncDef, args: Vec<Bound>, ty: Ty },
     Unary { op: UnOp, expr: Box<Bound>, ty: Ty },
     Binary { op: BinOp, lhs: Box<Bound>, rhs: Box<Bound>, ty: Ty },
+    /// a value set: only ever the second argument of `in_set` / `exists_set`
+    Set(std::rc::Rc<super::keyset::KeySet>),
 }
 
 impl Bound {
@@ -82,6 +84,7 @@ impl Bound {
             }
             Bound::Str(_) => Ty::Text,
             Bound::Null => Ty::Null,
+            Bound::Set(s) => s.ty(),
             Bound::Column { ty, .. }
             | Bound::Call { ty, .. }
             | Bound::Unary { ty, .. }
@@ -202,6 +205,10 @@ pub static FUNCS: &[FuncDef] = &[
     // desugar targets
     FuncDef { name: "between", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::ComparableToBool },
     FuncDef { name: "in", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::ComparableToBool },
+    // x IN <set> with SQL's NULL rules, and the never-NULL EXISTS form
+    // (keyset.rs); the set argument cannot be written in SQL
+    FuncDef { name: "in_set", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::ComparableToBool },
+    FuncDef { name: "exists_set", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::ComparableToBool },
     FuncDef { name: "like", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::ComparableToBool },
     FuncDef { name: "isnull", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Bool) },
     FuncDef { name: "if", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::SameAsFirst },
@@ -210,6 +217,34 @@ pub static FUNCS: &[FuncDef] = &[
     FuncDef { name: "float", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Float) },
     FuncDef { name: "text", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Text) },
 ];
+
+/// Literal `IN` lists longer than this bind as a set (`in_set`). Shorter
+/// ones keep the per-row compare, which is cheaper than a lookup at a few items.
+const IN_LIST_AS_SET: usize = 16;
+
+/// The set of an all-literal `IN` list: every item a number, or every item
+/// text (NULLs allowed in either); None for anything else.
+fn literal_set(items: &[Bound]) -> Option<super::keyset::KeySet> {
+    let (mut nums, mut texts, mut has_null, mut float) = (Vec::new(), Vec::new(), false, false);
+    for b in items {
+        match b {
+            Bound::Number(n, f) => {
+                nums.push(*n);
+                float |= *f;
+            }
+            Bound::Str(s) => texts.push(s.as_bytes().to_vec()),
+            Bound::Null => has_null = true,
+            _ => return None,
+        }
+    }
+    let ty = match (nums.is_empty(), texts.is_empty()) {
+        (false, true) if float => Ty::Float,
+        (false, true) => Ty::Int,
+        (true, false) => Ty::Text,
+        _ => return None,
+    };
+    Some(super::keyset::KeySet::new(ty, nums, texts, has_null))
+}
 
 fn lookup_func(name: &str) -> Option<&'static FuncDef> {
     FUNCS.iter().find(|f| f.name == name).or_else(|| crate::udf::lookup(name))
@@ -365,6 +400,7 @@ impl<'a> Binder<'a> {
             Expr::Number(n, f, _) => Ok(Bound::Number(*n, *f)),
             Expr::Str(s, _) => Ok(Bound::Str(s.clone())),
             Expr::Null(_) => Ok(Bound::Null),
+            Expr::Set(s, _) => Ok(Bound::Set(s.clone())),
             Expr::Star(span) => Err(Diagnostic::new(
                 "'*' can only be used in the select list or as count(*)",
                 *span,
@@ -485,7 +521,18 @@ impl<'a> Binder<'a> {
             ));
         }
 
+        if matches!(func.name, "in_set" | "exists_set") != matches!(bound_args.get(1), Some(Bound::Set(_))) {
+            return Err(Diagnostic::new(format!("unknown function '{name}'"), span));
+        }
         let ty = self.check_sig(func, &bound_args, args, span)?;
+        // a long literal list is a set: one lookup per row, not a scan of the list
+        if func.name == "in" && bound_args.len() > IN_LIST_AS_SET {
+            if let Some(set) = literal_set(&bound_args[1..]) {
+                let func = lookup_func("in_set").expect("registered");
+                let needle = bound_args.swap_remove(0);
+                return Ok(Bound::Call { func, args: vec![needle, Bound::Set(std::rc::Rc::new(set))], ty });
+            }
+        }
         // the executor evaluates the separator once, at plan time
         if func.name == "group_concat"
             && bound_args.len() == 2
@@ -555,10 +602,17 @@ impl<'a> Binder<'a> {
                 for (i, b) in bound.iter().enumerate().skip(1) {
                     if !(b.ty().coerces_to(base) || base.coerces_to(b.ty())) {
                         return Err(Diagnostic::new(
-                            format!(
-                                "{}() compares {} values, argument {} is {}",
-                                func.name, base.name(), i + 1, b.ty().name()
-                            ),
+                            match func.name {
+                                // a value set: what the user wrote was IN / EXISTS
+                                "in_set" | "exists_set" => format!(
+                                    "in() compares {} values with a subquery's {} values",
+                                    base.name(), b.ty().name()
+                                ),
+                                name => format!(
+                                    "{}() compares {} values, argument {} is {}",
+                                    name, base.name(), i + 1, b.ty().name()
+                                ),
+                            },
                             arg_span(i),
                         ));
                     }

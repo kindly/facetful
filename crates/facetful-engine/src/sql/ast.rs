@@ -25,6 +25,10 @@ pub enum Expr {
     /// `EXISTS (select … where inner.k = outer.k …)`: `cols` is empty and the
     /// keys come from the correlation in the subquery's WHERE.
     InSubquery { cols: Vec<Expr>, query: Box<Query>, body: Span, span: Span, exists: bool },
+    /// A materialized value set (`keyset.rs`), the second argument of
+    /// `in_set` / `exists_set`: what an `IN (select …)` becomes before
+    /// binding. Never produced by the parser.
+    Set(std::rc::Rc<super::keyset::KeySet>, Span),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +62,8 @@ impl Expr {
             | Expr::Column(_, s)
             | Expr::Star(s)
             | Expr::Null(s)
-            | Expr::Row(_, s) => *s,
+            | Expr::Row(_, s)
+            | Expr::Set(_, s) => *s,
             Expr::Call { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }

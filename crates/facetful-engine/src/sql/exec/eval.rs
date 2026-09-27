@@ -16,6 +16,7 @@ pub(super) fn eval_vec(b: &Bound, ctx: &GroupCtx) -> VV {
         }),
         Bound::Str(s) => VV::const_val(Val::text(s.clone())),
         Bound::Null => VV::const_val(Val::Null),
+        Bound::Set(_) => unreachable!("a set is only ever the second argument of in_set / exists_set"),
         Bound::Column { index, .. } => ctx.column(*index),
         Bound::Unary { op, expr, ty } => {
             let a = eval_vec(expr, ctx);
@@ -467,6 +468,10 @@ pub(super) fn like_shape_match(shape: &LikeShape, s: &str, full_pattern: &str) -
 pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) -> VV {
     let rows = ctx.rows;
     match name {
+        "in_set" | "exists_set" => {
+            let Bound::Set(set) = &args[1] else { unreachable!("the binder checks the set argument") };
+            in_set_vec(&args[0], set, name == "exists_set", ctx)
+        }
         "isnull" => {
             let a = eval_vec(&args[0], ctx);
             let out: Vec<u8> = (0..rows).map(|i| !a.is_valid(i) as u8).collect();
@@ -1119,4 +1124,110 @@ pub(super) fn lanes_to_vv(rows: usize, ty: Ty, f: &dyn Fn(usize) -> Val) -> VV {
             VV { data: Data::Text(Rc::new(out)), valid: Some(Rc::new(valid)) }
         }
     }
+}
+
+/// `x IN <set>` over a lane: one lookup per row. With `exists`, EXISTS
+/// semantics: a NULL `x` or a miss is FALSE, never NULL. Otherwise SQL's IN:
+/// a NULL `x` is NULL, and so is a miss when the set holds a NULL.
+fn in_set_vec(arg: &Bound, set: &crate::sql::keyset::KeySet, exists: bool, ctx: &GroupCtx) -> VV {
+    let rows = ctx.rows;
+    let mut out = vec![0u8; rows];
+    let valid_of = |i: usize, v: &Option<Rc<Vec<u8>>>| v.as_ref().map_or(true, |b| b[i / 8] >> (i % 8) & 1 != 0);
+    // a plain text column: straight off the blob, no strings built
+    let raw = match arg {
+        Bound::Column { index, .. } => match ctx.cols.get(index) {
+            Some((GroupCol::Text { offsets, bytes, .. }, validity)) => Some((offsets.clone(), bytes.clone(), validity.clone())),
+            _ => None,
+        },
+        _ => None,
+    };
+    let needle_valid: Option<Rc<Vec<u8>>> = match raw {
+        Some((offsets, bytes, validity)) => {
+            for (i, o) in out.iter_mut().enumerate() {
+                if valid_of(i, &validity) {
+                    *o = set.contains_bytes(&bytes[offsets[i] as usize..offsets[i + 1] as usize]) as u8;
+                }
+            }
+            validity
+        }
+        None => {
+            let x = eval_vec(arg, ctx);
+            match &x.data {
+                Data::Codes { codes, dict } => {
+                    // a membership table per dictionary entry; out-of-range codes are NULL
+                    let hit: Vec<u8> = dict.iter().map(|s| set.contains_bytes(s.as_bytes()) as u8).collect();
+                    for (o, &c) in out.iter_mut().zip(codes.iter()) {
+                        *o = hit.get(c as usize).copied().unwrap_or(0);
+                    }
+                }
+                Data::I64(v) => {
+                    for (o, &x) in out.iter_mut().zip(v.iter()) {
+                        *o = set.contains_i64(x) as u8;
+                    }
+                }
+                Data::F64(v) => {
+                    for (o, &x) in out.iter_mut().zip(v.iter()) {
+                        *o = set.contains_f64(x) as u8;
+                    }
+                }
+                Data::Bool(v) => {
+                    for (o, &x) in out.iter_mut().zip(v.iter()) {
+                        *o = set.contains_i64(x as i64) as u8;
+                    }
+                }
+                Data::Text(v) => {
+                    for (o, s) in out.iter_mut().zip(v.iter()) {
+                        *o = set.contains_bytes(s.as_bytes()) as u8;
+                    }
+                }
+                Data::Const(c) => {
+                    let hit = match c {
+                        Val::Null => false,
+                        Val::Bool(b) => set.contains_i64(*b as i64),
+                        Val::Int(i) => set.contains_i64(*i),
+                        Val::Float(f) => set.contains_f64(*f),
+                        Val::Text(s) => set.contains_bytes(s.as_bytes()),
+                    };
+                    out.fill(hit as u8);
+                    if c.is_null() {
+                        return if exists { VV::all_valid(Data::Bool(Rc::new(out))) } else { VV::const_val(Val::Null) };
+                    }
+                }
+            }
+            // a code past the dictionary is NULL too
+            match &x.data {
+                Data::Codes { codes, dict } if codes.iter().any(|&c| c as usize >= dict.len()) => {
+                    let mut v = vec![0u8; rows.div_ceil(8)];
+                    for (i, &c) in codes.iter().enumerate() {
+                        if (c as usize) < dict.len() && x.is_valid(i) {
+                            v[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    Some(Rc::new(v))
+                }
+                _ => x.valid.clone(),
+            }
+        }
+    };
+    if exists {
+        // NULL needle rows already read 0 or must: clear them
+        if let Some(v) = &needle_valid {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o &= v[i / 8] >> (i % 8) & 1;
+            }
+        }
+        return VV::all_valid(Data::Bool(Rc::new(out)));
+    }
+    if !set.has_null() {
+        // a hit is TRUE, a miss FALSE; only a NULL needle is NULL
+        return VV { data: Data::Bool(Rc::new(out)), valid: needle_valid };
+    }
+    // a miss against a set holding NULL is NULL
+    let mut valid = vec![0u8; rows.div_ceil(8)];
+    for (i, &o) in out.iter().enumerate() {
+        if o != 0 && valid_of(i, &needle_valid) {
+            valid[i / 8] |= 1 << (i % 8);
+        }
+    }
+    VV { data: Data::Bool(Rc::new(out)), valid: Some(Rc::new(valid)) }
 }

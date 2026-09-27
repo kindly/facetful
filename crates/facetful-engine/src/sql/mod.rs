@@ -4,6 +4,7 @@
 pub mod ast;
 pub mod binder;
 pub mod exec;
+pub mod keyset;
 pub mod lexer;
 pub mod parser;
 pub mod span;
@@ -99,11 +100,22 @@ pub fn run_batch_with<S: ReadAt>(
                 continue;
             }
         };
-        let simple = q.with.is_empty()
-            && q.from_subquery.is_none()
-            && q.joins.is_empty()
-            && !q.filter.as_ref().is_some_and(has_in)
-            && resolve_name(&q.from, &[], cat) == Target::Base;
+        let base = q.with.is_empty() && q.from_subquery.is_none() && q.joins.is_empty() && resolve_name(&q.from, &[], cat) == Target::Base;
+        // an IN that becomes a value set leaves a plain single-table query,
+        // which fuses like any other; one that needs a join runs alone
+        let q = if base && q.filter.as_ref().is_some_and(has_in) {
+            match expand_in_subqueries(table, &q, src, &mut Vec::new(), cat) {
+                Ok(Some(rq)) if rq.joins.is_empty() => strip_own_alias(&rq).unwrap_or(rq),
+                Ok(_) => continue,
+                Err(d) => {
+                    out[i] = Some(Err(d));
+                    continue;
+                }
+            }
+        } else {
+            q
+        };
+        let simple = base && !q.filter.as_ref().is_some_and(has_in);
         if simple {
             match binder::Binder::new(&schema).bind_query(&q) {
                 Ok(b) => bound.push((i, b, q.span)),
@@ -214,8 +226,15 @@ fn exec_query<S: ReadAt>(
     let expanded = expand_in_subqueries(table, q, src, &mut scope, cat)?;
     let q = expanded.as_ref().unwrap_or(q);
     let rewritten;
+    let unqualified;
     let q = if q.joins.is_empty() {
-        q
+        match strip_own_alias(q) {
+            Some(u) => {
+                unqualified = u;
+                &unqualified
+            }
+            None => q,
+        }
     } else {
         let (t, rq) = resolve_joins(table, q, src, &scope, cat, target)?;
         target = t;
@@ -764,6 +783,16 @@ fn expand_in_expr<S: ReadAt>(
                     span,
                 ));
             }
+            // one key: a value set, tested per row and cached as the outer
+            // table's own conjunct mask — no joined copy of the table
+            if cols.len() == 1 {
+                if let Some(set) = key_set_of(table, &inner_key, span)? {
+                    let func = if exists { "exists_set" } else { "in_set" };
+                    let pred = Expr::call(func, vec![cols[0].clone(), Expr::Set(std::rc::Rc::new(set), span)], span);
+                    *e = if negated { Expr::Unary { op: UnOp::Not, expr: Box::new(pred), span } } else { pred };
+                    return Ok(());
+                }
+            }
             for c in cols.iter() {
                 if !matches!(c, Expr::Column(..)) {
                     return Err(Diagnostic::new("IN (select …) compares plain columns", c.span()));
@@ -779,6 +808,18 @@ fn expand_in_expr<S: ReadAt>(
             scope.push(("__in_src".to_string(), inner_key.clone()));
             let distinct_q = parse_query(&distinct_sql)?;
             let distinct_key = derive(table, &distinct_q, span::Span::new(0, distinct_sql.len()), &distinct_sql, scope, cat)?;
+            // nothing to join against (and no key stats to join with): IN and
+            // EXISTS are FALSE, NOT IN and NOT EXISTS TRUE, whatever the row
+            if table.derived_table(&distinct_key).map_or(0, |t| t.catalog().total_rows) == 0 {
+                scope.pop();
+                *e = Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Number(1.0, false, span)),
+                    rhs: Box::new(Expr::Number(if negated { 1.0 } else { 0.0 }, false, span)),
+                    span,
+                };
+                return Ok(());
+            }
             // 3. does the key set hold a NULL? (decides NOT IN)
             let null_sql = format!(
                 "select count(*) from __in_src where {}",
@@ -840,6 +881,93 @@ fn expand_in_expr<S: ReadAt>(
         }
         _ => Ok(()),
     }
+}
+
+/// The members of a derived table's only column, as a value set; None for a
+/// column kind a set does not hold (bool), which keeps the join path.
+fn key_set_of<S: ReadAt>(table: &mut Table<S>, key: &str, span: span::Span) -> Result<Option<keyset::KeySet>, Diagnostic> {
+    use crate::format::ColumnType;
+    let err = |e: crate::format::FormatError| Diagnostic::new(format!("execution error: {e}"), span);
+    let t = table.derived_table(key).expect("a derived table was just materialized or found");
+    let def = t.catalog().schema.columns[0].clone();
+    let ty = match def.ty {
+        ColumnType::Utf8 => binder::Ty::Text,
+        ColumnType::Float64 => binder::Ty::Float,
+        ColumnType::Date => binder::Ty::Date,
+        ColumnType::Timestamp => binder::Ty::Timestamp,
+        ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::Int64 => binder::Ty::Int,
+        ColumnType::Bool => return Ok(None),
+    };
+    let (mut nums, mut texts, mut has_null) = (Vec::new(), Vec::new(), false);
+    let dict = if def.is_dict() { Some(t.dictionary(0).map_err(err)?) } else { None };
+    let mut used = vec![false; dict.as_ref().map_or(0, |d| d.len())];
+    for g in 0..t.group_count() {
+        let rows = t.group_rows(g);
+        let valid = t.validity(g, 0).map_err(err)?;
+        let ok = |i: usize| valid.as_ref().map_or(true, |v| v[i / 8] >> (i % 8) & 1 != 0);
+        has_null |= valid.is_some();
+        if dict.is_some() {
+            for (i, c) in t.codes(g, 0, rows).map_err(err)?.into_iter().enumerate() {
+                match used.get_mut(c as usize) {
+                    Some(u) if ok(i) => *u = true,
+                    _ => has_null = true,
+                }
+            }
+        } else if def.ty == ColumnType::Utf8 {
+            let (offs, bytes) = t.texts_raw(g, 0, rows).map_err(err)?;
+            for i in (0..rows).filter(|&i| ok(i)) {
+                texts.push(bytes[offs[i] as usize..offs[i + 1] as usize].to_vec());
+            }
+        } else if def.ty == ColumnType::Float64 {
+            nums.extend(t.f64s(g, 0, rows).map_err(err)?.into_iter().enumerate().filter(|&(i, _)| ok(i)).map(|(_, x)| x));
+        } else {
+            nums.extend(t.i64s(g, 0, rows).map_err(err)?.into_iter().enumerate().filter(|&(i, _)| ok(i)).map(|(_, x)| x as f64));
+        }
+    }
+    if let Some(d) = dict {
+        texts.extend(d.into_iter().zip(used).filter(|(_, u)| *u).map(|(s, _)| s.into_bytes()));
+    }
+    Ok(Some(keyset::KeySet::new(ty, nums, texts, has_null)))
+}
+
+/// A single-table query may qualify names with its own FROM alias (or
+/// name); with no join to resolve them, drop the qualifier. None when no
+/// name needed it.
+fn strip_own_alias(q: &ast::Query) -> Option<ast::Query> {
+    let own = q.from_alias.clone().unwrap_or_else(|| q.from.clone());
+    fn qualified(e: &ast::Expr, own: &str) -> bool {
+        let mut names = Vec::new();
+        collect_names(e, &mut names);
+        names.iter().any(|n| split_qualified(n).0 == Some(own))
+    }
+    let exprs = || q.select.iter().map(|s| &s.expr).chain(q.filter.iter()).chain(q.group_by.iter()).chain(q.order_by.iter().map(|o| &o.expr));
+    if !exprs().any(|e| qualified(e, &own)) {
+        return None;
+    }
+    fn strip(e: &mut ast::Expr, own: &str) {
+        match e {
+            ast::Expr::Column(n, _) => {
+                if let (Some(a), col) = split_qualified(n) {
+                    if a == own {
+                        *n = col.to_string();
+                    }
+                }
+            }
+            ast::Expr::Call { args, .. } | ast::Expr::Row(args, _) => args.iter_mut().for_each(|a| strip(a, own)),
+            ast::Expr::Unary { expr, .. } => strip(expr, own),
+            ast::Expr::Binary { lhs, rhs, .. } => {
+                strip(lhs, own);
+                strip(rhs, own);
+            }
+            _ => {}
+        }
+    }
+    let mut rq = q.clone();
+    for s in &mut rq.select {
+        strip(&mut s.expr, &own);
+    }
+    rq.filter.iter_mut().chain(rq.group_by.iter_mut()).chain(rq.order_by.iter_mut().map(|o| &mut o.expr)).for_each(|e| strip(e, &own));
+    Some(rq)
 }
 
 fn split_qualified(name: &str) -> (Option<&str>, &str) {
