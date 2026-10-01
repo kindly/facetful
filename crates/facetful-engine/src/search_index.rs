@@ -28,6 +28,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 const BITMAP_ABOVE: usize = 4096;
 const BITMAP_WORDS: usize = 65536 / 64;
 
+
 /// FxHash (as in rustc): fast for short keys, and the keys are our own data.
 #[derive(Default)]
 struct Fx(u64);
@@ -126,11 +127,10 @@ struct GroupIndex {
 }
 
 impl GroupIndex {
-    /// From (word id << 16 | row) pairs, duplicates allowed, rows ascending
-    /// within each column's run (pairs arrive column by column). A counting
-    /// sort by word id, not a comparison sort: each word's rows land in push
-    /// order, already ascending unless several columns contributed, and only
-    /// then get a (small) sort. `scratch` is reused across groups.
+    /// From (word id << 16 | row) pairs, pushed in ascending row order with
+    /// repeats allowed. A counting sort by word id, not a comparison sort:
+    /// each word's rows land in push order, so ascending, and repeats are
+    /// dropped in one pass. `scratch` is reused across groups.
     fn from_pairs(pairs: &[u64], scratch: &mut Scratch) -> GroupIndex {
         let Scratch { count, touched, rows } = scratch;
         touched.clear();
@@ -167,15 +167,27 @@ impl GroupIndex {
             let end = count[id as usize] as usize;
             count[id as usize] = 0; // reset for the next group
             let b = &mut rows[start..end];
-            if !b.windows(2).all(|w| w[0] < w[1]) {
-                b.sort_unstable();
-            }
-            // dedup in place (the same word in two columns of one row)
-            let mut n = 0;
-            for k in 0..b.len() {
-                if k == 0 || b[k] != b[n - 1] {
-                    b[n] = b[k];
+            // rows arrive ascending (pairs are pushed row by row); drop the
+            // repeats of a word within one row in the same pass
+            let mut n = 1;
+            let mut ordered = true;
+            for k in 1..b.len() {
+                let (prev, cur) = (b[n - 1], b[k]);
+                if cur != prev {
+                    ordered &= cur > prev;
+                    b[n] = cur;
                     n += 1;
+                }
+            }
+            if !ordered {
+                // not reachable from `build`; kept so the list stays a set
+                b.sort_unstable();
+                n = 1;
+                for k in 1..b.len() {
+                    if b[k] != b[n - 1] {
+                        b[n] = b[k];
+                        n += 1;
+                    }
                 }
             }
             if n > BITMAP_ABOVE {
@@ -330,12 +342,39 @@ pub struct ValueSets(Vec<(usize, Option<Vec<u8>>)>);
 /// Interns words while building: text -> id. Words of up to 15 bytes are
 /// keys by value (bytes plus length in one u128), so a lookup is an integer
 /// hash and compare with no pointer to chase; longer words are boxed.
-#[derive(Default)]
 struct Vocab {
     short: FxMap<u128, u32>,
     long: FxMap<Box<[u8]>, u32>,
+    /// direct-mapped cache in front of `short`: word frequencies are skewed,
+    /// so a few thousand slots (in cache, unlike the map) answer most lookups
+    front: Vec<(u128, u32)>,
+}
+
+const FRONT_SLOTS: usize = 1 << 13;
+
+impl Default for Vocab {
+    fn default() -> Self {
+        // key 0 never occurs (every short key carries its length, at least 1)
+        Vocab { short: FxMap::default(), long: FxMap::default(), front: vec![(0, 0); FRONT_SLOTS] }
+    }
 }
 impl Vocab {
+    /// The id of a word of up to 15 bytes, given as its key: the bytes
+    /// little-endian, the length in the top byte.
+    #[inline]
+    fn short_id(&mut self, key: u128) -> u32 {
+        let h = ((key as u64) ^ ((key >> 64) as u64).rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let slot = (h >> (64 - 13)) as usize;
+        let f = self.front[slot];
+        if f.0 == key {
+            return f.1;
+        }
+        let next = (self.short.len() + self.long.len()) as u32;
+        let id = *self.short.entry(key).or_insert(next);
+        self.front[slot] = (key, id);
+        id
+    }
+
     #[inline]
     fn id(&mut self, w: &[u8]) -> u32 {
         let next = (self.short.len() + self.long.len()) as u32;
@@ -343,7 +382,7 @@ impl Vocab {
             let mut b = [0u8; 16];
             b[..w.len()].copy_from_slice(w);
             b[15] = w.len() as u8;
-            return *self.short.entry(u128::from_le_bytes(b)).or_insert(next);
+            return self.short_id(u128::from_le_bytes(b));
         }
         if let Some(&id) = self.long.get(w) {
             return id;
@@ -361,6 +400,98 @@ impl Vocab {
             words[id as usize] = w;
         }
         words
+    }
+}
+
+/// A plain text column's row offsets: raw LE bytes off the image, or copied.
+#[derive(Clone, Copy)]
+enum Offsets<'a> {
+    Le(&'a [u8]),
+    Words(&'a [u32]),
+}
+impl Offsets<'_> {
+    #[inline]
+    fn at(&self, i: usize) -> usize {
+        match self {
+            Offsets::Le(o) => u32::from_le_bytes(o[i * 4..i * 4 + 4].try_into().unwrap()) as usize,
+            Offsets::Words(o) => o[i] as usize,
+        }
+    }
+}
+
+/// One bit per byte of an ASCII text, set for letters and digits, 64 bytes
+/// per word. Written as plain compares so the compiler vectorizes it.
+#[inline]
+fn word_byte_mask(text: &[u8], masks: &mut Vec<u64>) {
+    masks.clear();
+    for chunk in text.chunks(64) {
+        let mut m = 0u64;
+        for (k, &b) in chunk.iter().enumerate() {
+            let l = b | 0x20;
+            let is = (l.wrapping_sub(b'a') < 26) | (b.wrapping_sub(b'0') < 10);
+            m |= (is as u64) << k;
+        }
+        masks.push(m);
+    }
+}
+
+/// The next position at or after `from` whose bit is `want`, or `len`.
+#[inline]
+fn next_bit(masks: &[u64], from: usize, want: bool, len: usize) -> usize {
+    let mut w = from / 64;
+    if w >= masks.len() {
+        return len;
+    }
+    let flip = if want { 0 } else { u64::MAX };
+    let mut cur = (masks[w] ^ flip) & (u64::MAX << (from % 64));
+    loop {
+        if cur != 0 {
+            return (w * 64 + cur.trailing_zeros() as usize).min(len);
+        }
+        w += 1;
+        if w >= masks.len() {
+            return len;
+        }
+        cur = masks[w] ^ flip;
+    }
+}
+
+/// Push (word id << 16 | row) for every word of one row's text. ASCII text
+/// finds its words from a bitmask of letter-and-digit bytes, and a word of
+/// up to 15 bytes becomes its hash key in one 16-byte load: masked to its
+/// length and lowercased by setting bit 5 of every byte (which turns
+/// letters to lowercase and leaves digits as they are). Other text goes
+/// through `for_each_word`.
+#[inline]
+fn push_row_words(text: &[u8], row: u64, vocab: &mut Vocab, pairs: &mut Vec<u64>, buf: &mut Vec<u8>, masks: &mut Vec<u64>) {
+    if !text.is_ascii() {
+        for_each_word(text, buf, |w| pairs.push((vocab.id(w) as u64) << 16 | row));
+        return;
+    }
+    let n = text.len();
+    word_byte_mask(text, masks);
+    let mut i = next_bit(masks, 0, true, n);
+    while i < n {
+        let end = next_bit(masks, i, false, n);
+        let len = end - i;
+        let id = if len <= 15 {
+            let raw = if i + 16 <= n {
+                u128::from_le_bytes(text[i..i + 16].try_into().unwrap())
+            } else {
+                let mut b = [0u8; 16];
+                b[..len].copy_from_slice(&text[i..end]);
+                u128::from_le_bytes(b)
+            };
+            let keep = (1u128 << (8 * len)) - 1;
+            let lower = 0x2020_2020_2020_2020_2020_2020_2020_2020u128 & keep;
+            vocab.short_id((raw & keep) | lower | (len as u128) << 120)
+        } else {
+            buf.clear();
+            buf.extend(text[i..end].iter().map(|b| b.to_ascii_lowercase()));
+            vocab.id(buf)
+        };
+        pairs.push((id as u64) << 16 | row);
+        i = next_bit(masks, end, true, n);
     }
 }
 
@@ -398,38 +529,44 @@ impl SearchIndex {
         let mut groups = Vec::with_capacity(table.group_count());
         let mut pairs: Vec<u64> = Vec::new();
         let mut scratch = Scratch::default();
+        let mut masks = Vec::new();
         for g in 0..table.group_count() {
             let t = now();
             let rows = table.catalog().groups[g].row_count as usize;
             pairs.clear();
-            for &c in &cols {
+            let plain: Vec<usize> = cols.iter().copied().filter(|c| !dict_words.contains_key(c)).collect();
+            for (&c, (_, value_rows)) in dict_words.iter_mut() {
+                // rows per value, for the words' row counts
                 let valid = table.validity(g, c)?;
-                let present = |i: usize| valid.as_ref().is_none_or(|v| v[i / 8] >> (i % 8) & 1 == 1);
-                if let Some((_, value_rows)) = dict_words.get_mut(&c) {
-                    // rows per value, for the words' row counts
-                    for (r, &code) in table.codes(g, c, rows)?.iter().enumerate() {
-                        if present(r) {
-                            value_rows[code as usize] += 1;
+                for (r, &code) in table.codes(g, c, rows)?.iter().enumerate() {
+                    if valid.as_ref().is_none_or(|v| v[r / 8] >> (r % 8) & 1 == 1) {
+                        value_rows[code as usize] += 1;
+                    }
+                }
+            }
+            // plain columns row by row, across columns: every word's rows then
+            // arrive in ascending order, so `from_pairs` only drops repeats
+            let mut each = |segs: &[(Offsets, &[u8], Option<&[u8]>)]| {
+                for r in 0..rows {
+                    for (off, blob, valid) in segs {
+                        if valid.is_none_or(|v| v[r / 8] >> (r % 8) & 1 == 1) {
+                            push_row_words(&blob[off.at(r)..off.at(r + 1)], r as u64, &mut vocab, &mut pairs, &mut buf, &mut masks);
                         }
                     }
-                    continue;
                 }
-                let mut each = |offs: &dyn Fn(usize) -> usize, blob: &[u8]| {
-                    for r in 0..rows {
-                        if present(r) {
-                            for_each_word(&blob[offs(r)..offs(r + 1)], &mut buf, |w| {
-                                pairs.push((vocab.id(w) as u64) << 16 | r as u64);
-                            });
-                        }
-                    }
-                };
-                let done = table.with_text_segments(g, c, |o, blob, _| {
-                    each(&|i| u32::from_le_bytes(o[i * 4..i * 4 + 4].try_into().unwrap()) as usize, blob)
-                })?;
-                if done.is_none() {
-                    let (o, blob) = table.texts_raw(g, c, rows)?;
-                    each(&|i| o[i] as usize, &blob);
+            };
+            let done = table.with_text_columns(g, &plain, |segs| {
+                let segs: Vec<_> = segs.iter().map(|&(o, b, v)| (Offsets::Le(o), b, v)).collect();
+                each(&segs);
+            })?;
+            if done.is_none() {
+                let mut owned = Vec::new();
+                for &c in &plain {
+                    let (o, b) = table.texts_raw(g, c, rows)?;
+                    owned.push((o, b, table.validity(g, c)?));
                 }
+                let segs: Vec<_> = owned.iter().map(|(o, b, v)| (Offsets::Words(o), b.as_slice(), v.as_deref())).collect();
+                each(&segs);
             }
             phases[1] += since(&t);
             let t = now();

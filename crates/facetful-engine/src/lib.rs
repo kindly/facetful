@@ -433,6 +433,42 @@ impl<S: ReadAt> Table<S> {
         Ok(&e.data)
     }
 
+    /// Run `f` over several plain-text columns' raw segments for one group at
+    /// once — per column `(offsets as LE u32 bytes, blob, validity)` —
+    /// borrowed, no copy, so a caller can walk row by row across columns.
+    /// `Ok(None)` when they could not all be held resident at once.
+    #[cfg(feature = "search")]
+    pub(crate) fn with_text_columns<R>(
+        &mut self,
+        group: usize,
+        cols: &[usize],
+        f: impl FnOnce(&[(&[u8], &[u8], Option<&[u8]>)]) -> R,
+    ) -> Result<Option<R>, FormatError> {
+        for &c in cols {
+            self.segment(group, c, 0)?;
+            self.segment(group, c, 1)?;
+            if self.cat.groups[group].cols[c].null_count != 0 {
+                self.segment(group, c, 2)?;
+            }
+        }
+        let mut segs = Vec::with_capacity(cols.len());
+        for &c in cols {
+            let (Some(offs), Some(blob)) = (self.resident(group, c, 0), self.resident(group, c, 1)) else {
+                return Ok(None);
+            };
+            let valid = if self.cat.groups[group].cols[c].null_count != 0 {
+                match self.resident(group, c, 2) {
+                    Some(v) => Some(v),
+                    None => return Ok(None),
+                }
+            } else {
+                None
+            };
+            segs.push((offs, blob, valid));
+        }
+        Ok(Some(f(&segs)))
+    }
+
     /// Run `f` over a dictionary column's raw code segment for one group —
     /// `(codes as LE bytes, code width, validity)` — borrowed, no copy. For
     /// the search index's per-word lookups. `Ok(None)` when the segments

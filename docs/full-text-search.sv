@@ -155,18 +155,20 @@ Cold cost per word, split by column (each column as its own query, so each figur
 
 `crates/facetful-engine/src/search_index.rs` builds the word index; `Table::build_search_index(cols)` keeps it, and `search()` uses it when its columns match the index's exactly. Both paths match at **word starts**, folded and split by one tokenizer (`for_each_word`), cache each word's mask under the same key, and give identical rows: `tests/search.rs` checks both against a brute-force reading on every query and keystroke, and breaking the word-boundary check or the prefix lookup fails it. In JS, `buildSearchIndex(table, columns)` and `dropSearchIndex(table)`.
 
-**Layout as built.** Plain text columns: per row group, each word's rows (a sorted `u16` array, or a bitmap above 4,096 rows), built by a counting sort on word id. Dictionary columns: per word, the codes of the values that hold it; a query turns them into a byte table over codes and reads each group's codes. That keeps Description Common, whose 61K values repeat about 17 words each over 820K rows (26M of the 67M word occurrences), out of the build and the row lists. Words up to 15 bytes are hash keys by value, with no pointer to chase.
+**Layout as built.** Plain text columns: per row group, each word's rows (a sorted `u16` array, or a bitmap above 4,096 rows). The build reads the plain columns row by row across columns, so each word's rows arrive in order and a counting sort on word id only has to drop repeats. Dictionary columns: per word, the codes of the values that hold it; a query turns them into a byte table over codes and reads each group's codes. That keeps Description Common, whose 61K values repeat about 17 words each over 820K rows (26M of the 67M word occurrences), out of the build and the row lists. Tokenizing ASCII text finds words from a bitmask of letter-and-digit bytes, and a word of up to 15 bytes becomes its hash key in one 16-byte load, masked and lowercased by setting bit 5 of each byte. A small direct-mapped cache sits in front of the word hash map.
 
 grantnav, five search columns:
 
 | | first version | now, native | now, wasm (Node) |
 |---|---|---|---|
-| build | 2.92 s native, 3.9 s wasm | **2.05 s** | **2.86 s** |
+| build | 2.92 s native, 3.9 s wasm | **1.31 s** | **2.15 s** |
 | (word, row) pairs in row lists | 49.0M | 27.6M, plus 1.65M (word, value) pairs | same |
 | index holds | 79.6 MB | 67.3 MB | 67.2 MB |
-| wasm memory added by the build | +195 MB | | +158 MB (dictionaries, 32 MB, loaded by any query, not counted) |
+| wasm memory added by the build | +195 MB | | +159 MB (dictionaries, 32 MB, loaded by any query, not counted) |
 
-Build cost per column, native: Description Rare 0.95 s, Title 0.39 s, Recipient 0.22 s, Description Common 0.13 s, Programme 0.01 s. **Without Description Rare** (the first image of a split) the build is 0.82 s native and the index 40 MB, so the second image's column carries most of the build, and arrives later anyway.
+Where the native 1.31 s goes: tokenizing and looking up words 0.87 s, row lists 0.27 s, dictionaries 0.11 s. Tried and dropped: a radix sort (slower than the counting sort, more memory) and reusing a repeated short value's words within a group (repeats within 65,536 rows are too rare to pay for hashing every value).
+
+**Without Description Rare** (the first image of a split) the build is 0.61 s native and the index 40 MB; Description Rare carries most of the rest and arrives with the second image.
 
 Typing with the index (wasm, mask cache on): 5 to 7 ms per keystroke once a word has a few letters, 17 to 35 ms for the first letter of a word (thousands of words). `mental health` letter by letter is 119 ms in total, against 1,262 ms on the scan path. Cold whole queries: 4.8 to 13 ms against 62 to 186 ms scanning. Reading the dictionary columns' codes per word (about 3M lookups) is most of a keystroke; per-group row lists by dictionary value would make that proportional to the hits if it ever matters.
 
@@ -174,7 +176,7 @@ wasm memory never shrinks, so the build's temporary state (the pair buffer, the 
 
 The scan path with word starts is slower than the substring version committed on 30 September (typing `mental health` 1,262 against 566 ms): the kernel checks many hits that fall inside words. It only serves until the index is built and in the lite build.
 
-Size, unoptimized: lite 291.7 KB gz, full 318.6 KB gz (+27 KB for the scan path and the index).
+Size, unoptimized: lite 291.7 KB gz, full 320.4 KB gz (+29 KB for the scan path and the index).
 </sv-prose>
 
 <sv-prose id="fts-next">
