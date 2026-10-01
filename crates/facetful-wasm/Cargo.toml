@@ -9,4 +9,8 @@ description = "facetful wasm bindings and worker protocol"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-facetful-engine = { path = "../facetful-engine" }
+facetful-engine = { path = "../facetful-engine", default-features = false }
+
+[features]
+default = ["search"]
+search = ["facetful-engine/search"]

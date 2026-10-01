@@ -59,6 +59,26 @@ pub fn find_ci(hay: &[u8], from: usize, needle_lower: &[u8]) -> Option<usize> {
     }
 }
 
+/// Mark every row of a text blob that contains `needle_lower`: one scan of
+/// the whole blob, walking the row offsets along the hits (`off(i)` is row
+/// i's start, `off(rows)` the blob's end). Sets `out[row] = 1`, never clears.
+pub fn mark_rows_ci(blob: &[u8], off: impl Fn(usize) -> usize, rows: usize, needle_lower: &[u8], out: &mut [u8]) {
+    let blob = &blob[..off(rows)];
+    let (mut row, mut pos) = (0usize, 0usize);
+    while let Some(hit) = find_ci(blob, pos, needle_lower) {
+        while off(row + 1) <= hit {
+            row += 1;
+        }
+        let end = off(row + 1);
+        if hit + needle_lower.len() <= end {
+            out[row] = 1;
+            pos = end; // matched: skip the rest of this row
+        } else {
+            pos = hit + 1; // straddles a boundary: not a match
+        }
+    }
+}
+
 #[cfg_attr(all(target_arch = "wasm32", target_feature = "simd128"), allow(dead_code))]
 fn find_ci_scalar(hay: &[u8], from: usize, needle_lower: &[u8]) -> Option<usize> {
     let n = needle_lower.len();

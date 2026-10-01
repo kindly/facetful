@@ -7,3 +7,9 @@ description = "facetful vectorized executor (parser + planner later); pure, no I
 
 [dependencies]
 facetful-format = { path = "../facetful-format" }
+
+[features]
+default = ["search"]
+# search('q', col, …): word search over text columns (docs/full-text-search.sv).
+# Off for the lite build: cargo build -p facetful-wasm --no-default-features
+search = []

@@ -41,6 +41,9 @@ struct Entry {
     groups: Vec<Option<Rc<Vec<u8>>>>,
     last_used: u64,
     like: Option<LikeKey>,
+    /// search(): one word's mask over a set of columns, as (scope, word) —
+    /// narrowable the same way as a contains-LIKE (word_superset)
+    word: Option<(String, String)>,
 }
 
 pub struct MaskCache {
@@ -127,6 +130,7 @@ impl MaskCache {
             groups: vec![None; n_groups],
             last_used: tick,
             like,
+            word: None,
         });
         e.last_used = tick;
         if g < e.groups.len() {
@@ -151,6 +155,37 @@ impl MaskCache {
                     && needle.contains(lk.needle.as_str())
                     && e.groups.get(g).is_some_and(|m| m.is_some()))
                 .then_some((lk.needle.len(), k.clone()))
+            })
+            .max()
+            .map(|(_, k)| k)?;
+        let tick = self.touch();
+        let e = self.entries.get_mut(&best_key)?;
+        e.last_used = tick;
+        self.narrowed += 1;
+        e.groups[g].clone()
+    }
+
+    /// Store one search word's mask over `scope` (the searched columns).
+    pub fn put_word(&mut self, key: &str, g: usize, n_groups: usize, bits: Rc<Vec<u8>>, scope: &str, word: &str) {
+        self.put(key, g, n_groups, bits, None);
+        if let Some(e) = self.entries.get_mut(key) {
+            e.word.get_or_insert_with(|| (scope.to_string(), word.to_string()));
+        }
+    }
+
+    /// The tightest cached superset for a search word: the longest cached
+    /// word over the same `scope` that is a proper substring of `word`.
+    pub fn word_superset(&mut self, scope: &str, word: &str, g: usize) -> Option<Rc<Vec<u8>>> {
+        let best_key = self
+            .entries
+            .iter()
+            .filter_map(|(k, e)| {
+                let (s, w) = e.word.as_ref()?;
+                (s == scope
+                    && w.len() < word.len()
+                    && word.contains(w.as_str())
+                    && e.groups.get(g).is_some_and(|m| m.is_some()))
+                .then_some((w.len(), k.clone()))
             })
             .max()
             .map(|(_, k)| k)?;

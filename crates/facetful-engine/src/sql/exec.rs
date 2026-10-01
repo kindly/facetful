@@ -31,6 +31,8 @@ mod plain;
 mod sort;
 mod topk;
 mod batch;
+#[cfg(feature = "search")]
+mod search;
 use vector::*;
 use eval::*;
 use scalar::*;

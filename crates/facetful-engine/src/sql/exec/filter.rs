@@ -91,6 +91,9 @@ pub(super) struct Conjunct {
     pub(super) key: String,
     pub(super) cols: Vec<usize>,
     pub(super) like: Option<LikeKey>,
+    /// search(): evaluated word by word through the mask cache (search.rs)
+    #[cfg(feature = "search")]
+    pub(super) search: Option<super::search::Spec>,
 }
 
 /// `in_set` / `exists_set` over a stored integer column: the mask can test
@@ -197,6 +200,17 @@ pub(super) fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) 
                 Some(lk) => format!("like:{}:{}", lk.col, lk.needle),
                 None => format!("{expr:?}"),
             };
+            #[cfg(feature = "search")]
+            {
+                // keyed on the folded words: `Mental Health` and `health mental` are one mask
+                let search = super::search::spec_of(&expr);
+                let key = match &search {
+                    Some(s) => format!("search:{}:{:?}", s.scope, s.words),
+                    None => key,
+                };
+                Conjunct { key, expr, cols, like, search }
+            }
+            #[cfg(not(feature = "search"))]
             Conjunct { key, expr, cols, like }
         })
         .collect()
@@ -315,6 +329,12 @@ pub(super) fn where_mask<S: ReadAt>(
     // superset admits, straight off the image — no blob scan, no column copy
     let mut full: Vec<&Conjunct> = Vec::new();
     for c in pending {
+        #[cfg(feature = "search")]
+        if let Some(spec) = &c.search {
+            let m = super::search::group_mask(table, g, rows, spec, dicts)?;
+            store(table, c, &m, &mut keep);
+            continue;
+        }
         let narrowed = c.like.as_ref().and_then(|lk| {
             let sup = table.masks().like_superset(lk.col, &lk.needle, g)?;
             let needle = lk.needle.as_bytes();

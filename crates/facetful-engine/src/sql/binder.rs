@@ -211,6 +211,9 @@ pub static FUNCS: &[FuncDef] = &[
     FuncDef { name: "exists_set", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::ComparableToBool },
     FuncDef { name: "like", kind: FuncKind::Scalar, arity: (2, Some(2)), sig: Sig::ComparableToBool },
     FuncDef { name: "isnull", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Bool) },
+    // search('q', col, …): every word of q in one of the columns (exec/search.rs)
+    #[cfg(feature = "search")]
+    FuncDef { name: "search", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::Any(Ty::Bool) },
     FuncDef { name: "if", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::SameAsFirst },
     FuncDef { name: "case", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::SameAsFirst },
     FuncDef { name: "int", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Int) },
@@ -531,6 +534,18 @@ impl<'a> Binder<'a> {
                 let func = lookup_func("in_set").expect("registered");
                 let needle = bound_args.swap_remove(0);
                 return Ok(Bound::Call { func, args: vec![needle, Bound::Set(std::rc::Rc::new(set))], ty });
+            }
+        }
+        // search('q', col, …): the query is a literal (the executor splits it
+        // once per statement) and every searched column is text
+        if func.name == "search" {
+            if !matches!(bound_args[0], Bound::Str(_)) {
+                return Err(Diagnostic::new("search() query must be a text literal", args[0].span()));
+            }
+            for (i, b) in bound_args.iter().enumerate().skip(1) {
+                if !matches!(b, Bound::Column { ty: Ty::Text, .. }) {
+                    return Err(Diagnostic::new("search() searches text columns", args[i].span()));
+                }
             }
         }
         // the executor evaluates the separator once, at plan time
