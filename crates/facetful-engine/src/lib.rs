@@ -8,6 +8,8 @@
 
 pub use facetful_format as format;
 pub mod mask_cache;
+#[cfg(feature = "search")]
+pub mod search_index;
 pub mod join;
 pub mod materialize;
 pub mod text;
@@ -51,6 +53,9 @@ pub struct Table<S: ReadAt> {
     derived_tick: u64,
     pub derived_hits: u64,
     pub derived_misses: u64,
+    /// The word index search() uses when its columns match (search_index.rs).
+    #[cfg(feature = "search")]
+    search_index: Option<std::rc::Rc<search_index::SearchIndex>>,
 }
 
 /// Default derived-table budget: a few large rollups, dozens of facet-sized ones.
@@ -109,7 +114,30 @@ impl<S: ReadAt> Table<S> {
             derived_tick: 0,
             derived_hits: 0,
             derived_misses: 0,
+            #[cfg(feature = "search")]
+            search_index: None,
         })
+    }
+
+    /// Build the word index over `cols` (text columns) and keep it: search()
+    /// over exactly these columns then looks words up instead of scanning.
+    #[cfg(feature = "search")]
+    pub fn build_search_index(&mut self, cols: &[usize]) -> Result<search_index::IndexStats, FormatError> {
+        let idx = search_index::SearchIndex::build(self, cols)?;
+        let stats = idx.stats();
+        self.search_index = Some(std::rc::Rc::new(idx));
+        Ok(stats)
+    }
+
+    /// Drop the word index; search() scans again.
+    #[cfg(feature = "search")]
+    pub fn drop_search_index(&mut self) {
+        self.search_index = None;
+    }
+
+    #[cfg(feature = "search")]
+    pub fn search_index(&self) -> Option<std::rc::Rc<search_index::SearchIndex>> {
+        self.search_index.clone()
     }
 
     /// The filter-mask cache (per-conjunct WHERE bitmaps).
@@ -403,6 +431,38 @@ impl<S: ReadAt> Table<S> {
         let e = self.cache.get_mut(&key).unwrap();
         e.last_used = self.tick;
         Ok(&e.data)
+    }
+
+    /// Run `f` over a dictionary column's raw code segment for one group —
+    /// `(codes as LE bytes, code width, validity)` — borrowed, no copy. For
+    /// the search index's per-word lookups. `Ok(None)` when the segments
+    /// could not both be held resident; callers fall back to `codes`.
+    #[cfg(feature = "search")]
+    pub(crate) fn with_code_segments<R>(
+        &mut self,
+        group: usize,
+        col: usize,
+        f: impl FnOnce(&[u8], usize, Option<&[u8]>) -> R,
+    ) -> Result<Option<R>, FormatError> {
+        debug_assert!(self.cat.schema.columns[col].is_dict());
+        let width = self.cat.schema.columns[col].code_width();
+        let has_nulls = self.cat.groups[group].cols[col].null_count != 0;
+        self.segment(group, col, 0)?;
+        if has_nulls {
+            self.segment(group, col, 2)?;
+        }
+        let Some(codes) = self.resident(group, col, 0) else {
+            return Ok(None);
+        };
+        let valid = if has_nulls {
+            match self.resident(group, col, 2) {
+                Some(v) => Some(v),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        Ok(Some(f(codes, width, valid)))
     }
 
     pub(crate) fn codes(&mut self, group: usize, col: usize, n: usize) -> Result<Vec<u16>, FormatError> {

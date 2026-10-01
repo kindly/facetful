@@ -206,6 +206,30 @@ export class Engine {
     return this.w.table_warm(tableHandle, colIdx);
   }
 
+  /** Build the search() word index over these text columns and keep it on
+   *  the table: search() over exactly these columns then looks words up
+   *  instead of scanning. Returns { pairs, bytes }. Needs a build with the
+   *  `search` feature. */
+  buildSearchIndex(tableHandle, columns) {
+    if (!this.w.table_build_search_index) throw new Error("this facetful build has no search index (lite build)");
+    const idx = columns.map((c) => {
+      const i = this.colByName(tableHandle, c);
+      if (i < 0) throw new Error(`buildSearchIndex: no column ${JSON.stringify(c)}`);
+      return i;
+    });
+    const p = u32(this.w.alloc(idx.length * 4));
+    new Uint32Array(this.mem(), p, idx.length).set(idx);
+    const pairs = this.w.table_build_search_index(tableHandle, p, idx.length);
+    this.w.dealloc(p, idx.length * 4);
+    if (pairs < 0) throw new Error("buildSearchIndex: could not read the table");
+    return { pairs, bytes: this.w.table_search_index_bytes(tableHandle) };
+  }
+
+  /** Drop a table's search index; search() scans again. */
+  dropSearchIndex(tableHandle) {
+    this.w.table_drop_search_index?.(tableHandle);
+  }
+
   /** Filter-mask cache byte budget for a table; 0 disables it. */
   setMaskBudget(tableHandle, bytes) {
     this.w.table_set_mask_budget(tableHandle, bytes);

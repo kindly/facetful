@@ -401,6 +401,38 @@ pub extern "C" fn table_col_by_name(t: usize, name_ptr: *const u8, name_len: usi
     }
 }
 
+/// Build the search() word index over `n` text columns (indices at `cols`)
+/// and keep it on the table. Returns the (word, row) pairs indexed, or -1
+/// when a segment cannot be read.
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn table_build_search_index(t: usize, cols: *const u32, n: usize) -> f64 {
+    let t = unsafe { &mut *(t as *mut T) };
+    let cols: Vec<usize> = unsafe { core::slice::from_raw_parts(cols, n) }.iter().map(|&c| c as usize).collect();
+    match t.build_search_index(&cols) {
+        Ok(s) => s.pairs as f64,
+        Err(_) => -1.0,
+    }
+}
+
+/// Bytes the table's word index holds (row lists + vocabulary), 0 without one.
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn table_search_index_bytes(t: usize) -> f64 {
+    let t = unsafe { &*(t as *const T) };
+    t.search_index().map_or(0.0, |i| {
+        let s = i.stats();
+        (s.list_bytes + s.vocab_bytes) as f64
+    })
+}
+
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn table_drop_search_index(t: usize) {
+    let t = unsafe { &mut *(t as *mut T) };
+    t.drop_search_index();
+}
+
 /// Dictionary cardinality of a dict column (loads the dict on first call).
 #[no_mangle]
 pub extern "C" fn table_dict_len(t: usize, col: u32) -> u32 {

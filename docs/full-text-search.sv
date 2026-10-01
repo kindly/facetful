@@ -150,16 +150,43 @@ Typing costs 40 to 60 ms per letter for the first letters of a word and 20 to 45
 Cold cost per word, split by column (each column as its own query, so each figure carries some fixed overhead): a word with no hits costs 29.9 ms over all five columns. Plain text runs at 5 to 9 GB/s (Title 8.8 ms, Recipient 7.1, Description Rare 15.2). The two dictionary columns cost about 6 ms each even with no hits. `climate` adds about 22 ms of hit handling and `e` about 59 ms. So the scan path's realistic floor is about 20 ms per new word, after fixing the dictionary cost and checking later words only on earlier words' rows.
 </sv-prose>
 
+<sv-prose id="fts-index-results">
+## Index prototype (2 October, uncommitted)
+
+`crates/facetful-engine/src/search_index.rs` builds the word index; `Table::build_search_index(cols)` keeps it, and `search()` uses it when its columns match the index's exactly. Both paths match at **word starts**, folded and split by one tokenizer (`for_each_word`), cache each word's mask under the same key, and give identical rows: `tests/search.rs` checks both against a brute-force reading on every query and keystroke, and breaking the word-boundary check or the prefix lookup fails it. In JS, `buildSearchIndex(table, columns)` and `dropSearchIndex(table)`.
+
+**Layout as built.** Plain text columns: per row group, each word's rows (a sorted `u16` array, or a bitmap above 4,096 rows), built by a counting sort on word id. Dictionary columns: per word, the codes of the values that hold it; a query turns them into a byte table over codes and reads each group's codes. That keeps Description Common, whose 61K values repeat about 17 words each over 820K rows (26M of the 67M word occurrences), out of the build and the row lists. Words up to 15 bytes are hash keys by value, with no pointer to chase.
+
+grantnav, five search columns:
+
+| | first version | now, native | now, wasm (Node) |
+|---|---|---|---|
+| build | 2.92 s native, 3.9 s wasm | **2.05 s** | **2.86 s** |
+| (word, row) pairs in row lists | 49.0M | 27.6M, plus 1.65M (word, value) pairs | same |
+| index holds | 79.6 MB | 67.3 MB | 67.2 MB |
+| wasm memory added by the build | +195 MB | | +158 MB (dictionaries, 32 MB, loaded by any query, not counted) |
+
+Build cost per column, native: Description Rare 0.95 s, Title 0.39 s, Recipient 0.22 s, Description Common 0.13 s, Programme 0.01 s. **Without Description Rare** (the first image of a split) the build is 0.82 s native and the index 40 MB, so the second image's column carries most of the build, and arrives later anyway.
+
+Typing with the index (wasm, mask cache on): 5 to 7 ms per keystroke once a word has a few letters, 17 to 35 ms for the first letter of a word (thousands of words). `mental health` letter by letter is 119 ms in total, against 1,262 ms on the scan path. Cold whole queries: 4.8 to 13 ms against 62 to 186 ms scanning. Reading the dictionary columns' codes per word (about 3M lookups) is most of a keystroke; per-group row lists by dictionary value would make that proportional to the hits if it ever matters.
+
+wasm memory never shrinks, so the build's temporary state (the pair buffer, the word hash map, per-value word lists) stays reserved, now about 58 MB over the dictionaries and the index.
+
+The scan path with word starts is slower than the substring version committed on 30 September (typing `mental health` 1,262 against 566 ms): the kernel checks many hits that fall inside words. It only serves until the index is built and in the lite build.
+
+Size, unoptimized: lite 291.7 KB gz, full 318.6 KB gz (+27 KB for the scan path and the index).
+</sv-prose>
+
 <sv-prose id="fts-next">
 ## Next steps
 
-1. **Prototype the index build** in the engine. Native first, then wasm, on grantnav: build time, peak memory, query time for the typing sequences. Group by group, so it can run while streaming later.
-2. **Word-start matching** in `search()`, scan path and index path.
-3. **Scan path fixes:** narrow the dictionary truth tables from the shorter word's matches, check later words only on rows the earlier words matched, cut per-hit cost.
-4. **Vocabulary section** in the converter, then spell check, variants and inflections.
-5. **Split images with attach**, then the **streaming load**.
-6. `search_rank` and `next_words`.
-7. Accent folding with the 958-character table.
+1. **Build memory and speed:** cut the build's temporary state (about 58 MB stays reserved in wasm); tokenize repeated plain values once per group (Recipient has 425K distinct values in 1.5M rows); a faster tokenize-and-hash loop for Description Rare.
+2. **Vocabulary section** in the converter (exact sizes and sorted ids up front), then spell check, variants and inflections over it.
+3. **Build while loading:** group by group as the image streams in, then the OPFS cache of the whole index.
+4. **Split images with attach.**
+5. `search_rank` and `next_words`.
+6. Accent folding with the 958-character table.
+7. Scan path speed, only if the build window or the lite build need it.
 </sv-prose>
 
 <sv-prose id="fts-rejected">

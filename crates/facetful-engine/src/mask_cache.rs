@@ -174,7 +174,9 @@ impl MaskCache {
     }
 
     /// The tightest cached superset for a search word: the longest cached
-    /// word over the same `scope` that is a proper substring of `word`.
+    /// word over the same `scope` that is a proper prefix of `word` (search
+    /// matches at word starts, so a row with a word starting `heal` has one
+    /// starting `hea`).
     pub fn word_superset(&mut self, scope: &str, word: &str, g: usize) -> Option<Rc<Vec<u8>>> {
         let best_key = self
             .entries
@@ -183,7 +185,7 @@ impl MaskCache {
                 let (s, w) = e.word.as_ref()?;
                 (s == scope
                     && w.len() < word.len()
-                    && word.contains(w.as_str())
+                    && word.starts_with(w.as_str())
                     && e.groups.get(g).is_some_and(|m| m.is_some()))
                 .then_some((w.len(), k.clone()))
             })

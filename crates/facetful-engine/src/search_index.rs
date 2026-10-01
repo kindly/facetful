@@ -1,0 +1,631 @@
+//! The word index behind `search()` (docs/full-text-search.sv, "The word
+//! index, built on load"): every folded word of the searched text columns,
+//! and per row group the rows each word occurs in.
+//!
+//! Group-major, so it can be built one row group at a time as an image
+//! streams in, and so a query reads one entry per group, the way the
+//! executor already runs. Within a group a word's rows are a sorted `u16`
+//! array, or a 65,536-bit bitmap once that is smaller (over 4,096 rows),
+//! as Roaring does. Dictionary columns are indexed by value, not by row:
+//! word -> the dictionary codes whose value holds it. A query turns those
+//! codes into a lookup table and reads each group's codes, which keeps the
+//! rows of a column like grantnav's Description Common (61K values, about 17
+//! words each, over 820K rows) out of the build and out of the row lists.
+//!
+//! Prototype (step 1): word ids are assigned in discovery order and each
+//! group's entries are sorted by id, so a prefix (a contiguous range of the
+//! sorted vocabulary) is looked up id by id. A shipped vocabulary would give
+//! ids in sorted order up front.
+
+use crate::format::read::ReadAt;
+use crate::format::FormatError;
+use crate::Table;
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Rows above which a word's rows in a group are a bitmap, not an array:
+/// 4,096 `u16`s are 8 KB, the size of the bitmap.
+const BITMAP_ABOVE: usize = 4096;
+const BITMAP_WORDS: usize = 65536 / 64;
+
+/// FxHash (as in rustc): fast for short keys, and the keys are our own data.
+#[derive(Default)]
+struct Fx(u64);
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut b = [0u8; 8];
+            b[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(b) ^ ((rest.len() as u64) << 59));
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    fn write_u128(&mut self, i: u128) {
+        self.add(i as u64);
+        self.add((i >> 64) as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+impl Fx {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+
+/// Call `emit` with each folded word of `text`: letters and digits, lowercased
+/// (Unicode), split on anything else. ASCII text takes a byte loop.
+pub fn for_each_word(text: &[u8], buf: &mut Vec<u8>, mut emit: impl FnMut(&[u8])) {
+    buf.clear();
+    if text.is_ascii() {
+        for &b in text {
+            if b.is_ascii_alphanumeric() {
+                buf.push(b.to_ascii_lowercase());
+            } else if !buf.is_empty() {
+                emit(buf);
+                buf.clear();
+            }
+        }
+    } else {
+        let mut tmp = [0u8; 4];
+        for c in String::from_utf8_lossy(text).chars() {
+            if c.is_alphanumeric() {
+                for l in c.to_lowercase() {
+                    buf.extend_from_slice(l.encode_utf8(&mut tmp).as_bytes());
+                }
+            } else if !buf.is_empty() {
+                emit(buf);
+                buf.clear();
+            }
+        }
+    }
+    if !buf.is_empty() {
+        emit(buf);
+        buf.clear();
+    }
+}
+
+/// One word's rows in one group: `len` rows of the group's array pool from
+/// `start`, or (len == BITMAP) the bitmap at `start` in the bitmap pool.
+#[derive(Clone, Copy)]
+struct Entry {
+    start: u32,
+    len: u32,
+}
+const BITMAP: u32 = u32::MAX;
+
+/// Buffers `from_pairs` reuses across groups: per word id a count, then a
+/// position; the ids seen in the group; the rows bucketed by word.
+#[derive(Default)]
+struct Scratch {
+    count: Vec<u32>,
+    touched: Vec<u32>,
+    rows: Vec<u16>,
+}
+
+#[derive(Default)]
+struct GroupIndex {
+    /// word ids present in the group, ascending, parallel to `entries`
+    ids: Vec<u32>,
+    entries: Vec<Entry>,
+    rows: Vec<u16>,
+    bitmaps: Vec<u64>,
+}
+
+impl GroupIndex {
+    /// From (word id << 16 | row) pairs, duplicates allowed, rows ascending
+    /// within each column's run (pairs arrive column by column). A counting
+    /// sort by word id, not a comparison sort: each word's rows land in push
+    /// order, already ascending unless several columns contributed, and only
+    /// then get a (small) sort. `scratch` is reused across groups.
+    fn from_pairs(pairs: &[u64], scratch: &mut Scratch) -> GroupIndex {
+        let Scratch { count, touched, rows } = scratch;
+        touched.clear();
+        for &p in pairs {
+            let id = (p >> 16) as usize;
+            if id >= count.len() {
+                count.resize(id + 1, 0);
+            }
+            if count[id] == 0 {
+                touched.push(id as u32);
+            }
+            count[id] += 1;
+        }
+        touched.sort_unstable();
+        // count[id] becomes the bucket's start; ends follow from the next start
+        let mut pos = 0u32;
+        for &id in touched.iter() {
+            let n = count[id as usize];
+            count[id as usize] = pos;
+            pos += n;
+        }
+        rows.clear();
+        rows.resize(pairs.len(), 0);
+        for &p in pairs {
+            let id = (p >> 16) as usize;
+            rows[count[id] as usize] = p as u16;
+            count[id] += 1;
+        }
+        // count[id] is now the bucket's end; walk the buckets in id order
+        let (mut array_rows, mut bitmaps) = (0usize, 0usize);
+        let mut start = 0usize;
+        let mut runs: Vec<(u32, usize, usize)> = Vec::with_capacity(touched.len());
+        for &id in touched.iter() {
+            let end = count[id as usize] as usize;
+            count[id as usize] = 0; // reset for the next group
+            let b = &mut rows[start..end];
+            if !b.windows(2).all(|w| w[0] < w[1]) {
+                b.sort_unstable();
+            }
+            // dedup in place (the same word in two columns of one row)
+            let mut n = 0;
+            for k in 0..b.len() {
+                if k == 0 || b[k] != b[n - 1] {
+                    b[n] = b[k];
+                    n += 1;
+                }
+            }
+            if n > BITMAP_ABOVE {
+                bitmaps += 1;
+            } else {
+                array_rows += n;
+            }
+            runs.push((id, start, start + n));
+            start = end;
+        }
+        let mut g = GroupIndex {
+            ids: Vec::with_capacity(runs.len()),
+            entries: Vec::with_capacity(runs.len()),
+            rows: Vec::with_capacity(array_rows),
+            bitmaps: vec![0; bitmaps * BITMAP_WORDS],
+        };
+        let mut next_bitmap = 0;
+        for (id, i, j) in runs {
+            g.ids.push(id);
+            if j - i > BITMAP_ABOVE {
+                let base = next_bitmap * BITMAP_WORDS;
+                for &r in &rows[i..j] {
+                    g.bitmaps[base + r as usize / 64] |= 1 << (r % 64);
+                }
+                g.entries.push(Entry { start: next_bitmap as u32, len: BITMAP });
+                next_bitmap += 1;
+            } else {
+                g.entries.push(Entry { start: g.rows.len() as u32, len: (j - i) as u32 });
+                g.rows.extend_from_slice(&rows[i..j]);
+            }
+        }
+        g
+    }
+
+    /// Rows of this group the row lists give `ids` (for the NULL correction
+    /// of a nullable dictionary column, a rare path).
+    fn plain_hits(&self, ids: &[u32], rows: usize) -> Vec<u8> {
+        let mut m = vec![0u8; rows];
+        for &id in ids {
+            self.mark(id, &mut m);
+        }
+        m
+    }
+
+    /// (word, row) pairs held.
+    fn pairs(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|e| {
+                if e.len == BITMAP {
+                    let s = e.start as usize * BITMAP_WORDS;
+                    self.bitmaps[s..s + BITMAP_WORDS].iter().map(|b| b.count_ones() as usize).sum()
+                } else {
+                    e.len as usize
+                }
+            })
+            .sum()
+    }
+
+    fn bytes(&self) -> usize {
+        self.ids.len() * 4 + self.entries.len() * 8 + self.rows.len() * 2 + self.bitmaps.len() * 8
+    }
+
+    /// OR word `id`'s rows into `out` (one byte per row); false when absent.
+    fn mark(&self, id: u32, out: &mut [u8]) -> bool {
+        let Ok(k) = self.ids.binary_search(&id) else { return false };
+        let e = self.entries[k];
+        if e.len == BITMAP {
+            let s = e.start as usize * BITMAP_WORDS;
+            for (w, &bits) in self.bitmaps[s..s + BITMAP_WORDS].iter().enumerate() {
+                let mut b = bits;
+                while b != 0 {
+                    let r = w * 64 + b.trailing_zeros() as usize;
+                    if r < out.len() {
+                        out[r] = 1;
+                    }
+                    b &= b - 1;
+                }
+            }
+        } else {
+            for &r in &self.rows[e.start as usize..(e.start + e.len) as usize] {
+                out[r as usize] = 1;
+            }
+        }
+        true
+    }
+}
+
+/// Seconds since `t`, natively; wasm32 has no clock in std, so 0 there.
+#[cfg(not(target_arch = "wasm32"))]
+fn since(t: &std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64()
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+#[cfg(target_arch = "wasm32")]
+fn since(_: &()) -> f64 {
+    0.0
+}
+#[cfg(target_arch = "wasm32")]
+fn now() {}
+
+/// What a build cost and holds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexStats {
+    pub words: usize,
+    /// distinct (word, row) pairs held in row lists (the plain text columns)
+    pub pairs: usize,
+    /// (word, value) pairs of the dictionary columns
+    pub value_pairs: usize,
+    /// word entries stored as bitmaps
+    pub bitmap_entries: usize,
+    /// bytes held by the row lists and per-group directories
+    pub list_bytes: usize,
+    /// bytes held by the vocabulary (word text, ids, sort order)
+    pub vocab_bytes: usize,
+    /// native builds only: seconds spent tokenizing dictionaries, reading
+    /// rows into (word, row) pairs, turning pairs into row lists, finishing
+    pub phases: [f64; 4],
+}
+
+pub struct SearchIndex {
+    /// the searched columns, ascending
+    pub cols: Vec<usize>,
+    /// word text by id
+    words: Vec<Box<[u8]>>,
+    /// rows each word occurs in (over the whole table), by id
+    counts: Vec<u32>,
+    /// ids in word order
+    sorted: Vec<u32>,
+    groups: Vec<GroupIndex>,
+    dicts: Vec<DictIndex>,
+    phases: [f64; 4],
+}
+
+/// One dictionary column: per word id, the codes whose value holds the word
+/// (`codes[offsets[id]..offsets[id + 1]]`).
+struct DictIndex {
+    col: usize,
+    values: usize,
+    offsets: Vec<u32>,
+    codes: Vec<u32>,
+}
+
+/// Per dictionary column of the index: which codes a query word admits, one
+/// byte per code (0 or 1) so the per-row lookup is a branchless OR. `None`
+/// when the word holds no value of that column.
+pub struct ValueSets(Vec<(usize, Option<Vec<u8>>)>);
+
+/// Interns words while building: text -> id. Words of up to 15 bytes are
+/// keys by value (bytes plus length in one u128), so a lookup is an integer
+/// hash and compare with no pointer to chase; longer words are boxed.
+#[derive(Default)]
+struct Vocab {
+    short: FxMap<u128, u32>,
+    long: FxMap<Box<[u8]>, u32>,
+}
+impl Vocab {
+    #[inline]
+    fn id(&mut self, w: &[u8]) -> u32 {
+        let next = (self.short.len() + self.long.len()) as u32;
+        if w.len() <= 15 {
+            let mut b = [0u8; 16];
+            b[..w.len()].copy_from_slice(w);
+            b[15] = w.len() as u8;
+            return *self.short.entry(u128::from_le_bytes(b)).or_insert(next);
+        }
+        if let Some(&id) = self.long.get(w) {
+            return id;
+        }
+        self.long.insert(w.into(), next);
+        next
+    }
+    fn into_words(self) -> Vec<Box<[u8]>> {
+        let mut words: Vec<Box<[u8]>> = vec![Box::default(); self.short.len() + self.long.len()];
+        for (k, id) in self.short {
+            let b = k.to_le_bytes();
+            words[id as usize] = b[..b[15] as usize].into();
+        }
+        for (w, id) in self.long {
+            words[id as usize] = w;
+        }
+        words
+    }
+}
+
+impl SearchIndex {
+    /// Index `cols` (text columns) of every row group.
+    pub fn build<S: ReadAt>(table: &mut Table<S>, cols: &[usize]) -> Result<SearchIndex, FormatError> {
+        let mut cols = cols.to_vec();
+        cols.sort_unstable();
+        cols.dedup();
+        let mut vocab = Vocab::default();
+        let mut buf = Vec::new();
+        // dictionary columns: each distinct value's word ids, tokenized once
+        let mut phases = [0.0f64; 4];
+        let t = now();
+        // per dictionary column: each value's word ids, and rows per value
+        let mut dict_words: FxMap<usize, (Vec<Vec<u32>>, Vec<u32>)> = FxMap::default();
+        for &c in &cols {
+            if table.catalog().schema.columns[c].is_dict() {
+                let dict = table.dictionary_rc(c)?;
+                let per_value = dict
+                    .iter()
+                    .map(|s| {
+                        let mut ids = Vec::new();
+                        for_each_word(s.as_bytes(), &mut buf, |w| ids.push(vocab.id(w)));
+                        ids.sort_unstable();
+                        ids.dedup();
+                        ids
+                    })
+                    .collect::<Vec<_>>();
+                let n = per_value.len();
+                dict_words.insert(c, (per_value, vec![0u32; n]));
+            }
+        }
+        phases[0] = since(&t);
+        let mut groups = Vec::with_capacity(table.group_count());
+        let mut pairs: Vec<u64> = Vec::new();
+        let mut scratch = Scratch::default();
+        for g in 0..table.group_count() {
+            let t = now();
+            let rows = table.catalog().groups[g].row_count as usize;
+            pairs.clear();
+            for &c in &cols {
+                let valid = table.validity(g, c)?;
+                let present = |i: usize| valid.as_ref().is_none_or(|v| v[i / 8] >> (i % 8) & 1 == 1);
+                if let Some((_, value_rows)) = dict_words.get_mut(&c) {
+                    // rows per value, for the words' row counts
+                    for (r, &code) in table.codes(g, c, rows)?.iter().enumerate() {
+                        if present(r) {
+                            value_rows[code as usize] += 1;
+                        }
+                    }
+                    continue;
+                }
+                let mut each = |offs: &dyn Fn(usize) -> usize, blob: &[u8]| {
+                    for r in 0..rows {
+                        if present(r) {
+                            for_each_word(&blob[offs(r)..offs(r + 1)], &mut buf, |w| {
+                                pairs.push((vocab.id(w) as u64) << 16 | r as u64);
+                            });
+                        }
+                    }
+                };
+                let done = table.with_text_segments(g, c, |o, blob, _| {
+                    each(&|i| u32::from_le_bytes(o[i * 4..i * 4 + 4].try_into().unwrap()) as usize, blob)
+                })?;
+                if done.is_none() {
+                    let (o, blob) = table.texts_raw(g, c, rows)?;
+                    each(&|i| o[i] as usize, &blob);
+                }
+            }
+            phases[1] += since(&t);
+            let t = now();
+            groups.push(GroupIndex::from_pairs(&pairs, &mut scratch));
+            phases[2] += since(&t);
+        }
+        let t = now();
+        drop(pairs);
+        drop(scratch);
+        let words = vocab.into_words();
+        let mut counts = vec![0u32; words.len()];
+        // invert each dictionary column: word -> codes (CSR); a word's row
+        // count adds its values' rows (a row holding the word in two columns
+        // counts twice: the counts guide "too broad" and spell checking)
+        let mut dicts = Vec::new();
+        let mut dict_cols: Vec<usize> = dict_words.keys().copied().collect();
+        dict_cols.sort_unstable();
+        for c in dict_cols {
+            let (per_value, value_rows) = dict_words.remove(&c).unwrap();
+            let mut offsets = vec![0u32; words.len() + 1];
+            for ids in &per_value {
+                for &id in ids {
+                    offsets[id as usize + 1] += 1;
+                }
+            }
+            for k in 0..words.len() {
+                offsets[k + 1] += offsets[k];
+            }
+            let mut fill = offsets.clone();
+            let mut codes = vec![0u32; offsets[words.len()] as usize];
+            for (code, ids) in per_value.iter().enumerate() {
+                for &id in ids {
+                    codes[fill[id as usize] as usize] = code as u32;
+                    fill[id as usize] += 1;
+                    counts[id as usize] += value_rows[code];
+                }
+            }
+            dicts.push(DictIndex { col: c, values: per_value.len(), offsets, codes });
+        }
+        for g in &groups {
+            for (k, &id) in g.ids.iter().enumerate() {
+                let e = g.entries[k];
+                counts[id as usize] += if e.len == BITMAP {
+                    let s = e.start as usize * BITMAP_WORDS;
+                    g.bitmaps[s..s + BITMAP_WORDS].iter().map(|b| b.count_ones()).sum()
+                } else {
+                    e.len
+                };
+            }
+        }
+        let mut sorted: Vec<u32> = (0..words.len() as u32).collect();
+        sorted.sort_unstable_by(|&a, &b| words[a as usize].cmp(&words[b as usize]));
+        phases[3] = since(&t);
+        Ok(SearchIndex { cols, words, counts, sorted, groups, dicts, phases })
+    }
+
+    pub fn stats(&self) -> IndexStats {
+        IndexStats {
+            words: self.words.len(),
+            pairs: self.groups.iter().map(|g| g.pairs()).sum(),
+            value_pairs: self.dicts.iter().map(|d| d.codes.len()).sum(),
+            bitmap_entries: self.groups.iter().map(|g| g.entries.iter().filter(|e| e.len == BITMAP).count()).sum(),
+            list_bytes: self.groups.iter().map(|g| g.bytes()).sum::<usize>()
+                + self.dicts.iter().map(|d| d.offsets.len() * 4 + d.codes.len() * 4).sum::<usize>(),
+            vocab_bytes: self.words.iter().map(|w| w.len() + 16).sum::<usize>() + self.words.len() * 8,
+            phases: self.phases,
+        }
+    }
+
+    /// Ids of every word starting with `prefix` (folded), in word order.
+    pub fn prefix_ids(&self, prefix: &[u8]) -> &[u32] {
+        let lo = self.sorted.partition_point(|&id| &*self.words[id as usize] < prefix);
+        let hi = lo + self.sorted[lo..].partition_point(|&id| self.words[id as usize].starts_with(prefix));
+        &self.sorted[lo..hi]
+    }
+
+    /// The id of exactly `word`, if indexed.
+    pub fn word_id(&self, word: &[u8]) -> Option<u32> {
+        let k = self.sorted.partition_point(|&id| &*self.words[id as usize] < word);
+        self.sorted.get(k).copied().filter(|&id| &*self.words[id as usize] == word)
+    }
+
+    pub fn word(&self, id: u32) -> &[u8] {
+        &self.words[id as usize]
+    }
+
+    /// Rows (over the whole table) word `id` occurs in.
+    pub fn rows_of(&self, id: u32) -> u32 {
+        self.counts[id as usize]
+    }
+
+    /// The dictionary codes any of `ids` occurs in, per dictionary column.
+    /// Once per query word; every group's lookup reuses it.
+    pub fn value_sets(&self, ids: &[u32]) -> ValueSets {
+        ValueSets(
+            self.dicts
+                .iter()
+                .map(|d| {
+                    let mut t: Option<Vec<u8>> = None;
+                    for &id in ids {
+                        for &code in &d.codes[d.offsets[id as usize] as usize..d.offsets[id as usize + 1] as usize] {
+                            t.get_or_insert_with(|| vec![0u8; d.values])[code as usize] = 1;
+                        }
+                    }
+                    (d.col, t)
+                })
+                .collect(),
+        )
+    }
+
+    /// Mark (one byte per row, set to 1) the rows of group `g` holding any of
+    /// `ids`: the plain columns from the row lists, the dictionary columns by
+    /// reading the group's codes against `values` (from `value_sets(ids)`).
+    pub fn mark_group<S: ReadAt>(
+        &self,
+        table: &mut Table<S>,
+        g: usize,
+        ids: &[u32],
+        values: &ValueSets,
+        out: &mut [u8],
+    ) -> Result<(), FormatError> {
+        for &id in ids {
+            self.groups[g].mark(id, out);
+        }
+        let rows = out.len();
+        for (c, t) in &values.0 {
+            let Some(t) = t else { continue };
+            let done = table.with_code_segments(g, *c, |codes, width, valid| {
+                if width == 1 {
+                    for (o, &code) in out.iter_mut().zip(&codes[..rows]) {
+                        *o |= t[code as usize];
+                    }
+                } else {
+                    for (o, c) in out.iter_mut().zip(codes[..rows * 2].chunks_exact(2)) {
+                        *o |= t[u16::from_le_bytes([c[0], c[1]]) as usize];
+                    }
+                }
+                valid.map(|v| v.to_vec())
+            })?;
+            let valid = match done {
+                Some(v) => v,
+                None => {
+                    let codes = table.codes(g, *c, rows)?;
+                    for (o, &code) in out.iter_mut().zip(&codes) {
+                        *o |= t[code as usize];
+                    }
+                    table.validity(g, *c)?
+                }
+            };
+            // NULL rows carry some code; a hit there is not a hit
+            if let Some(v) = valid {
+                let plain = self.groups[g].plain_hits(ids, rows);
+                for (r, o) in out.iter_mut().enumerate() {
+                    if v[r / 8] >> (r % 8) & 1 == 0 && plain[r] == 0 {
+                        *o = 0;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{for_each_word, GroupIndex, BITMAP};
+
+    #[test]
+    fn arrays_and_bitmaps() {
+        // word 7 in every 3rd row of a full group (21,846 rows: a bitmap), word 2 in three rows
+        let mut pairs: Vec<u64> = (0..65536u64).step_by(3).map(|r| 7 << 16 | r).collect();
+        pairs.extend([2u64 << 16 | 9, 2 << 16 | 1, 2 << 16 | 9, 2 << 16 | 65535]);
+        let g = GroupIndex::from_pairs(&pairs, &mut super::Scratch::default());
+        assert_eq!(g.ids, [2, 7]);
+        assert_eq!(g.entries[0].len, 3);
+        assert_eq!(g.entries[1].len, BITMAP);
+        let mut out = vec![0u8; 65536];
+        assert!(g.mark(7, &mut out));
+        assert!(out.iter().enumerate().all(|(r, &b)| (b == 1) == (r % 3 == 0)));
+        let mut out = vec![0u8; 65536];
+        assert!(g.mark(2, &mut out) && !g.mark(5, &mut out));
+        assert_eq!(out.iter().enumerate().filter(|(_, &b)| b == 1).map(|(r, _)| r).collect::<Vec<_>>(), [1, 9, 65535]);
+    }
+
+    fn words(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        for_each_word(s.as_bytes(), &mut buf, |w| out.push(String::from_utf8(w.to_vec()).unwrap()));
+        out
+    }
+
+    #[test]
+    fn folding_and_splitting() {
+        assert_eq!(words("Mental-health, LONDON 2024!"), ["mental", "health", "london", "2024"]);
+        assert_eq!(words("São Paulo ÉCOLE"), ["são", "paulo", "école"]);
+        assert_eq!(words("  "), Vec::<String>::new());
+        assert_eq!(words("a"), ["a"]);
+    }
+}

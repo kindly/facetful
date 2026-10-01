@@ -59,10 +59,44 @@ pub fn find_ci(hay: &[u8], from: usize, needle_lower: &[u8]) -> Option<usize> {
     }
 }
 
-/// Mark every row of a text blob that contains `needle_lower`: one scan of
-/// the whole blob, walking the row offsets along the hits (`off(i)` is row
-/// i's start, `off(rows)` the blob's end). Sets `out[row] = 1`, never clears.
-pub fn mark_rows_ci(blob: &[u8], off: impl Fn(usize) -> usize, rows: usize, needle_lower: &[u8], out: &mut [u8]) {
+/// Does a word start at `pos` of `hay`, given that `start` begins the text?
+/// True at the start, or after a character that is not a letter or digit
+/// (decoded when it is not ASCII, as `search_index::for_each_word` splits).
+pub fn at_word_start(hay: &[u8], start: usize, pos: usize) -> bool {
+    if pos <= start {
+        return true;
+    }
+    let b = hay[pos - 1];
+    if b < 0x80 {
+        return !b.is_ascii_alphanumeric();
+    }
+    let mut k = pos - 1;
+    while k > start && hay[k] & 0xc0 == 0x80 {
+        k -= 1;
+    }
+    match core::str::from_utf8(&hay[k..pos]).ok().and_then(|s| s.chars().next()) {
+        Some(c) => !c.is_alphanumeric(),
+        None => true, // invalid UTF-8 splits words, as from_utf8_lossy's U+FFFD does
+    }
+}
+
+/// Does a word of `hay` start with ASCII `needle_lower` (case-insensitively)?
+pub fn word_start_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
+    let mut pos = 0;
+    while let Some(hit) = find_ci(hay, pos, needle_lower) {
+        if at_word_start(hay, 0, hit) {
+            return true;
+        }
+        pos = hit + 1;
+    }
+    false
+}
+
+/// Mark every row of a text blob where a word begins with `needle_lower`:
+/// one scan of the whole blob, walking the row offsets along the hits
+/// (`off(i)` is row i's start, `off(rows)` the blob's end). Sets
+/// `out[row] = 1`, never clears.
+pub fn mark_rows_word_start_ci(blob: &[u8], off: impl Fn(usize) -> usize, rows: usize, needle_lower: &[u8], out: &mut [u8]) {
     let blob = &blob[..off(rows)];
     let (mut row, mut pos) = (0usize, 0usize);
     while let Some(hit) = find_ci(blob, pos, needle_lower) {
@@ -70,11 +104,11 @@ pub fn mark_rows_ci(blob: &[u8], off: impl Fn(usize) -> usize, rows: usize, need
             row += 1;
         }
         let end = off(row + 1);
-        if hit + needle_lower.len() <= end {
+        if hit + needle_lower.len() <= end && at_word_start(blob, off(row), hit) {
             out[row] = 1;
             pos = end; // matched: skip the rest of this row
         } else {
-            pos = hit + 1; // straddles a boundary: not a match
+            pos = hit + 1;
         }
     }
 }
