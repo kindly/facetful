@@ -110,19 +110,34 @@ fn words_of(s: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/// How many rows search(q, title, org, descr) should match, and which.
+/// How many rows search(q, title, org, descr) should match, and which:
+/// every finished word as a whole word, the last word as a word prefix
+/// unless the query ends in a separator.
 fn expected(q: &str, only: impl Fn(usize) -> bool) -> (i64, Vec<bool>) {
     let qw = words_of(q);
+    let open = q.chars().next_back().is_some_and(|c| c.is_alphanumeric());
     let hits: Vec<bool> = (0..ROWS)
         .map(|i| {
             let row: Vec<Vec<u8>> = texts(i).iter().flat_map(|t| words_of(t)).collect();
-            only(i) && qw.iter().all(|w| row.iter().any(|r| r.starts_with(w)))
+            only(i)
+                && qw.iter().enumerate().all(|(k, w)| {
+                    let prefix = open && k + 1 == qw.len();
+                    row.iter().any(|r| if prefix { r.starts_with(w) } else { r == w })
+                })
         })
         .collect();
     (hits.iter().filter(|&&h| h).count() as i64, hits)
 }
 
-const QUERIES: [&str; 14] = [
+const QUERIES: [&str; 22] = [
+    "sport ",
+    "sporting",
+    "sport club",
+    "fund ",
+    "fund",
+    "men ",
+    "mental health ",
+    "health heal",
     "mental health",
     "Youth London",
     "sport",
@@ -130,7 +145,7 @@ const QUERIES: [&str; 14] = [
     "são paulo",
     "SÃO",
     "münchen",
-    "health heal",
+    "climate change ",
     "youth-sport",
     "ment",
     "tal",
@@ -164,6 +179,10 @@ fn matches_word_starts_cold_and_cached() {
     // word starts, not substrings: `ment` is in `mental`, `tal` starts nothing
     assert!(expected("ment", |_| true).0 > 0);
     assert_eq!(expected("tal", |_| true).0, 0);
+    // a finished word is whole: `sport ` is not `sporting`, `fund ` not `funding`
+    assert!(expected("sport ", |_| true).0 < expected("sport", |_| true).0);
+    assert!(expected("fund ", |_| true).0 < expected("fund", |_| true).0);
+    assert_eq!(expected("men ", |_| true).0, 0);
 }
 
 #[test]

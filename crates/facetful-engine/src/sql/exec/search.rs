@@ -1,9 +1,11 @@
-//! search('q', col, …): true when every word of `q` starts a word in at
-//! least one of the columns (docs/full-text-search.sv).
+//! search('q', col, …): true when every word of `q` is a word in at least
+//! one of the columns (docs/full-text-search.sv).
 //!
 //! Words are folded and split exactly as the word index splits text
-//! (`search_index::for_each_word`), and each query word matches as a word
-//! prefix: `men` finds `mental` and `members`, not `government`.
+//! (`search_index::for_each_word`). Finished words match whole words. The
+//! last word is still being typed, so it matches as a word prefix (`men`
+//! finds `mental` and `members`, not `government`), unless the query ends
+//! in a space or other separator, which finishes it too.
 //!
 //! Two paths give the same rows. When the table holds a word index over
 //! exactly these columns, each word is a range of the index's vocabulary
@@ -18,46 +20,79 @@ use crate::search_index::for_each_word;
 /// Narrow through a cached shorter word only when it admits under 1/N of the rows.
 const NARROW_BELOW: usize = 4;
 
-/// Per (dictionary column, word): which values have a word starting so.
-type DictTables = std::cell::RefCell<HashMap<(usize, String), Rc<Vec<bool>>>>;
+/// Per (dictionary column, word): which values hold the word.
+type DictTables = std::cell::RefCell<HashMap<(usize, Word), Rc<Vec<bool>>>>;
+
+/// One query word: folded text, and whether it is the word still being
+/// typed (matched as a prefix) or finished (matched whole).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Word {
+    pub(super) text: String,
+    pub(super) prefix: bool,
+}
+
+impl Word {
+    /// Every row this word matches, `other` matches too.
+    fn implied_by(&self, other: &Word) -> bool {
+        if self.prefix {
+            other.text.starts_with(&self.text)
+        } else {
+            !other.prefix && other.text == self.text
+        }
+    }
+    /// The mask cache key; finished words and prefixes never share one.
+    fn key(&self, scope: &str) -> String {
+        format!("search:{scope}:{}{}", if self.prefix { "" } else { "=" }, self.text)
+    }
+}
 
 /// A search() conjunct, split once per statement.
 pub(super) struct Spec {
     pub(super) cols: Vec<usize>,
-    pub(super) words: Vec<String>,
+    pub(super) words: Vec<Word>,
     /// the column set, as the mask cache's narrowing scope
     pub(super) scope: String,
     /// computed once per statement rather than once per row group
     dict_tables: DictTables,
     /// per word, the dictionary codes the index admits (once per statement)
-    value_sets: std::cell::RefCell<HashMap<String, Rc<crate::search_index::ValueSets>>>,
+    value_sets: std::cell::RefCell<HashMap<Word, Rc<crate::search_index::ValueSets>>>,
 }
 
-/// The query's words, folded and split as the index splits text,
-/// deduplicated, and without words that another word starts with (a row
-/// with a word starting `health` has one starting `heal`).
-pub(super) fn words(q: &str) -> Vec<String> {
+/// The query's words, folded and split as the index splits text. The last
+/// one is a prefix unless the query ends in a separator. Deduplicated, and
+/// without words another word implies (a row with a word starting `health`
+/// has one starting `heal`; a finished `heal` is not implied by it).
+pub(super) fn words(q: &str) -> Vec<Word> {
     let mut all: Vec<String> = Vec::new();
     let mut buf = Vec::new();
     for_each_word(q.as_bytes(), &mut buf, |w| all.push(String::from_utf8_lossy(w).into_owned()));
-    all.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    let last_open = q.chars().next_back().is_some_and(|c| c.is_alphanumeric());
+    let n = all.len();
+    let mut all: Vec<Word> = all
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| Word { text, prefix: last_open && i + 1 == n })
+        .collect();
+    all.sort_by(|a, b| b.text.len().cmp(&a.text.len()).then(a.text.cmp(&b.text)).then(a.prefix.cmp(&b.prefix)));
     all.dedup();
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<Word> = Vec::new();
     for w in all {
-        if !out.iter().any(|o| o.starts_with(w.as_str())) {
+        if !out.iter().any(|o| w.implied_by(o)) {
+            out.retain(|o| !o.implied_by(&w));
             out.push(w);
         }
     }
     out
 }
 
-/// Does a word of `text` start with folded word `w`?
-fn has_word_start(text: &[u8], w: &str, buf: &mut Vec<u8>) -> bool {
-    if w.is_ascii() && text.is_ascii() {
-        return crate::text::word_start_ci(text, w.as_bytes());
+/// Does `text` hold the word `w` (as a whole word, or as a word prefix)?
+fn has_word(text: &[u8], w: &Word, buf: &mut Vec<u8>) -> bool {
+    if w.text.is_ascii() && text.is_ascii() {
+        return crate::text::word_ci(text, w.text.as_bytes(), !w.prefix);
     }
     let mut hit = false;
-    for_each_word(text, buf, |t| hit |= t.starts_with(w.as_bytes()));
+    let wb = w.text.as_bytes();
+    for_each_word(text, buf, |t| hit |= if w.prefix { t.starts_with(wb) } else { t == wb });
     hit
 }
 
@@ -96,14 +131,18 @@ pub(super) fn group_mask<S: ReadAt>(
     for w in &spec.words {
         // each word's mask is cached on its own (same key on both paths: they
         // give the same rows), so a keystroke computes only its last word
-        let key = format!("search:{}:{w}", spec.scope);
+        let key = w.key(&spec.scope);
         let bits = match table.masks().get(&key, g) {
             Some(b) => b,
             None => {
                 let m = match &idx {
                     // the index: the word a range of the vocabulary, its rows a union
                     Some(idx) => {
-                        let ids = idx.prefix_ids(w.as_bytes());
+                        let ids = if w.prefix {
+                            idx.prefix_ids(w.text.as_bytes())
+                        } else {
+                            idx.word_id(w.text.as_bytes()).map_or(0..0, |id| id..id + 1)
+                        };
                         let values = spec
                             .value_sets
                             .borrow_mut()
@@ -117,16 +156,22 @@ pub(super) fn group_mask<S: ReadAt>(
                     None => {
                         // narrow only through a selective superset: checking
                         // row by row is slower than one SIMD scan of the blob
-                        // once most rows are candidates (`m` → `me`)
+                        // once most rows are candidates (`m` → `me`). Only
+                        // cached prefixes are supersets: of longer prefixes,
+                        // and of finished words that start with them
                         let sup = table
                             .masks()
-                            .word_superset(&spec.scope, w, g)
+                            .word_superset(&spec.scope, &w.text, g)
                             .filter(|b| b.iter().map(|x| x.count_ones() as usize).sum::<usize>() * NARROW_BELOW < rows);
                         word_mask(table, g, rows, spec, w, sup.as_ref().map(|v| v.as_slice()), dicts)?
                     }
                 };
                 let b = Rc::new(pack_bits(&m));
-                table.masks().put_word(&key, g, n_groups, b.clone(), &spec.scope, w);
+                if w.prefix {
+                    table.masks().put_word(&key, g, n_groups, b.clone(), &spec.scope, &w.text);
+                } else {
+                    table.masks().put(&key, g, n_groups, b.clone(), None);
+                }
                 b
             }
         };
@@ -147,7 +192,7 @@ fn word_mask<S: ReadAt>(
     g: usize,
     rows: usize,
     spec: &Spec,
-    w: &str,
+    w: &Word,
     sup: Option<&[u8]>,
     dicts: &Dicts,
 ) -> Result<Vec<u8>, FormatError> {
@@ -163,8 +208,8 @@ fn word_mask<S: ReadAt>(
             let t = spec
                 .dict_tables
                 .borrow_mut()
-                .entry((c, w.to_string()))
-                .or_insert_with(|| Rc::new(dicts[&c].iter().map(|s| has_word_start(s.as_bytes(), w, &mut buf)).collect()))
+                .entry((c, w.clone()))
+                .or_insert_with(|| Rc::new(dicts[&c].iter().map(|s| has_word(s.as_bytes(), w, &mut buf)).collect()))
                 .clone();
             for (i, (mi, &code)) in m.iter_mut().zip(&codes).enumerate() {
                 if *mi == 0 && present(i) && t[code as usize] {
@@ -176,9 +221,9 @@ fn word_mask<S: ReadAt>(
         let mut check = |m: &mut [u8], blob: &[u8], off: &dyn Fn(usize) -> usize| {
             let row = |i: usize| &blob[off(i)..off(i + 1)];
             match sup {
-                None if w.is_ascii() => {
+                None if w.text.is_ascii() => {
                     let mut hits = vec![0u8; rows];
-                    crate::text::mark_rows_word_start_ci(blob, off, rows, w.as_bytes(), &mut hits);
+                    crate::text::mark_rows_word_ci(blob, off, rows, w.text.as_bytes(), !w.prefix, &mut hits);
                     for (i, (mi, h)) in m.iter_mut().zip(hits).enumerate() {
                         *mi |= h & present(i) as u8;
                     }
@@ -186,7 +231,7 @@ fn word_mask<S: ReadAt>(
                 _ => {
                     for i in 0..rows {
                         if m[i] == 0 && sup.is_none_or(|s| set(s, i)) && present(i) {
-                            m[i] = has_word_start(row(i), w, &mut buf) as u8;
+                            m[i] = has_word(row(i), w, &mut buf) as u8;
                         }
                     }
                 }
@@ -216,7 +261,7 @@ pub(super) fn eval_search(args: &[Bound], ctx: &GroupCtx) -> VV {
         let mut m = vec![0u8; rows];
         for v in &cols {
             if let Data::Codes { codes, dict } = &v.data {
-                let t: Vec<bool> = dict.iter().map(|s| has_word_start(s.as_bytes(), &w, &mut buf)).collect();
+                let t: Vec<bool> = dict.iter().map(|s| has_word(s.as_bytes(), &w, &mut buf)).collect();
                 for (i, mi) in m.iter_mut().enumerate() {
                     *mi |= (v.is_valid(i) && t[codes[i] as usize]) as u8;
                 }
@@ -225,7 +270,7 @@ pub(super) fn eval_search(args: &[Bound], ctx: &GroupCtx) -> VV {
             for (i, mi) in m.iter_mut().enumerate() {
                 if *mi == 0 && v.is_valid(i) {
                     if let Some(s) = v.text_at(i) {
-                        *mi = has_word_start(s.as_bytes(), &w, &mut buf) as u8;
+                        *mi = has_word(s.as_bytes(), &w, &mut buf) as u8;
                     }
                 }
             }
@@ -239,16 +284,24 @@ pub(super) fn eval_search(args: &[Bound], ctx: &GroupCtx) -> VV {
 
 #[cfg(test)]
 mod tests {
-    use super::words;
+    use super::{words, Word};
+
+    fn w(text: &str, prefix: bool) -> Word {
+        Word { text: text.into(), prefix }
+    }
 
     #[test]
     fn query_words() {
-        assert_eq!(words("Mental  health"), ["health", "mental"]);
-        assert_eq!(words("heal health HEALTH"), ["health"]);
-        // `tal` is inside `mental` but is not a prefix of it: both stay
-        assert_eq!(words("tal mental"), ["mental", "tal"]);
-        assert_eq!(words("youth-sport, London!"), ["london", "sport", "youth"]);
+        // the last word is a prefix while it is being typed
+        assert_eq!(words("Mental  health"), [w("health", true), w("mental", false)]);
+        assert_eq!(words("mental health "), [w("health", false), w("mental", false)]);
+        assert_eq!(words("youth-sport, London!"), [w("london", false), w("sport", false), w("youth", false)]);
+        // a prefix is implied by a longer word starting with it; a finished word is not
+        assert_eq!(words("health heal"), [w("health", false)]);
+        assert_eq!(words("heal health"), [w("health", true), w("heal", false)]);
+        assert_eq!(words("health HEALTH health"), [w("health", false)]);
+        assert_eq!(words("tal mental"), [w("mental", true), w("tal", false)]);
         assert!(words(" -- ").is_empty());
-        assert_eq!(words("SÃO paulo"), ["paulo", "são"]);
+        assert_eq!(words("SÃO paulo"), [w("paulo", true), w("são", false)]);
     }
 }

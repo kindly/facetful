@@ -80,11 +80,33 @@ pub fn at_word_start(hay: &[u8], start: usize, pos: usize) -> bool {
     }
 }
 
-/// Does a word of `hay` start with ASCII `needle_lower` (case-insensitively)?
-pub fn word_start_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
+/// Does a word of `hay` end at `pos`, given that `end` ends the text? True
+/// at the end, or before a character that is not a letter or digit.
+pub fn at_word_end(hay: &[u8], end: usize, pos: usize) -> bool {
+    if pos >= end {
+        return true;
+    }
+    let b = hay[pos];
+    if b < 0x80 {
+        return !b.is_ascii_alphanumeric();
+    }
+    let n = match b {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    };
+    match core::str::from_utf8(&hay[pos..(pos + n).min(end)]).ok().and_then(|s| s.chars().next()) {
+        Some(c) => !c.is_alphanumeric(),
+        None => true,
+    }
+}
+
+/// Does a word of `hay` start with ASCII `needle_lower` (case-insensitively),
+/// or with `whole`, equal it?
+pub fn word_ci(hay: &[u8], needle_lower: &[u8], whole: bool) -> bool {
     let mut pos = 0;
     while let Some(hit) = find_ci(hay, pos, needle_lower) {
-        if at_word_start(hay, 0, hit) {
+        if at_word_start(hay, 0, hit) && (!whole || at_word_end(hay, hay.len(), hit + needle_lower.len())) {
             return true;
         }
         pos = hit + 1;
@@ -92,11 +114,11 @@ pub fn word_start_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
     false
 }
 
-/// Mark every row of a text blob where a word begins with `needle_lower`:
-/// one scan of the whole blob, walking the row offsets along the hits
-/// (`off(i)` is row i's start, `off(rows)` the blob's end). Sets
-/// `out[row] = 1`, never clears.
-pub fn mark_rows_word_start_ci(blob: &[u8], off: impl Fn(usize) -> usize, rows: usize, needle_lower: &[u8], out: &mut [u8]) {
+/// Mark every row of a text blob where a word begins with `needle_lower`
+/// (with `whole`, is exactly it): one scan of the whole blob, walking the row
+/// offsets along the hits (`off(i)` is row i's start, `off(rows)` the blob's
+/// end). Sets `out[row] = 1`, never clears.
+pub fn mark_rows_word_ci(blob: &[u8], off: impl Fn(usize) -> usize, rows: usize, needle_lower: &[u8], whole: bool, out: &mut [u8]) {
     let blob = &blob[..off(rows)];
     let (mut row, mut pos) = (0usize, 0usize);
     while let Some(hit) = find_ci(blob, pos, needle_lower) {
@@ -104,7 +126,10 @@ pub fn mark_rows_word_start_ci(blob: &[u8], off: impl Fn(usize) -> usize, rows: 
             row += 1;
         }
         let end = off(row + 1);
-        if hit + needle_lower.len() <= end && at_word_start(blob, off(row), hit) {
+        let fits = hit + needle_lower.len() <= end
+            && at_word_start(blob, off(row), hit)
+            && (!whole || at_word_end(blob, end, hit + needle_lower.len()));
+        if fits {
             out[row] = 1;
             pos = end; // matched: skip the rest of this row
         } else {

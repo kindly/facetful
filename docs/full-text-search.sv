@@ -200,7 +200,7 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
 <sv-prose id="fts-next">
 ## Next steps
 
-1. **Last word only as a prefix.** Finished words (followed by a space) match exactly; only the word being typed is a prefix.
+1. ~~Last word only as a prefix~~ (done 3 October): finished words match whole words; the last word is a prefix unless the query ends in a separator. On grantnav `mental health` went from 45,916 to 45,825 rows (`mental` no longer matches `mentally`).
 2. **Incremental build.** Start, index row group g, finish: the worker stays free between groups, so facet clicks and searches run (scanning) while the index builds in the background. Today's build is one synchronous call that blocks the worker for about 2 s on grantnav. This is also the interface step 7 calls.
 3. **Spell checker** over the index's vocabulary: length-based edit limits, the frequency filters, automatic expansion for clear typos, did-you-mean for real words, typo-tolerant completion of the word being typed.
 4. **Inflections and UK/US variants.**
