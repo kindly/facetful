@@ -25,7 +25,8 @@ const TITLES: [&str; 9] = [
     "London climate youth",
 ];
 const ORGS: [&str; 5] = ["Sport England", "Mind", "Climate Trust", "Youth London", "Health Board"];
-const DESCS: [&str; 7] = [
+const DESCS: [&str; 8] = [
+    "Mental and physical health",
     "Funding for mental-health services in London",
     "A youth club",
     "Sporting chance for young people",
@@ -110,26 +111,96 @@ fn words_of(s: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/// How many rows search(q, title, org, descr) should match, and which:
-/// every finished word as a whole word, the last word as a word prefix
-/// unless the query ends in a separator.
-fn expected(q: &str, only: impl Fn(usize) -> bool) -> (i64, Vec<bool>) {
-    let qw = words_of(q);
-    let open = q.chars().next_back().is_some_and(|c| c.is_alphanumeric());
+/// A query item as the oracle reads it: words, whether it is a quoted
+/// phrase, whether its last word is still being typed, whether it was quoted.
+struct QItem {
+    words: Vec<Vec<u8>>,
+    phrase: bool,
+    prefix: bool,
+    literal: bool,
+}
+
+/// The query read the way search() documents it: quoted stretches are a
+/// quoted word or a phrase, an unclosed quote runs to the end, and the last
+/// word is a prefix unless the query ends in a separator or closing quote.
+fn query_items(q: &str) -> Vec<QItem> {
+    let mut items = Vec::new();
+    for (k, part) in q.split('"').enumerate() {
+        let ws = words_of(part);
+        if k % 2 == 1 {
+            if !ws.is_empty() {
+                items.push(QItem { phrase: ws.len() > 1, words: ws, prefix: false, literal: true });
+            }
+        } else {
+            items.extend(ws.into_iter().map(|w| QItem { words: vec![w], phrase: false, prefix: false, literal: false }));
+        }
+    }
+    if q.chars().next_back().is_some_and(|c| c.is_alphanumeric()) {
+        if let Some(last) = items.last_mut() {
+            last.prefix = true;
+        }
+    }
+    items
+}
+
+/// How many rows search(q, title, org, descr) should match, and which.
+/// Without an index, words match as typed (whole, the last as a prefix).
+/// With one, a word matches the words its forms in the index cover
+/// (`word_forms`: respellings, inflections, corrections); the forms
+/// themselves are checked by `forms_follow_the_rules`. A phrase matches its
+/// words as typed, consecutively, within one field.
+fn expected_on(idx: Option<&SearchIndex>, q: &str, only: impl Fn(usize) -> bool) -> (i64, Vec<bool>) {
+    let items = query_items(q);
+    let accepts: Vec<Box<dyn Fn(&[u8], usize) -> bool + '_>> = items
+        .iter()
+        .map(|it| -> Box<dyn Fn(&[u8], usize) -> bool + '_> {
+            let n = it.words.len();
+            if it.phrase {
+                // position k of the phrase: the word as typed
+                let words = it.words.clone();
+                let prefix = it.prefix;
+                return Box::new(move |t: &[u8], k: usize| if prefix && k + 1 == n { t.starts_with(&words[k]) } else { t == words[k].as_slice() });
+            }
+            let w = it.words[0].clone();
+            let prefix = it.prefix;
+            match idx {
+                Some(ix) => {
+                    let ranges = ix.word_forms(&w, prefix, it.literal).ranges;
+                    Box::new(move |t: &[u8], _| ix.word_id(t).is_some_and(|id| ranges.iter().any(|r| r.contains(&id))))
+                }
+                None => Box::new(move |t: &[u8], _| if prefix { t.starts_with(&w) } else { t == w.as_slice() }),
+            }
+        })
+        .collect();
     let hits: Vec<bool> = (0..ROWS)
         .map(|i| {
-            let row: Vec<Vec<u8>> = texts(i).iter().flat_map(|t| words_of(t)).collect();
+            let fields: Vec<Vec<Vec<u8>>> = texts(i).iter().map(|t| words_of(t)).collect();
             only(i)
-                && qw.iter().enumerate().all(|(k, w)| {
-                    let prefix = open && k + 1 == qw.len();
-                    row.iter().any(|r| if prefix { r.starts_with(w) } else { r == w })
+                && items.iter().zip(&accepts).all(|(it, acc)| {
+                    if it.phrase {
+                        let n = it.words.len();
+                        fields.iter().any(|f| f.windows(n).any(|win| win.iter().enumerate().all(|(k, t)| acc(t, k))))
+                    } else {
+                        fields.iter().flatten().any(|t| acc(t, 0))
+                    }
                 })
         })
         .collect();
     (hits.iter().filter(|&&h| h).count() as i64, hits)
 }
 
-const QUERIES: [&str; 22] = [
+/// `expected_on` without an index: words as typed.
+fn expected(q: &str, only: impl Fn(usize) -> bool) -> (i64, Vec<bool>) {
+    expected_on(None, q, only)
+}
+
+const QUERIES: [&str; 28] = [
+    "\"mental health\"",
+    "\"health mental\"",
+    "\"mental hea",
+    "\"youth sport\" london",
+    "\"sport\"",
+    "\"fund\" climate",
     "sport ",
     "sporting",
     "sport club",
@@ -168,8 +239,9 @@ fn matches_word_starts_cold_and_cached() {
     both_paths(|t, path| {
         for cached in [false, true] {
             t.masks().set_budget(if cached { 1 << 20 } else { 0 });
+            let ix = t.search_index();
             for q in QUERIES {
-                let want = expected(q, |_| true).0;
+                let want = expected_on(ix.as_deref(), q, |_| true).0;
                 let sql = format!("select count(*) from t where search('{q}', {COLS})");
                 assert_eq!(count(t, &sql), want, "{path}: search('{q}') cached={cached}");
                 assert_eq!(count(t, &sql), want, "{path}: search('{q}') again");
@@ -194,7 +266,8 @@ fn typing_narrows_word_by_word() {
             for i in 1..=chars.len() {
                 let typed: String = chars[..i].iter().collect();
                 let got = count(t, &format!("select count(*) from t where search('{typed}', {COLS})"));
-                assert_eq!(got, expected(&typed, |_| true).0, "{path}: typing '{typed}'");
+                let ix = t.search_index();
+                assert_eq!(got, expected_on(ix.as_deref(), &typed, |_| true).0, "{path}: typing '{typed}'");
             }
         }
         if path == "scan" {
@@ -220,7 +293,8 @@ fn facets_combine() {
         t.masks().set_budget(1 << 20);
         let mind = |i: usize| ORGS[(i * 7) % ORGS.len()] == "Mind";
         let got = count(t, &format!("select count(*) from t where search('health', {COLS}) and org = 'Mind'"));
-        assert_eq!(got, expected("health", mind).0, "{path}");
+        let ix = t.search_index();
+        assert_eq!(got, expected_on(ix.as_deref(), "health", mind).0, "{path}");
     });
 }
 
@@ -312,7 +386,7 @@ fn incremental_build_with_queries_in_between() {
     assert_eq!(idx.stats().words, one.stats().words);
     for q in QUERIES {
         let got = count(&mut t, &format!("select count(*) from t where search('{q}', {COLS})"));
-        assert_eq!(got, expected(q, |_| true).0, "after the build: search('{q}')");
+        assert_eq!(got, expected_on(Some(&idx), q, |_| true).0, "after the build: search('{q}')");
     }
     // a step with no build in progress does nothing
     assert_eq!(t.search_index_step(5).unwrap(), 0);
@@ -338,25 +412,92 @@ fn typos_are_corrected_with_the_index() {
         // non-ASCII, also measured
         ("münchn ", "münchen "),
     ] {
-        let want = expected(right, |_| true).0;
+        // with the index, both go through respelling and inflection: compare them there
+        let want = q(&mut t, right);
         assert!(want > 0, "{right}");
         assert_eq!(q(&mut t, typo), want, "'{typo}' should find what '{right}' finds");
     }
     // the word being typed: nothing starts with `londn`, so prefixes one edit away count
-    assert_eq!(q(&mut t, "youth londn"), expected("youth london", |_| true).0);
+    assert_eq!(q(&mut t, "youth londn"), q(&mut t, "youth london"));
     // words that exist stay as typed; words under 4 letters are never corrected
-    assert_eq!(q(&mut t, "sport "), expected("sport ", |_| true).0);
+    let ix = t.search_index();
+    assert_eq!(q(&mut t, "sport "), expected_on(ix.as_deref(), "sport ", |_| true).0);
     assert_eq!(q(&mut t, "zzz "), 0);
     // the scan's cached answer is not reused once the index can correct
     let mut t = table();
     t.masks().set_budget(1 << 20);
     assert_eq!(q(&mut t, "helth "), 0);
     t.build_search_index(&[0, 1, 2]).unwrap();
-    assert_eq!(q(&mut t, "helth "), expected("health ", |_| true).0);
+    assert_eq!(q(&mut t, "helth "), q(&mut t, "health "));
     // and the index says what it did
     let idx = t.search_index().unwrap();
-    let f = idx.word_forms(b"helth", false);
+    let f = idx.word_forms(b"helth", false, false);
     assert_eq!(f.own_rows, 0);
     assert_eq!(f.corrections.iter().map(|c| c.0.as_slice()).collect::<Vec<_>>(), [b"health".as_slice()]);
-    assert!(idx.word_forms(b"health", false).corrections.is_empty());
+    assert!(idx.word_forms(b"health", false, false).corrections.is_empty());
+}
+
+/// One plain text column `t`, each text repeated 5 times (inflected forms
+/// need 5 rows to count).
+fn word_table(texts: &[&str]) -> Table<Vec<u8>> {
+    let schema = Schema { columns: vec![ColumnDef { name: "t".into(), ty: ColumnType::Utf8, flags: 0 }] };
+    let mut w = Writer::new(schema, vec![], 64, &[None]);
+    let rows: Vec<&str> = texts.iter().flat_map(|t| std::iter::repeat_n(*t, 5)).collect();
+    for chunk in rows.chunks(64) {
+        let mut offs = vec![0u32];
+        let mut bytes = Vec::new();
+        for r in chunk {
+            bytes.extend_from_slice(r.as_bytes());
+            offs.push(bytes.len() as u32);
+        }
+        w.write_group(chunk.len() as u32, &[ColumnChunk { data: SegmentData::Utf8 { offsets: &offs, bytes: &bytes }, validity: None, null_count: 0 }]);
+    }
+    Table::open(w.finish()).unwrap()
+}
+
+#[test]
+fn forms_follow_the_rules() {
+    let mut t = word_table(&[
+        "fund funds funded funding fundamental funder",
+        "charity charities plan plans planned planning",
+        "organisation organisations organization centre center programme program",
+        "heath heaths heather business news new use used using",
+        "colour color travelled traveled defence defense",
+    ]);
+    let idx = SearchIndex::build(&mut t, &[0]).unwrap();
+    let forms = |w: &str| {
+        let f = idx.word_forms(w.as_bytes(), false, false);
+        let mut all: Vec<String> = f.ranges.iter().flat_map(|r| r.clone()).map(|id| String::from_utf8(idx.word(id).to_vec()).unwrap()).collect();
+        all.sort();
+        all
+    };
+    // plurals, -ed, -ing; not -er (another word) and not words that only start alike
+    assert_eq!(forms("fund"), ["fund", "funded", "funding", "funds"]);
+    assert_eq!(forms("funding"), ["fund", "funded", "funding", "funds"]);
+    assert_eq!(forms("charities"), ["charities", "charity"]);
+    assert_eq!(forms("planning"), ["plan", "planned", "planning", "plans"]);
+    assert_eq!(forms("heath"), ["heath", "heaths"]);
+    assert_eq!(forms("used"), ["use", "used", "using"]);
+    // a final s that is not a plural
+    assert_eq!(forms("news"), ["news"]);
+    assert_eq!(forms("business"), ["business"]);
+    // UK/US spellings both ways, with their inflections
+    assert_eq!(forms("organization"), ["organisation", "organisations", "organization"]);
+    assert_eq!(forms("centre"), ["center", "centre"]);
+    assert_eq!(forms("program"), ["program", "programme"]);
+    assert_eq!(forms("color"), ["color", "colour"]);
+    assert_eq!(forms("traveled"), ["traveled", "travelled"]);
+    assert_eq!(forms("defence"), ["defence", "defense"]);
+    // a spelling variant that exists is not a typo to correct
+    assert!(idx.word_forms(b"organization", false, false).corrections.is_empty());
+    // quoted: only itself
+    let lit = idx.word_forms(b"fund", false, true);
+    assert_eq!((lit.ranges.len(), lit.expanded()), (1, false));
+    // the word being typed: its prefix covers its forms
+    assert!(!idx.word_forms(b"fund", true, false).expanded());
+    // and search() uses them: `fund ` finds funding, `"fund"` does not
+    let n = |t: &mut Table<Vec<u8>>, q: &str| count(t, &format!("select count(*) from t where search('{q}', t)"));
+    t.build_search_index(&[0]).unwrap();
+    assert_eq!(n(&mut t, "funding "), n(&mut t, "fund "));
+    assert_eq!(n(&mut t, "\"fund\""), 5);
 }

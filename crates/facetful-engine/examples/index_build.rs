@@ -49,13 +49,15 @@ fn main() {
     // spelling: what each word corrects to, and how long finding it takes
     let show = |w: &str, prefix: bool| {
         let t0 = Instant::now();
-        let f = idx.word_forms(w.as_bytes(), prefix);
+        let f = idx.word_forms(w.as_bytes(), prefix, false);
         let ms = t0.elapsed().as_secs_f64() * 1e3;
-        let fixes: Vec<String> = f.corrections.iter().map(|(c, n)| format!("{}{} {n}", String::from_utf8_lossy(c), if prefix { "…" } else { "" })).collect();
-        println!("{:>16}{} | own {:>7} | {:<60} | {:.2} ms", w, if prefix { "…" } else { " " }, f.own_rows, if fixes.is_empty() { "(as typed)".into() } else { fixes.join(", ") }, ms);
+        let mut fixes: Vec<String> = f.corrections.iter().map(|(c, n)| format!("fix {}{} {n}", String::from_utf8_lossy(c), if prefix { "…" } else { "" })).collect();
+        fixes.extend(f.variants.iter().map(|(c, n)| format!("var {} {n}", String::from_utf8_lossy(c))));
+        fixes.extend(f.inflections.iter().map(|(c, n)| format!("{} {n}", String::from_utf8_lossy(c))));
+        println!("{:>16}{} | own {:>7} | {:<100} | {:.2} ms", w, if prefix { "…" } else { " " }, f.own_rows, if fixes.is_empty() { "(as typed)".into() } else { fixes.join(", ") }, ms);
     };
-    for w in ["helth", "heath", "health", "enviromental", "enviroment", "yuoth", "sprot", "londn", "climte", "chnage", "orgnisation",
-              "suport", "comunity", "projcet", "chairty", "organization", "servics", "mentl", "wellbeeing", "acommodation"] {
+    for w in ["helth", "heath", "health", "fund", "funding", "charities", "organization", "organisation", "centre", "programme",
+              "children", "news", "business", "plan", "training", "used", "sport", "community", "support", "projects"] {
         show(w, false);
     }
     for w in ["helt", "londn", "enviro", "climt", "comun", "suppo"] {

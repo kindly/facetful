@@ -209,7 +209,7 @@ pub(super) fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) 
                 let key = match &search {
                     Some(s) => {
                         let ix = table.search_index().is_some_and(|i| i.cols == s.cols);
-                        format!("search:{}:{:?}{}", s.scope, s.words, if ix { "#ix" } else { "" })
+                        format!("search:{}:{:?}{}", s.scope, s.items, if ix { "#ix" } else { "" })
                     }
                     None => key,
                 };

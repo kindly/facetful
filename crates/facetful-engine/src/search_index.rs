@@ -926,6 +926,142 @@ fn edits1(w: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+// ---- English inflections and UK/US spellings (query-side, ASCII) ----
+
+/// Words whose final `s` is not a plural ending (`news` is not `new`s).
+const NOT_PLURAL: &[&str] = &["news", "series", "species", "means", "lens", "gas", "bias", "atlas", "canvas", "always"];
+
+fn is_vowel(c: u8) -> bool {
+    matches!(c, b'a' | b'e' | b'i' | b'o' | b'u')
+}
+
+/// `plann` -> `plan`: a doubled final consonant undone (from `planning`).
+fn undouble(s: &[u8]) -> Option<Vec<u8>> {
+    let n = s.len();
+    (n >= 3 && s[n - 1] == s[n - 2] && !is_vowel(s[n - 1]) && !matches!(s[n - 1], b'l' | b's' | b'z' | b'f')).then(|| s[..n - 1].to_vec())
+}
+
+/// Ends consonant, vowel, consonant (not w/x/y): `plan` doubles to `planned`.
+fn cvc(s: &[u8]) -> bool {
+    let n = s.len();
+    n >= 3 && !is_vowel(s[n - 1]) && is_vowel(s[n - 2]) && !is_vowel(s[n - 3]) && !matches!(s[n - 1], b'w' | b'x' | b'y')
+}
+
+/// Candidate bases of a word: itself, and what plural, `-ed` and `-ing`
+/// endings strip back to. Not checked against any vocabulary.
+fn bases(w: &[u8]) -> Vec<Vec<u8>> {
+    let n = w.len();
+    let mut out = vec![w.to_vec()];
+    let plural_ok = !NOT_PLURAL.iter().any(|x| x.as_bytes() == w)
+        && !w.ends_with(b"ss")
+        && !w.ends_with(b"us")
+        && !w.ends_with(b"is")
+        && !w.ends_with(b"ics");
+    if plural_ok && n > 3 && w.ends_with(b"s") {
+        out.push(w[..n - 1].to_vec());
+        if n > 4 && w.ends_with(b"es") {
+            out.push(w[..n - 2].to_vec());
+        }
+        if n > 4 && w.ends_with(b"ies") {
+            out.push([&w[..n - 3], b"y"].concat());
+        }
+    }
+    // `-ed` from 4 letters (`used` -> `use`) but not `-eed` (`feed` is not
+    // `fee`); `-ing` from 6 (`thing` is not `the`)
+    for (suffix, min) in [(&b"ed"[..], 3), (&b"ing"[..], 5)] {
+        if n > min && w.ends_with(suffix) && !w.ends_with(b"eed") {
+            let stem = &w[..n - suffix.len()];
+            if stem.len() >= 3 {
+                out.push(stem.to_vec()); // `used` is not `us`
+            }
+            out.push([stem, b"e"].concat()); // used -> use, using -> use
+            out.extend(undouble(stem));
+        }
+    }
+    out
+}
+
+/// The plural, `-ed` and `-ing` forms of a base (no `-er`: `funder` and
+/// `heather` are other words, not forms of `fund` and `heath`).
+fn forms_of(b: &[u8]) -> Vec<Vec<u8>> {
+    let n = b.len();
+    if n < 3 {
+        return vec![b.to_vec()];
+    }
+    let mut out = vec![b.to_vec(), [b, b"s"].concat(), [b, b"ed"].concat(), [b, b"ing"].concat()];
+    // `-es` after a hissing end only (`boxes`, `churches`; `plan` is not `planes`)
+    if [&b"s"[..], b"x", b"z", b"ch", b"sh"].iter().any(|e| b.ends_with(e)) {
+        out.push([b, b"es"].concat());
+    }
+    if b[n - 1] == b'y' && !is_vowel(b[n - 2]) {
+        out.push([&b[..n - 1], b"ies"].concat());
+        out.push([&b[..n - 1], b"ied"].concat());
+    }
+    if b[n - 1] == b'e' {
+        out.push([b, b"d"].concat());
+        out.push([&b[..n - 1], b"ing"].concat());
+    }
+    if cvc(b) {
+        let last = [b[n - 1]];
+        out.push([b, &last, b"ed"].concat());
+        out.push([b, &last, b"ing"].concat());
+    }
+    out
+}
+
+/// Every inflected form of the word's bases that `is_word` accepts (a stem
+/// that is not a word itself, like `traine` from `training`, would make
+/// `trainees`), the word itself excluded.
+fn inflections(w: &[u8], is_word: impl Fn(&[u8]) -> bool) -> Vec<Vec<u8>> {
+    if !w.is_ascii() || w.len() < 3 {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<u8>> = bases(w).iter().filter(|b| b.as_slice() == w || is_word(b)).flat_map(|b| forms_of(b)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out.retain(|f| f != w);
+    out
+}
+
+/// UK/US spelling pairs, as word endings swapped either way.
+const SPELLINGS: &[(&str, &str)] = &[
+    ("ise", "ize"), ("ised", "ized"), ("ises", "izes"), ("ising", "izing"),
+    ("isation", "ization"), ("isations", "izations"), ("iser", "izer"), ("isers", "izers"),
+    ("our", "or"), ("ours", "ors"), ("oured", "ored"), ("ouring", "oring"), ("ourite", "orite"), ("ourites", "orites"), ("ourable", "orable"),
+    ("tre", "ter"), ("tres", "ters"), ("bre", "ber"), ("bres", "bers"),
+    ("mme", "m"), ("mmes", "ms"),
+    ("lled", "led"), ("lling", "ling"), ("ller", "ler"), ("llers", "lers"),
+    ("ogue", "og"), ("ogues", "ogs"),
+    ("ence", "ense"), ("ences", "enses"),
+];
+
+/// The other spellings of a word (`organisation` -> `organization`). Not
+/// checked against any vocabulary.
+fn spelling_variants(w: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if !w.is_ascii() || w.len() < 5 {
+        return out;
+    }
+    for &(uk, us) in SPELLINGS {
+        for (from, to) in [(uk, us), (us, uk)] {
+            if w.ends_with(from.as_bytes()) && w.len() > from.len() + 1 {
+                out.push([&w[..w.len() - from.len()], to.as_bytes()].concat());
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out.retain(|v| v != w);
+    out
+}
+
+/// An inflected form counts only with at least this many rows, and at
+/// least 1/`FORM_SHARE` of the word's: the data's own misspellings
+/// (`charitys`, 8 rows beside `charity`'s 31,756) and other words that look
+/// like forms (`planed`, 9 beside `plan`'s 29,006) are words too.
+const MIN_FORM_ROWS: u64 = 5;
+const FORM_SHARE: u64 = 1000;
+
 /// Corrections kept per word: the most common few…
 const CORRECTIONS: usize = 5;
 /// …each with at least 1/this of the best one's rows (`sprot` keeps `sport`,
@@ -937,16 +1073,30 @@ const KEEP_BELOW_BEST: u64 = 100;
 /// `heath` (2,258) beside `health` (53 times) is left alone, for
 /// did-you-mean.
 const TYPO_RATIO: u64 = 200;
+/// …and only a word this rare: `news` (754 rows) beside `new` (152,461) is
+/// a word, not a typo.
+const TYPO_MAX_ROWS: u64 = 100;
 
-/// How a query word matches the index: the id ranges of its accepted forms,
-/// and which of them are corrections (with their rows).
+/// How a query word matches the index: the id ranges of its accepted
+/// forms, and what each beyond the word itself is (with its rows).
 #[derive(Debug, Clone, Default)]
 pub struct Forms {
     pub ranges: Vec<Ids>,
     /// rows the word as typed has (for a prefix, summed over its words)
     pub own_rows: u64,
+    /// other spellings (UK/US), matched as the word itself
+    pub variants: Vec<(Vec<u8>, u64)>,
     /// corrected words (or, for a word being typed, corrected prefixes)
     pub corrections: Vec<(Vec<u8>, u64)>,
+    /// plural, `-ed` and `-ing` forms of the word, its variants and corrections
+    pub inflections: Vec<(Vec<u8>, u64)>,
+}
+
+impl Forms {
+    /// Matches more than the word as typed.
+    pub fn expanded(&self) -> bool {
+        !(self.variants.is_empty() && self.corrections.is_empty() && self.inflections.is_empty())
+    }
 }
 
 impl SearchIndex {
@@ -1001,17 +1151,65 @@ impl SearchIndex {
     }
 
     /// The forms query word `w` (folded) matches: itself (a word, or with
-    /// `prefix` every word starting with it), plus corrections when it looks
-    /// like a typo. A finished word is corrected when it is missing or a word
-    /// within `max_edits` has `TYPO_RATIO` times its rows; a word being typed
-    /// only when nothing starts with it, and then to prefixes one edit away
+    /// `prefix` every word starting with it), and unless `literal` (a quoted
+    /// word): for a finished word its other spellings, corrections when it
+    /// looks like a typo, and the inflections of all of those; for a word
+    /// being typed, corrections only (its prefix already covers its endings).
+    /// A finished word is corrected when it is missing or a word within
+    /// `max_edits` has `TYPO_RATIO` times its rows; a word being typed only
+    /// when nothing starts with it, and then to prefixes one edit away
     /// (prefix typos are noisy: `helt` is one edit from `help`, `held`, `heat`).
-    pub fn word_forms(&self, w: &[u8], prefix: bool) -> Forms {
+    pub fn word_forms(&self, w: &[u8], prefix: bool, literal: bool) -> Forms {
+        let mut forms = self.typo_forms(w, prefix, literal);
+        if literal || prefix {
+            return forms;
+        }
+        let mut seen: Vec<u32> = forms.ranges.iter().flat_map(|r| r.clone()).collect();
+        let mut add = |v: &[u8], to: &mut Vec<(Vec<u8>, u64)>, ranges: &mut Vec<Ids>, min_rows: u64| {
+            if let Some(id) = self.word_id(v) {
+                let rows = self.counts[id as usize] as u64;
+                if rows >= min_rows && !seen.contains(&id) {
+                    seen.push(id);
+                    ranges.push(id..id + 1);
+                    to.push((v.to_vec(), rows));
+                }
+            }
+        };
+        let mut variants = Vec::new();
+        for v in spelling_variants(w) {
+            add(&v, &mut variants, &mut forms.ranges, 1);
+        }
+        // inflect the word as typed (when it exists), its variants and corrections
+        let mut bases: Vec<Vec<u8>> = Vec::new();
+        if forms.own_rows > 0 {
+            bases.push(w.to_vec());
+        }
+        bases.extend(variants.iter().map(|v| v.0.clone()));
+        bases.extend(forms.corrections.iter().map(|c| c.0.clone()));
+        let reference = forms.own_rows.max(forms.corrections.iter().map(|c| c.1).max().unwrap_or(0));
+        let min_rows = MIN_FORM_ROWS.max(reference / FORM_SHARE);
+        let mut inflected = Vec::new();
+        for b in bases {
+            for f in inflections(&b, |x| self.word_id(x).is_some()) {
+                add(&f, &mut inflected, &mut forms.ranges, min_rows);
+            }
+        }
+        forms.variants = variants;
+        forms.inflections = inflected;
+        forms
+    }
+
+    /// The word as typed, and its corrections (see `word_forms`).
+    fn typo_forms(&self, w: &[u8], prefix: bool, literal: bool) -> Forms {
         let own = if prefix { self.prefix_ids(w) } else { self.word_id(w).map_or(0..0, |id| id..id + 1) };
         let own_rows = self.rows_in(own.clone());
-        let mut forms = Forms { ranges: if own.is_empty() { vec![] } else { vec![own] }, own_rows, corrections: vec![] };
+        let mut forms = Forms { ranges: if own.is_empty() { vec![] } else { vec![own] }, own_rows, ..Default::default() };
         let k = max_edits(w.len());
-        if k == 0 || (prefix && own_rows > 0) {
+        if literal || k == 0 || (prefix && own_rows > 0) {
+            return forms;
+        }
+        // a spelling variant that exists is not a typo (`organization`)
+        if !prefix && own_rows == 0 && spelling_variants(w).iter().any(|v| self.word_id(v).is_some()) {
             return forms;
         }
         let mut cands: Vec<(Vec<u8>, Ids, u64)> = Vec::new();
@@ -1060,7 +1258,17 @@ impl SearchIndex {
             }
         }
         let best = cands.iter().map(|c| c.2).max().unwrap_or(0);
-        if best == 0 || (!prefix && own_rows > 0 && own_rows * TYPO_RATIO > best) {
+        if best == 0 || (!prefix && own_rows > 0 && (own_rows >= TYPO_MAX_ROWS || own_rows * TYPO_RATIO > best)) {
+            return forms;
+        }
+        // a word's own singular or plural is not a correction of it
+        let plural_pair = |a: &[u8], b: &[u8]| {
+            let (s, l) = if a.len() < b.len() { (a, b) } else { (b, a) };
+            l.starts_with(s) && matches!(&l[s.len()..], b"s" | b"es")
+        };
+        cands.retain(|c| prefix || !plural_pair(&c.0, w));
+        let best = cands.iter().map(|c| c.2).max().unwrap_or(0);
+        if best == 0 {
             return forms;
         }
         cands.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
