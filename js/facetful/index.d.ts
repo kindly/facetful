@@ -220,10 +220,10 @@ export declare class Facetful {
 
   /**
    * What to offer for a search query typed so far over these columns:
-   * completions of the word being typed, counted on the rows the other
-   * words and `where` (the app's facets, as a SQL condition) leave; the
-   * words search() corrected by itself; and with `didYouMean` a better
-   * query when there is one. Completions and corrections need the search
+   * completions of the word being typed, most common first, each found in
+   * some row the other words and `where` (the app's facets, as a SQL
+   * condition) leave; the words search() corrected by itself; and with
+   * `didYouMean` a better query when there is one. No counts: run the query. Completions and corrections need the search
    * index over exactly these columns (`indexed` says whether it answered).
    */
   searchSuggest(
@@ -308,14 +308,12 @@ export declare class Facetful {
 export interface SearchSuggestions {
   /** whether a search index over these columns answered */
   indexed: boolean;
-  /** rows the query as typed matches (under `where`) */
-  rows: number;
-  /** rows the word being typed has as a prefix over the whole table: a measure of "too broad" */
+  /** rows the word being typed has as a prefix over the whole table, roughly: a measure of "too broad" */
   prefixRows: number;
-  /** completions of the word being typed, most rows first */
-  completions: { word: string; query: string; rows: number }[];
+  /** completions of the word being typed, most common words first */
+  completions: { word: string; query: string }[];
   /** words search() corrected by itself ("including results for …") */
   corrected: { word: string; to: string[] }[];
-  /** a better query, when asked for and one exists */
-  didYouMean: { query: string; rows: number } | null;
+  /** a better query, when asked for and one with results exists */
+  didYouMean: string | null;
 }

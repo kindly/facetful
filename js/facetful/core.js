@@ -242,11 +242,12 @@ export class Engine {
   }
 
   /** What to offer for a search query typed so far: completions of the word
-   *  being typed (counted on the rows the other words and `where` leave),
-   *  the words corrected automatically, and on request a did-you-mean.
-   *  `where` is a SQL condition (the app's facets), e.g. `region = 'London'`.
-   *  Returns { indexed, rows, prefixRows, completions: [{ word, query, rows }],
-   *  corrected: [{ word, to }], didYouMean: { query, rows } | null }. */
+   *  being typed (most common first, each found in some row the other words
+   *  and `where` leave), the words corrected automatically, and on request a
+   *  did-you-mean. `where` is a SQL condition (the app's facets), e.g.
+   *  `region = 'London'`. No counts: run the query for those. Returns
+   *  { indexed, prefixRows, completions: [{ word, query }], corrected:
+   *  [{ word, to }], didYouMean: query | null }. */
   searchSuggest(tableHandle, columns, q, { where = "", limit = 8, didYouMean = false } = {}) {
     if (!this.w.table_search_suggest) throw new Error("this facetful build has no search (lite build)");
     const idx = columns.map((c) => {

@@ -153,10 +153,10 @@ export class Facetful {
 
   /**
    * What to offer for a search query typed so far over these columns:
-   * completions of the word being typed, counted on the rows the other
-   * words and `where` (the app's facets, as a SQL condition) leave; the
-   * words search() corrected by itself; and with `didYouMean` a better
-   * query when there is one. Completions and corrections need the search
+   * completions of the word being typed, most common first, each found in
+   * some row the other words and `where` (the app's facets, as a SQL
+   * condition) leave; the words search() corrected by itself; and with
+   * `didYouMean` a better query when there is one. No counts: run the query. Completions and corrections need the search
    * index over exactly these columns (`indexed` says whether it answered).
    */
   async searchSuggest(q, { columns, where = "", limit = 8, didYouMean = false, table } = {}) {

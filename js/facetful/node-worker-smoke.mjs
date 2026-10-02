@@ -75,7 +75,7 @@ if (!(built.bytes > 0) || typeof built.elapsedMs !== "number") throw new Error(`
 // suggestions through the worker: completions of the word being typed,
 // counted on the rows the filter leaves
 const sg = (await ok({ cmd: "searchSuggest", table: "t", q: "countr", columns: ["country", "owner"], where: "status = 'status_0'", limit: 5, didYouMean: true })).suggestions;
-if (!sg.indexed || !sg.completions.some((c) => c.word === "country" && c.query === "country" && c.rows > 0)) {
+if (!sg.indexed || !sg.completions.some((c) => c.word === "country" && c.query === "country")) {
   throw new Error(`searchSuggest: ${JSON.stringify(sg)}`);
 }
 const bad = await send({ cmd: "searchSuggest", table: "t", q: "x", columns: ["country"], where: "nope = 1" });

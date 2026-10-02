@@ -1263,25 +1263,26 @@ impl SearchIndex {
         cands
     }
 
-    /// Call `f` with each row (within group `g`) of word `id`'s row list
-    /// (the plain columns; dictionary columns go through `value_sets`).
-    pub fn for_each_row(&self, g: usize, id: u32, mut f: impl FnMut(usize)) {
+    /// Whether `f` holds for some row (within group `g`) of word `id`'s row
+    /// list, stopping at the first.
+    pub fn any_row(&self, g: usize, id: u32, mut f: impl FnMut(usize) -> bool) -> bool {
         let gi = &self.groups[g];
-        let Ok(k) = gi.ids.binary_search(&id) else { return };
+        let Ok(k) = gi.ids.binary_search(&id) else { return false };
         let e = gi.entries[k];
         if e.len == BITMAP {
             let s = e.start as usize * BITMAP_WORDS;
             for (w, &bits) in gi.bitmaps[s..s + BITMAP_WORDS].iter().enumerate() {
                 let mut b = bits;
                 while b != 0 {
-                    f(w * 64 + b.trailing_zeros() as usize);
+                    if f(w * 64 + b.trailing_zeros() as usize) {
+                        return true;
+                    }
                     b &= b - 1;
                 }
             }
+            false
         } else {
-            for &r in &gi.rows[e.start as usize..(e.start + e.len) as usize] {
-                f(r as usize);
-            }
+            gi.rows[e.start as usize..(e.start + e.len) as usize].iter().any(|&r| f(r as usize))
         }
     }
 

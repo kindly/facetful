@@ -500,9 +500,8 @@ pub(super) fn eval_search(args: &[Bound], ctx: &GroupCtx) -> VV {
 
 // ---- suggestions: completions of the word being typed, did-you-mean ----
 
-/// Completions counted in the context are taken from this many of the
-/// prefix's most common words.
-const SHORTLIST: usize = 50;
+/// Candidate words examined at most for completions, most common first.
+const EXAMINE: usize = 1000;
 /// Did-you-mean offers a word's neighbour when it has this many times the
 /// word's rows (lower than the automatic correction's 200: here the user
 /// chooses).
@@ -515,30 +514,29 @@ pub struct SuggestOptions {
     pub did_you_mean: bool,
 }
 
-/// One completion of the word being typed: the word, the whole query with
-/// it, and how many rows that query has (under the filter).
+/// One completion of the word being typed: the word, and the whole query
+/// with it in place of what was typed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Completion {
     pub word: String,
     pub query: String,
-    pub rows: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Suggestions {
     /// whether a word index over these columns answered (without one: no
-    /// completions, corrections or did-you-mean, words as typed)
+    /// completions, corrections or did-you-mean)
     pub indexed: bool,
-    /// rows the query as typed has (under the filter)
-    pub rows: u64,
-    /// rows the word being typed has as a prefix over the whole table
-    /// (summed over its words): the app's measure of "too broad"
+    /// rows the word being typed has as a prefix over the whole table, from
+    /// the index's per-word totals (a row with the word in two columns counts
+    /// twice): the app's measure of "too broad"
     pub prefix_rows: u64,
+    /// completions of the word being typed, most common words first
     pub completions: Vec<Completion>,
     /// words the search corrected by itself: (as typed, corrections)
     pub corrected: Vec<(String, Vec<String>)>,
-    /// a better query when asked for and one was found: (query, rows)
-    pub did_you_mean: Option<(String, u64)>,
+    /// a better query, when asked for and one with rows was found
+    pub did_you_mean: Option<String>,
 }
 
 fn spec_for(cols: &[usize], items: Vec<Item>) -> Spec {
@@ -562,15 +560,14 @@ fn render(items: &[Item]) -> String {
     q
 }
 
-/// Rows `spec` matches in each group, ANDed with `filter`: (masks, count).
+/// Rows `spec` matches in each group, ANDed with `filter`.
 fn matching<S: ReadAt>(
     table: &mut Table<S>,
     spec: &Spec,
     filter: Option<&[Option<Vec<u8>>]>,
     dicts: &Dicts,
-) -> Result<(Vec<Vec<u8>>, u64), FormatError> {
+) -> Result<Vec<Vec<u8>>, FormatError> {
     let mut masks = Vec::with_capacity(table.group_count());
-    let mut n = 0u64;
     for g in 0..table.group_count() {
         let rows = table.group_rows(g);
         let mut m = if spec.items.is_empty() { vec![1u8; rows] } else { group_mask(table, g, rows, spec, dicts)? };
@@ -579,25 +576,24 @@ fn matching<S: ReadAt>(
                 *a &= b;
             }
         }
-        n += m.iter().filter(|&&b| b == 1).count() as u64;
         masks.push(m);
     }
-    Ok((masks, n))
+    Ok(masks)
 }
 
 /// What to offer for query `q` typed so far over `cols`, with the app's
-/// other conditions keeping `filter`:
+/// other conditions keeping `filter`. No counts: the app runs the query.
 ///
 /// - completions of the word being typed (the last word, unquoted, with no
 ///   separator after it): the prefix's words (and, when it looks like a
-///   typo, those of prefixes one edit away), the `SHORTLIST` most common of them
-///   counted against the rows the other words and the filter leave, ranked
-///   by that count. With no other words and no filter, the index's counts.
+///   typo, those of prefixes one edit away), most common first, keeping
+///   those found in at least one row the other words and the filter leave.
+///   Each check stops at the first such row.
 /// - the words corrected automatically, for "including results for".
 /// - did-you-mean, on request: the query with each corrected word replaced
-///   by its best correction, and each real word whose neighbour has
-///   `DID_YOU_MEAN_RATIO` times its rows replaced by it; offered when it has
-///   rows.
+///   by its best correction (the word being typed by its first completion),
+///   and each real word whose neighbour has `DID_YOU_MEAN_RATIO` times its
+///   rows replaced by it; offered when it finds a row.
 pub(super) fn suggest<S: ReadAt>(
     table: &mut Table<S>,
     cols: &[usize],
@@ -608,6 +604,9 @@ pub(super) fn suggest<S: ReadAt>(
     let mut cols = cols.to_vec();
     cols.sort_unstable();
     cols.dedup();
+    let idx = table.search_index().filter(|i| i.cols == cols);
+    let mut out = Suggestions { indexed: idx.is_some(), ..Default::default() };
+    let Some(idx) = idx else { return Ok(out) };
     let mut dicts: Dicts = HashMap::new();
     for &c in &cols {
         if table.catalog().schema.columns[c].is_dict() {
@@ -615,11 +614,6 @@ pub(super) fn suggest<S: ReadAt>(
         }
     }
     let items = parse(q);
-    let spec = spec_for(&cols, items.clone());
-    let (_, rows) = matching(table, &spec, filter, &dicts)?;
-    let idx = table.search_index().filter(|i| i.cols == cols);
-    let mut out = Suggestions { indexed: idx.is_some(), rows, ..Default::default() };
-    let Some(idx) = idx else { return Ok(out) };
 
     // automatic corrections, as search() applied them
     for it in &items {
@@ -641,32 +635,20 @@ pub(super) fn suggest<S: ReadAt>(
         cands.dedup();
         out.prefix_rows = cands.iter().map(|&id| idx.rows_of(id) as u64).sum();
         cands.sort_unstable_by(|&a, &b| idx.rows_of(b).cmp(&idx.rows_of(a)).then(a.cmp(&b)));
-        cands.truncate(SHORTLIST);
+        cands.truncate(EXAMINE);
         let context = spec_for(&cols, items[..items.len() - 1].to_vec());
-        let mut counts = vec![0u64; cands.len()];
+        let mut found: Vec<u32> = Vec::new();
         if context.items.is_empty() && filter.is_none() {
-            for (n, &id) in counts.iter_mut().zip(&cands) {
-                *n = idx.rows_of(id) as u64;
-            }
+            found = cands.into_iter().take(opts.limit).collect();
         } else {
-            // counted from each candidate's side, so the cost follows its rows,
-            // not the context's: its row lists against the context, and its
-            // dictionary values through the context rows bucketed by value
-            let (ctx, _) = matching(table, &context, filter, &dicts)?;
-            let starts: Vec<usize> = ctx.iter().scan(0, |acc, m| {
-                let s = *acc;
-                *acc += m.len();
-                Some(s)
-            }).collect();
-            let total: usize = ctx.iter().map(|m| m.len()).sum();
-            // per dictionary column: context rows (global numbers) by code
-            let mut buckets: Vec<(usize, Vec<u32>, Vec<u32>)> = Vec::new(); // (col, offsets, rows)
+            let ctx = matching(table, &context, filter, &dicts)?;
+            // per dictionary column, the values some context row has
+            let mut present: Vec<(usize, Vec<bool>)> = Vec::new();
             for &c in &cols {
                 if !dicts.contains_key(&c) {
                     continue;
                 }
-                let n_values = dicts[&c].len();
-                let mut pairs: Vec<(u32, u32)> = Vec::new();
+                let mut seen = vec![false; dicts[&c].len()];
                 for (g, m) in ctx.iter().enumerate() {
                     if !m.contains(&1) {
                         continue;
@@ -675,59 +657,29 @@ pub(super) fn suggest<S: ReadAt>(
                     let valid = table.validity(g, c)?;
                     for (r, (&k, &code)) in m.iter().zip(&codes).enumerate() {
                         if k == 1 && valid.as_ref().is_none_or(|v| v[r / 8] >> (r % 8) & 1 == 1) {
-                            pairs.push((code as u32, (starts[g] + r) as u32));
+                            seen[code as usize] = true;
                         }
                     }
                 }
-                let mut offsets = vec![0u32; n_values + 1];
-                for &(code, _) in &pairs {
-                    offsets[code as usize + 1] += 1;
-                }
-                for k in 0..n_values {
-                    offsets[k + 1] += offsets[k];
-                }
-                let mut fill = offsets.clone();
-                let mut rows = vec![0u32; pairs.len()];
-                for (code, r) in pairs {
-                    rows[fill[code as usize] as usize] = r;
-                    fill[code as usize] += 1;
-                }
-                buckets.push((c, offsets, rows));
+                present.push((c, seen));
             }
-            // a row counts once per candidate, whichever columns hold the word
-            let mut stamp = vec![0u32; total];
-            for (k, &id) in cands.iter().enumerate() {
-                let mark = k as u32 + 1;
-                let mut n = 0u64;
-                for (g, m) in ctx.iter().enumerate() {
-                    idx.for_each_row(g, id, |r| {
-                        if m[r] == 1 && stamp[starts[g] + r] != mark {
-                            stamp[starts[g] + r] = mark;
-                            n += 1;
-                        }
-                    });
+            for id in cands {
+                if found.len() == opts.limit {
+                    break;
                 }
-                for (c, codes) in idx.dict_codes(id) {
-                    let Some((_, offsets, rows)) = buckets.iter().find(|b| b.0 == c) else { continue };
-                    for &code in codes {
-                        for &r in &rows[offsets[code as usize] as usize..offsets[code as usize + 1] as usize] {
-                            if stamp[r as usize] != mark {
-                                stamp[r as usize] = mark;
-                                n += 1;
-                            }
-                        }
-                    }
+                let in_dict = idx.dict_codes(id).any(|(c, codes)| {
+                    present.iter().find(|p| p.0 == c).is_some_and(|(_, seen)| codes.iter().any(|&k| seen[k as usize]))
+                });
+                if in_dict || ctx.iter().enumerate().any(|(g, m)| idx.any_row(g, id, |r| m[r] == 1)) {
+                    found.push(id);
                 }
-                counts[k] = n;
             }
         }
-        let mut ranked: Vec<(u64, u32)> = counts.into_iter().zip(cands).filter(|(n, _)| *n > 0).collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(idx.rows_of(b.1).cmp(&idx.rows_of(a.1))).then(a.1.cmp(&b.1)));
         let head = render(&items[..items.len() - 1]);
         let head = if head.is_empty() || head.ends_with(' ') { head } else { head + " " };
-        for (n, id) in ranked.into_iter().take(opts.limit) {
+        for id in found {
             let word = String::from_utf8_lossy(idx.word(id)).into_owned();
-            out.completions.push(Completion { query: format!("{head}{word}"), word, rows: n });
+            out.completions.push(Completion { query: format!("{head}{word}"), word });
         }
     }
 
@@ -742,7 +694,7 @@ pub(super) fn suggest<S: ReadAt>(
             }
             let f = idx.word_forms(w.text.as_bytes(), w.prefix, false);
             let best = if w.prefix && !f.corrections.is_empty() {
-                // the word being typed, misspelt: its top completion, a
+                // the word being typed, misspelt: its first completion, a
                 // whole word (`climt` → `climate`, not the prefix `clim`)
                 out.completions.first().map(|c| c.word.clone().into_bytes())
             } else if !f.corrections.is_empty() {
@@ -767,9 +719,8 @@ pub(super) fn suggest<S: ReadAt>(
         }
         if changed {
             let alt_spec = spec_for(&cols, alt.clone());
-            let (_, n) = matching(table, &alt_spec, filter, &dicts)?;
-            if n > 0 {
-                out.did_you_mean = Some((render(&alt), n));
+            if matching(table, &alt_spec, filter, &dicts)?.iter().any(|m| m.contains(&1)) {
+                out.did_you_mean = Some(render(&alt));
             }
         }
     }

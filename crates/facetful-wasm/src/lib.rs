@@ -439,11 +439,11 @@ pub extern "C" fn table_search_index_pairs(t: usize) -> f64 {
 #[cfg(feature = "search")]
 static mut SUGGEST_JSON: String = String::new();
 
-/// search()'s suggestions for query `q` over `n` text columns, counted on
-/// the rows the WHERE condition `filter` keeps (empty: all rows), as JSON:
-/// `{indexed, rows, prefixRows, completions: [{word, query, rows}],
-/// corrected: [{word, to: [...]}], didYouMean: {query, rows} | null}`, or
-/// `{error}`. Returns its byte length; `search_suggest_read` copies it out.
+/// search()'s suggestions for query `q` over `n` text columns, within the
+/// rows the WHERE condition `filter` keeps (empty: all rows), as JSON:
+/// `{indexed, prefixRows, completions: [{word, query}], corrected: [{word,
+/// to: [...]}], didYouMean: query | null}`, or `{error}`. Returns its byte
+/// length; `search_suggest_read` copies it out.
 #[cfg(feature = "search")]
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -467,7 +467,7 @@ pub extern "C" fn table_search_suggest(
     let mut out = String::new();
     match facetful_engine::sql::search_suggest(t, &cols, q, Some(f), &opts) {
         Ok(s) => {
-            out.push_str(&format!("{{\"indexed\":{},\"rows\":{},\"prefixRows\":{},\"completions\":[", s.indexed, s.rows, s.prefix_rows));
+            out.push_str(&format!("{{\"indexed\":{},\"prefixRows\":{},\"completions\":[", s.indexed, s.prefix_rows));
             for (i, c) in s.completions.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
@@ -476,7 +476,7 @@ pub extern "C" fn table_search_suggest(
                 json_str(&mut out, &c.word);
                 out.push_str(",\"query\":");
                 json_str(&mut out, &c.query);
-                out.push_str(&format!(",\"rows\":{}}}", c.rows));
+                out.push('}');
             }
             out.push_str("],\"corrected\":[");
             for (i, (w, to)) in s.corrected.iter().enumerate() {
@@ -496,11 +496,7 @@ pub extern "C" fn table_search_suggest(
             }
             out.push_str("],\"didYouMean\":");
             match &s.did_you_mean {
-                Some((q, rows)) => {
-                    out.push_str("{\"query\":");
-                    json_str(&mut out, q);
-                    out.push_str(&format!(",\"rows\":{rows}}}"));
-                }
+                Some(q) => json_str(&mut out, q),
                 None => out.push_str("null"),
             }
             out.push('}');
