@@ -200,13 +200,17 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
 <sv-prose id="fts-next">
 ## Next steps
 
-1. **Spell check, variants and inflections** over the index's vocabulary.
-2. **Build peak memory**, if it matters on phones: build each group in halves, or 6-byte pairs.
-3. **Build while loading:** group by group as the image streams in, then the OPFS cache of the whole index.
-4. **Split images with attach.**
-5. `searchSuggest`: word completions and did-you-mean, then `search_rank`.
-6. Accent folding with the 958-character table.
-7. Scan path speed, only if the build window or the lite build need it.
+1. **Last word only as a prefix.** Finished words (followed by a space) match exactly; only the word being typed is a prefix.
+2. **Incremental build.** Start, index row group g, finish: the worker stays free between groups, so facet clicks and searches run (scanning) while the index builds in the background. Today's build is one synchronous call that blocks the worker for about 2 s on grantnav. This is also the interface step 7 calls.
+3. **Spell checker** over the index's vocabulary: length-based edit limits, the frequency filters, automatic expansion for clear typos, did-you-mean for real words, typo-tolerant completion of the word being typed.
+4. **Inflections and UK/US variants.**
+5. **`searchSuggest`:** word completions ranked by co-occurrence with the current results and facets; did-you-mean on request.
+6. **`search_rank` tiers.**
+7. **Streaming load with the build integrated** (load-time work): the worker reads the response stream front to back, tokenizes dictionary columns as soon as they arrive, indexes each row group as its bytes complete (step 2's interface), writes to OPFS as it goes, and finishes the index when the footer arrives, so search is ready with the table. The app names the columns to index when it starts the load.
+8. **Split images with attach,** each image's columns indexed as it streams, merged into one index at attach (same row groups; combine the two sorted vocabularies).
+9. **OPFS cache of the whole index,** read back in full on later visits.
+10. **Accent folding** and keeping apostrophes inside words (tokenizer changes; any time).
+11. **Measurements in Chrome, Firefox, Safari and a phone;** build peak memory if phones need it (groups in halves, 6-byte pairs).
 </sv-prose>
 
 <sv-prose id="fts-rejected">
