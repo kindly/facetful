@@ -498,6 +498,284 @@ pub(super) fn eval_search(args: &[Bound], ctx: &GroupCtx) -> VV {
     VV::all_valid(Data::Bool(Rc::new(keep)))
 }
 
+// ---- suggestions: completions of the word being typed, did-you-mean ----
+
+/// Completions counted in the context are taken from this many of the
+/// prefix's most common words.
+const SHORTLIST: usize = 50;
+/// Did-you-mean offers a word's neighbour when it has this many times the
+/// word's rows (lower than the automatic correction's 200: here the user
+/// chooses).
+const DID_YOU_MEAN_RATIO: u64 = 20;
+
+pub struct SuggestOptions {
+    /// completions returned at most
+    pub limit: usize,
+    /// also look for a better query
+    pub did_you_mean: bool,
+}
+
+/// One completion of the word being typed: the word, the whole query with
+/// it, and how many rows that query has (under the filter).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Completion {
+    pub word: String,
+    pub query: String,
+    pub rows: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Suggestions {
+    /// whether a word index over these columns answered (without one: no
+    /// completions, corrections or did-you-mean, words as typed)
+    pub indexed: bool,
+    /// rows the query as typed has (under the filter)
+    pub rows: u64,
+    /// rows the word being typed has as a prefix over the whole table
+    /// (summed over its words): the app's measure of "too broad"
+    pub prefix_rows: u64,
+    pub completions: Vec<Completion>,
+    /// words the search corrected by itself: (as typed, corrections)
+    pub corrected: Vec<(String, Vec<String>)>,
+    /// a better query when asked for and one was found: (query, rows)
+    pub did_you_mean: Option<(String, u64)>,
+}
+
+fn spec_for(cols: &[usize], items: Vec<Item>) -> Spec {
+    Spec { cols: cols.to_vec(), items, scope: format!("{cols:?}"), dict_tables: Default::default(), index_forms: Default::default(), phrase_values: Default::default() }
+}
+
+/// The query again from its items, the last word left open if it was.
+fn render(items: &[Item]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for it in items {
+        out.push(match it {
+            Item::Word(w) if w.literal => format!("\"{}\"", w.text),
+            Item::Word(w) => w.text.clone(),
+            Item::Phrase(p) => format!("\"{}{}", p.words.join(" "), if p.prefix { "" } else { "\"" }),
+        });
+    }
+    let mut q = out.join(" ");
+    if !matches!(items.last(), Some(Item::Word(w)) if w.prefix) && !matches!(items.last(), Some(Item::Phrase(p)) if p.prefix) && !q.is_empty() && !q.ends_with('"') {
+        q.push(' ');
+    }
+    q
+}
+
+/// Rows `spec` matches in each group, ANDed with `filter`: (masks, count).
+fn matching<S: ReadAt>(
+    table: &mut Table<S>,
+    spec: &Spec,
+    filter: Option<&[Option<Vec<u8>>]>,
+    dicts: &Dicts,
+) -> Result<(Vec<Vec<u8>>, u64), FormatError> {
+    let mut masks = Vec::with_capacity(table.group_count());
+    let mut n = 0u64;
+    for g in 0..table.group_count() {
+        let rows = table.group_rows(g);
+        let mut m = if spec.items.is_empty() { vec![1u8; rows] } else { group_mask(table, g, rows, spec, dicts)? };
+        if let Some(Some(f)) = filter.map(|f| &f[g]) {
+            for (a, &b) in m.iter_mut().zip(f) {
+                *a &= b;
+            }
+        }
+        n += m.iter().filter(|&&b| b == 1).count() as u64;
+        masks.push(m);
+    }
+    Ok((masks, n))
+}
+
+/// What to offer for query `q` typed so far over `cols`, with the app's
+/// other conditions keeping `filter`:
+///
+/// - completions of the word being typed (the last word, unquoted, with no
+///   separator after it): the prefix's words (and, when it looks like a
+///   typo, those of prefixes one edit away), the `SHORTLIST` most common of them
+///   counted against the rows the other words and the filter leave, ranked
+///   by that count. With no other words and no filter, the index's counts.
+/// - the words corrected automatically, for "including results for".
+/// - did-you-mean, on request: the query with each corrected word replaced
+///   by its best correction, and each real word whose neighbour has
+///   `DID_YOU_MEAN_RATIO` times its rows replaced by it; offered when it has
+///   rows.
+pub(super) fn suggest<S: ReadAt>(
+    table: &mut Table<S>,
+    cols: &[usize],
+    q: &str,
+    filter: Option<&[Option<Vec<u8>>]>,
+    opts: &SuggestOptions,
+) -> Result<Suggestions, FormatError> {
+    let mut cols = cols.to_vec();
+    cols.sort_unstable();
+    cols.dedup();
+    let mut dicts: Dicts = HashMap::new();
+    for &c in &cols {
+        if table.catalog().schema.columns[c].is_dict() {
+            dicts.insert(c, table.dictionary_rc(c)?);
+        }
+    }
+    let items = parse(q);
+    let spec = spec_for(&cols, items.clone());
+    let (_, rows) = matching(table, &spec, filter, &dicts)?;
+    let idx = table.search_index().filter(|i| i.cols == cols);
+    let mut out = Suggestions { indexed: idx.is_some(), rows, ..Default::default() };
+    let Some(idx) = idx else { return Ok(out) };
+
+    // automatic corrections, as search() applied them
+    for it in &items {
+        if let Item::Word(w) = it {
+            let f = idx.word_forms(w.text.as_bytes(), w.prefix, w.literal);
+            if !f.corrections.is_empty() {
+                let fixes = f.corrections.iter().map(|c| String::from_utf8_lossy(&c.0).into_owned() + if w.prefix { "…" } else { "" }).collect();
+                out.corrected.push((w.text.clone(), fixes));
+            }
+        }
+    }
+
+    // completions of the word being typed
+    if let Some(Item::Word(w)) = items.last().filter(|it| matches!(it, Item::Word(w) if w.prefix && !w.literal)) {
+        // the prefix's words, and those of its corrections when it looks like a typo
+        let ranges = idx.word_forms(w.text.as_bytes(), true, false).ranges;
+        let mut cands: Vec<u32> = ranges.iter().flat_map(|r| r.clone()).collect();
+        cands.sort_unstable();
+        cands.dedup();
+        out.prefix_rows = cands.iter().map(|&id| idx.rows_of(id) as u64).sum();
+        cands.sort_unstable_by(|&a, &b| idx.rows_of(b).cmp(&idx.rows_of(a)).then(a.cmp(&b)));
+        cands.truncate(SHORTLIST);
+        let context = spec_for(&cols, items[..items.len() - 1].to_vec());
+        let mut counts = vec![0u64; cands.len()];
+        if context.items.is_empty() && filter.is_none() {
+            for (n, &id) in counts.iter_mut().zip(&cands) {
+                *n = idx.rows_of(id) as u64;
+            }
+        } else {
+            // counted from each candidate's side, so the cost follows its rows,
+            // not the context's: its row lists against the context, and its
+            // dictionary values through the context rows bucketed by value
+            let (ctx, _) = matching(table, &context, filter, &dicts)?;
+            let starts: Vec<usize> = ctx.iter().scan(0, |acc, m| {
+                let s = *acc;
+                *acc += m.len();
+                Some(s)
+            }).collect();
+            let total: usize = ctx.iter().map(|m| m.len()).sum();
+            // per dictionary column: context rows (global numbers) by code
+            let mut buckets: Vec<(usize, Vec<u32>, Vec<u32>)> = Vec::new(); // (col, offsets, rows)
+            for &c in &cols {
+                if !dicts.contains_key(&c) {
+                    continue;
+                }
+                let n_values = dicts[&c].len();
+                let mut pairs: Vec<(u32, u32)> = Vec::new();
+                for (g, m) in ctx.iter().enumerate() {
+                    if !m.contains(&1) {
+                        continue;
+                    }
+                    let codes = table.codes(g, c, m.len())?;
+                    let valid = table.validity(g, c)?;
+                    for (r, (&k, &code)) in m.iter().zip(&codes).enumerate() {
+                        if k == 1 && valid.as_ref().is_none_or(|v| v[r / 8] >> (r % 8) & 1 == 1) {
+                            pairs.push((code as u32, (starts[g] + r) as u32));
+                        }
+                    }
+                }
+                let mut offsets = vec![0u32; n_values + 1];
+                for &(code, _) in &pairs {
+                    offsets[code as usize + 1] += 1;
+                }
+                for k in 0..n_values {
+                    offsets[k + 1] += offsets[k];
+                }
+                let mut fill = offsets.clone();
+                let mut rows = vec![0u32; pairs.len()];
+                for (code, r) in pairs {
+                    rows[fill[code as usize] as usize] = r;
+                    fill[code as usize] += 1;
+                }
+                buckets.push((c, offsets, rows));
+            }
+            // a row counts once per candidate, whichever columns hold the word
+            let mut stamp = vec![0u32; total];
+            for (k, &id) in cands.iter().enumerate() {
+                let mark = k as u32 + 1;
+                let mut n = 0u64;
+                for (g, m) in ctx.iter().enumerate() {
+                    idx.for_each_row(g, id, |r| {
+                        if m[r] == 1 && stamp[starts[g] + r] != mark {
+                            stamp[starts[g] + r] = mark;
+                            n += 1;
+                        }
+                    });
+                }
+                for (c, codes) in idx.dict_codes(id) {
+                    let Some((_, offsets, rows)) = buckets.iter().find(|b| b.0 == c) else { continue };
+                    for &code in codes {
+                        for &r in &rows[offsets[code as usize] as usize..offsets[code as usize + 1] as usize] {
+                            if stamp[r as usize] != mark {
+                                stamp[r as usize] = mark;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                counts[k] = n;
+            }
+        }
+        let mut ranked: Vec<(u64, u32)> = counts.into_iter().zip(cands).filter(|(n, _)| *n > 0).collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(idx.rows_of(b.1).cmp(&idx.rows_of(a.1))).then(a.1.cmp(&b.1)));
+        let head = render(&items[..items.len() - 1]);
+        let head = if head.is_empty() || head.ends_with(' ') { head } else { head + " " };
+        for (n, id) in ranked.into_iter().take(opts.limit) {
+            let word = String::from_utf8_lossy(idx.word(id)).into_owned();
+            out.completions.push(Completion { query: format!("{head}{word}"), word, rows: n });
+        }
+    }
+
+    // did-you-mean: corrections made explicit, and real words with a far more common neighbour
+    if opts.did_you_mean {
+        let mut alt = items.clone();
+        let mut changed = false;
+        for it in alt.iter_mut() {
+            let Item::Word(w) = it else { continue };
+            if w.literal {
+                continue;
+            }
+            let f = idx.word_forms(w.text.as_bytes(), w.prefix, false);
+            let best = if w.prefix && !f.corrections.is_empty() {
+                // the word being typed, misspelt: its top completion, a
+                // whole word (`climt` → `climate`, not the prefix `clim`)
+                out.completions.first().map(|c| c.word.clone().into_bytes())
+            } else if !f.corrections.is_empty() {
+                f.corrections.first().map(|c| c.0.clone())
+            } else if !w.prefix && f.own_rows > 0 {
+                let variants = idx.spelling_variants(w.text.as_bytes());
+                let own = w.text.as_bytes();
+                idx.neighbors(own, false)
+                    .into_iter()
+                    .filter(|c| !variants.contains(&c.0) && !crate::search_index::plural_pair(&c.0, own) && !f.ranges.iter().any(|r| r.contains(&c.1.start)))
+                    .filter(|c| c.2 >= DID_YOU_MEAN_RATIO * f.own_rows)
+                    .max_by_key(|c| c.2)
+                    .map(|c| c.0)
+            } else {
+                None
+            };
+            if let Some(b) = best {
+                w.text = String::from_utf8_lossy(&b).into_owned();
+                w.prefix = false;
+                changed = true;
+            }
+        }
+        if changed {
+            let alt_spec = spec_for(&cols, alt.clone());
+            let (_, n) = matching(table, &alt_spec, filter, &dicts)?;
+            if n > 0 {
+                out.did_you_mean = Some((render(&alt), n));
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{has_phrase, has_phrase_ascii, has_phrase_words, parse, Item, Phrase, Word};

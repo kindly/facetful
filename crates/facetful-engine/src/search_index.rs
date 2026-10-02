@@ -409,7 +409,7 @@ struct DictIndex {
 /// Per dictionary column of the index: which codes a query word admits, one
 /// byte per code (0 or 1) so the per-row lookup is a branchless OR. `None`
 /// when the word holds no value of that column.
-pub struct ValueSets(Vec<(usize, Option<Vec<u8>>)>);
+pub struct ValueSets(pub(crate) Vec<(usize, Option<Vec<u8>>)>);
 
 /// Interns words while building: text -> id. Words of up to 15 bytes are
 /// keys by value (bytes plus length in one u128), so a lookup is an integer
@@ -1062,6 +1062,12 @@ fn spelling_variants(w: &[u8]) -> Vec<Vec<u8>> {
 const MIN_FORM_ROWS: u64 = 5;
 const FORM_SHARE: u64 = 1000;
 
+/// One word is the other plus `s` or `es` (`news`/`new`): not a typo of it.
+pub fn plural_pair(a: &[u8], b: &[u8]) -> bool {
+    let (s, l) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    l.starts_with(s) && matches!(&l[s.len()..], b"s" | b"es")
+}
+
 /// Corrections kept per word: the most common few…
 const CORRECTIONS: usize = 5;
 /// …each with at least 1/this of the best one's rows (`sprot` keeps `sport`,
@@ -1155,10 +1161,10 @@ impl SearchIndex {
     /// word): for a finished word its other spellings, corrections when it
     /// looks like a typo, and the inflections of all of those; for a word
     /// being typed, corrections only (its prefix already covers its endings).
-    /// A finished word is corrected when it is missing or a word within
-    /// `max_edits` has `TYPO_RATIO` times its rows; a word being typed only
-    /// when nothing starts with it, and then to prefixes one edit away
-    /// (prefix typos are noisy: `helt` is one edit from `help`, `held`, `heat`).
+    /// A word is corrected when it is missing or a word within `max_edits`
+    /// (for the word being typed, a prefix one edit away) has `TYPO_RATIO`
+    /// times its rows; a finished word only while it has under
+    /// `TYPO_MAX_ROWS`. Corrections add to the word as typed, never replace it.
     pub fn word_forms(&self, w: &[u8], prefix: bool, literal: bool) -> Forms {
         let mut forms = self.typo_forms(w, prefix, literal);
         if literal || prefix {
@@ -1199,20 +1205,17 @@ impl SearchIndex {
         forms
     }
 
-    /// The word as typed, and its corrections (see `word_forms`).
-    fn typo_forms(&self, w: &[u8], prefix: bool, literal: bool) -> Forms {
-        let own = if prefix { self.prefix_ids(w) } else { self.word_id(w).map_or(0..0, |id| id..id + 1) };
-        let own_rows = self.rows_in(own.clone());
-        let mut forms = Forms { ranges: if own.is_empty() { vec![] } else { vec![own] }, own_rows, ..Default::default() };
+    /// Words within `max_edits` of `w` (with `prefix`, prefixes one edit
+    /// away), with their id ranges and rows: one edit first, by generating
+    /// every string one edit away (letters and digits) and looking each up;
+    /// two edits, and non-ASCII words, by measuring against words of a
+    /// similar length, only when one edit found nothing.
+    pub fn neighbors(&self, w: &[u8], prefix: bool) -> Vec<(Vec<u8>, Ids, u64)> {
         let k = max_edits(w.len());
-        if literal || k == 0 || (prefix && own_rows > 0) {
-            return forms;
-        }
-        // a spelling variant that exists is not a typo (`organization`)
-        if !prefix && own_rows == 0 && spelling_variants(w).iter().any(|v| self.word_id(v).is_some()) {
-            return forms;
-        }
         let mut cands: Vec<(Vec<u8>, Ids, u64)> = Vec::new();
+        if k == 0 {
+            return cands;
+        }
         if w.is_ascii() {
             // one edit first, even where two are allowed: generate the
             // neighbours and look each one up. A word with a neighbour one
@@ -1257,18 +1260,61 @@ impl SearchIndex {
                 }
             }
         }
-        let best = cands.iter().map(|c| c.2).max().unwrap_or(0);
-        if best == 0 || (!prefix && own_rows > 0 && (own_rows >= TYPO_MAX_ROWS || own_rows * TYPO_RATIO > best)) {
+        cands
+    }
+
+    /// Call `f` with each row (within group `g`) of word `id`'s row list
+    /// (the plain columns; dictionary columns go through `value_sets`).
+    pub fn for_each_row(&self, g: usize, id: u32, mut f: impl FnMut(usize)) {
+        let gi = &self.groups[g];
+        let Ok(k) = gi.ids.binary_search(&id) else { return };
+        let e = gi.entries[k];
+        if e.len == BITMAP {
+            let s = e.start as usize * BITMAP_WORDS;
+            for (w, &bits) in gi.bitmaps[s..s + BITMAP_WORDS].iter().enumerate() {
+                let mut b = bits;
+                while b != 0 {
+                    f(w * 64 + b.trailing_zeros() as usize);
+                    b &= b - 1;
+                }
+            }
+        } else {
+            for &r in &gi.rows[e.start as usize..(e.start + e.len) as usize] {
+                f(r as usize);
+            }
+        }
+    }
+
+    /// The dictionary columns' codes holding word `id`: (column, codes).
+    pub fn dict_codes(&self, id: u32) -> impl Iterator<Item = (usize, &[u32])> {
+        self.dicts.iter().map(move |d| (d.col, &d.codes[d.offsets[id as usize] as usize..d.offsets[id as usize + 1] as usize]))
+    }
+
+    /// A word's other spellings that are words (see `word_forms`).
+    pub fn spelling_variants(&self, w: &[u8]) -> Vec<Vec<u8>> {
+        spelling_variants(w).into_iter().filter(|v| self.word_id(v).is_some()).collect()
+    }
+
+    /// The word as typed, and its corrections (see `word_forms`).
+    fn typo_forms(&self, w: &[u8], prefix: bool, literal: bool) -> Forms {
+        let own = if prefix { self.prefix_ids(w) } else { self.word_id(w).map_or(0..0, |id| id..id + 1) };
+        let own_rows = self.rows_in(own.clone());
+        let mut forms = Forms { ranges: if own.is_empty() { vec![] } else { vec![own] }, own_rows, ..Default::default() };
+        if literal || max_edits(w.len()) == 0 {
             return forms;
         }
+        // a spelling variant that exists is not a typo (`organization`)
+        if !prefix && own_rows == 0 && spelling_variants(w).iter().any(|v| self.word_id(v).is_some()) {
+            return forms;
+        }
+        let mut cands = self.neighbors(w, prefix);
         // a word's own singular or plural is not a correction of it
-        let plural_pair = |a: &[u8], b: &[u8]| {
-            let (s, l) = if a.len() < b.len() { (a, b) } else { (b, a) };
-            l.starts_with(s) && matches!(&l[s.len()..], b"s" | b"es")
-        };
         cands.retain(|c| prefix || !plural_pair(&c.0, w));
         let best = cands.iter().map(|c| c.2).max().unwrap_or(0);
-        if best == 0 {
+        // a word, or the word being typed, is corrected when it is missing or a
+        // neighbour has TYPO_RATIO times its rows (`comun…`, 322 rows, beside
+        // `commun…`); a finished word only while it is rare
+        if best == 0 || (own_rows > 0 && (own_rows * TYPO_RATIO > best || (!prefix && own_rows >= TYPO_MAX_ROWS))) {
             return forms;
         }
         cands.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));

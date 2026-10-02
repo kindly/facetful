@@ -72,6 +72,14 @@ if (before === 0 || mid.result.columns[0].values[0] !== before || after !== befo
   throw new Error(`search counts before/during/after the build: ${before}/${mid.result.columns[0].values[0]}/${after}`);
 }
 if (!(built.bytes > 0) || typeof built.elapsedMs !== "number") throw new Error(`buildSearchIndex reply ${JSON.stringify(built)}`);
+// suggestions through the worker: completions of the word being typed,
+// counted on the rows the filter leaves
+const sg = (await ok({ cmd: "searchSuggest", table: "t", q: "countr", columns: ["country", "owner"], where: "status = 'status_0'", limit: 5, didYouMean: true })).suggestions;
+if (!sg.indexed || !sg.completions.some((c) => c.word === "country" && c.query === "country" && c.rows > 0)) {
+  throw new Error(`searchSuggest: ${JSON.stringify(sg)}`);
+}
+const bad = await send({ cmd: "searchSuggest", table: "t", q: "x", columns: ["country"], where: "nope = 1" });
+if (bad.ok || !/nope/.test(bad.error)) throw new Error(`searchSuggest with a bad filter: ${JSON.stringify(bad)}`);
 await ok({ cmd: "dropSearchIndex", table: "t" });
 
 // loadCsv with a buffer source (the Blob path needs a browser); it must

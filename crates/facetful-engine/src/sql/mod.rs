@@ -153,6 +153,31 @@ pub fn run_batch_with<S: ReadAt>(
         .collect()
 }
 
+/// search()'s suggestions for query `q` over text columns `cols` (see
+/// `exec::search_suggest`), with `filter` (a WHERE condition, e.g. the
+/// app's facets) limiting the rows they are counted on.
+#[cfg(feature = "search")]
+pub fn search_suggest<S: ReadAt>(
+    table: &mut Table<S>,
+    cols: &[usize],
+    q: &str,
+    filter: Option<&str>,
+    opts: &exec::SuggestOptions,
+) -> Result<exec::Suggestions, Diagnostic> {
+    let rows = match filter.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => {
+            let src = format!("select 1 from t where {f}");
+            let q = parse_query(&src)?;
+            let schema = table.catalog().schema.clone();
+            let b = binder::Binder::new(&schema).bind_query(&q)?;
+            Some(exec::filter_rows(table, &b).map_err(|e| Diagnostic::new(format!("execution error: {e}"), q.span))?)
+        }
+        None => None,
+    };
+    exec::search_suggest(table, cols, q, rows.as_deref(), opts)
+        .map_err(|e| Diagnostic::new(format!("execution error: {e}"), span::Span::new(0, 0)))
+}
+
 /// `run_batch_with` over the table alone.
 pub fn run_batch<S: ReadAt>(table: &mut Table<S>, srcs: &[&str]) -> Vec<Result<exec::QueryResult, Diagnostic>> {
     run_batch_with(table, srcs, &mut NoCatalog)

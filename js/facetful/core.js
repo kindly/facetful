@@ -241,6 +241,45 @@ export class Engine {
     return left;
   }
 
+  /** What to offer for a search query typed so far: completions of the word
+   *  being typed (counted on the rows the other words and `where` leave),
+   *  the words corrected automatically, and on request a did-you-mean.
+   *  `where` is a SQL condition (the app's facets), e.g. `region = 'London'`.
+   *  Returns { indexed, rows, prefixRows, completions: [{ word, query, rows }],
+   *  corrected: [{ word, to }], didYouMean: { query, rows } | null }. */
+  searchSuggest(tableHandle, columns, q, { where = "", limit = 8, didYouMean = false } = {}) {
+    if (!this.w.table_search_suggest) throw new Error("this facetful build has no search (lite build)");
+    const idx = columns.map((c) => {
+      const i = this.colByName(tableHandle, c);
+      if (i < 0) throw new Error(`searchSuggest: no column ${JSON.stringify(c)}`);
+      return i;
+    });
+    const qb = this.enc.encode(q);
+    const fb = this.enc.encode(where);
+    const cp = u32(this.w.alloc(idx.length * 4 + 4));
+    const qp = u32(this.w.alloc(qb.byteLength + 1));
+    const fp = u32(this.w.alloc(fb.byteLength + 1));
+    try {
+      new Uint32Array(this.mem(), cp, idx.length).set(idx);
+      new Uint8Array(this.mem(), qp, qb.byteLength).set(qb);
+      new Uint8Array(this.mem(), fp, fb.byteLength).set(fb);
+      const n = this.w.table_search_suggest(tableHandle, cp, idx.length, qp, qb.byteLength, fp, fb.byteLength, limit, didYouMean ? 1 : 0);
+      const out = u32(this.w.alloc(n + 1));
+      try {
+        const m = this.w.search_suggest_read(out, n);
+        const r = JSON.parse(this.dec.decode(new Uint8Array(this.mem(), out, m)));
+        if (r.error) throw new QueryError(r.error);
+        return r;
+      } finally {
+        this.w.dealloc(out, n + 1);
+      }
+    } finally {
+      this.w.dealloc(cp, idx.length * 4 + 4);
+      this.w.dealloc(qp, qb.byteLength + 1);
+      this.w.dealloc(fp, fb.byteLength + 1);
+    }
+  }
+
   /** { pairs, bytes } of a table's finished search index (zeros without one). */
   searchIndexStats(tableHandle) {
     return { pairs: this.w.table_search_index_pairs(tableHandle), bytes: this.w.table_search_index_bytes(tableHandle) };

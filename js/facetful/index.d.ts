@@ -218,6 +218,19 @@ export declare class Facetful {
     options?: { table?: string },
   ): Promise<{ pairs: number; bytes: number; elapsedMs: number }>;
 
+  /**
+   * What to offer for a search query typed so far over these columns:
+   * completions of the word being typed, counted on the rows the other
+   * words and `where` (the app's facets, as a SQL condition) leave; the
+   * words search() corrected by itself; and with `didYouMean` a better
+   * query when there is one. Completions and corrections need the search
+   * index over exactly these columns (`indexed` says whether it answered).
+   */
+  searchSuggest(
+    q: string,
+    options: { columns: string[]; where?: string; limit?: number; didYouMean?: boolean; table?: string },
+  ): Promise<SearchSuggestions>;
+
   /** Drop a table's search index (search() scans again). */
   dropSearchIndex(options?: { table?: string }): Promise<void>;
 
@@ -289,4 +302,20 @@ export declare class Facetful {
 
   /** Terminate the worker. */
   close(): void;
+}
+
+/** What `searchSuggest` offers for a query typed so far. */
+export interface SearchSuggestions {
+  /** whether a search index over these columns answered */
+  indexed: boolean;
+  /** rows the query as typed matches (under `where`) */
+  rows: number;
+  /** rows the word being typed has as a prefix over the whole table: a measure of "too broad" */
+  prefixRows: number;
+  /** completions of the word being typed, most rows first */
+  completions: { word: string; query: string; rows: number }[];
+  /** words search() corrected by itself ("including results for …") */
+  corrected: { word: string; to: string[] }[];
+  /** a better query, when asked for and one exists */
+  didYouMean: { query: string; rows: number } | null;
 }

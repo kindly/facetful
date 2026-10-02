@@ -436,6 +436,96 @@ pub extern "C" fn table_search_index_pairs(t: usize) -> f64 {
     t.search_index().map_or(0.0, |i| i.stats().pairs as f64)
 }
 
+#[cfg(feature = "search")]
+static mut SUGGEST_JSON: String = String::new();
+
+/// search()'s suggestions for query `q` over `n` text columns, counted on
+/// the rows the WHERE condition `filter` keeps (empty: all rows), as JSON:
+/// `{indexed, rows, prefixRows, completions: [{word, query, rows}],
+/// corrected: [{word, to: [...]}], didYouMean: {query, rows} | null}`, or
+/// `{error}`. Returns its byte length; `search_suggest_read` copies it out.
+#[cfg(feature = "search")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn table_search_suggest(
+    t: usize,
+    cols: *const u32,
+    n: usize,
+    q_ptr: *const u8,
+    q_len: usize,
+    f_ptr: *const u8,
+    f_len: usize,
+    limit: u32,
+    did_you_mean: u32,
+) -> u32 {
+    use facetful_engine::sql::exec::SuggestOptions;
+    let t = unsafe { &mut *(t as *mut T) };
+    let cols: Vec<usize> = unsafe { core::slice::from_raw_parts(cols, n) }.iter().map(|&c| c as usize).collect();
+    let q = core::str::from_utf8(unsafe { core::slice::from_raw_parts(q_ptr, q_len) }).unwrap_or("");
+    let f = core::str::from_utf8(unsafe { core::slice::from_raw_parts(f_ptr, f_len) }).unwrap_or("");
+    let opts = SuggestOptions { limit: limit as usize, did_you_mean: did_you_mean != 0 };
+    let mut out = String::new();
+    match facetful_engine::sql::search_suggest(t, &cols, q, Some(f), &opts) {
+        Ok(s) => {
+            out.push_str(&format!("{{\"indexed\":{},\"rows\":{},\"prefixRows\":{},\"completions\":[", s.indexed, s.rows, s.prefix_rows));
+            for (i, c) in s.completions.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"word\":");
+                json_str(&mut out, &c.word);
+                out.push_str(",\"query\":");
+                json_str(&mut out, &c.query);
+                out.push_str(&format!(",\"rows\":{}}}", c.rows));
+            }
+            out.push_str("],\"corrected\":[");
+            for (i, (w, to)) in s.corrected.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"word\":");
+                json_str(&mut out, w);
+                out.push_str(",\"to\":[");
+                for (j, x) in to.iter().enumerate() {
+                    if j > 0 {
+                        out.push(',');
+                    }
+                    json_str(&mut out, x);
+                }
+                out.push_str("]}");
+            }
+            out.push_str("],\"didYouMean\":");
+            match &s.did_you_mean {
+                Some((q, rows)) => {
+                    out.push_str("{\"query\":");
+                    json_str(&mut out, q);
+                    out.push_str(&format!(",\"rows\":{rows}}}"));
+                }
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        Err(d) => {
+            out.push_str("{\"error\":");
+            json_str(&mut out, &d.render(f));
+            out.push('}');
+        }
+    }
+    let len = out.len() as u32;
+    unsafe { *core::ptr::addr_of_mut!(SUGGEST_JSON) = out };
+    len
+}
+
+/// Copy the last `table_search_suggest` JSON into `out` (up to `cap` bytes).
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn search_suggest_read(out: *mut u8, cap: usize) -> u32 {
+    let s = unsafe { &*core::ptr::addr_of!(SUGGEST_JSON) };
+    let n = s.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), out, n) };
+    n as u32
+}
+
 /// The index build's wasm memory size (MB) at four points.
 #[cfg(feature = "search")]
 #[no_mangle]

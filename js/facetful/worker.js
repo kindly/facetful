@@ -248,6 +248,11 @@ self.onmessage = async (e) => {
         await new Promise((r) => setTimeout(r, 0));
       }
       reply({ ok: true, ...engine.searchIndexStats(handle), elapsedMs: performance.now() - t0 });
+    } else if (cmd === "searchSuggest") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error("no table loaded");
+      const { columns, q, where, limit, didYouMean } = e.data;
+      reply({ ok: true, suggestions: engine.searchSuggest(handle, columns, q, { where, limit, didYouMean }) });
     } else if (cmd === "dropSearchIndex") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");

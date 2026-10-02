@@ -501,3 +501,67 @@ fn forms_follow_the_rules() {
     assert_eq!(n(&mut t, "funding "), n(&mut t, "fund "));
     assert_eq!(n(&mut t, "\"fund\""), 5);
 }
+
+#[test]
+fn suggestions() {
+    use facetful_engine::sql::exec::SuggestOptions;
+    use facetful_engine::sql::search_suggest;
+    let opts = SuggestOptions { limit: 8, did_you_mean: true };
+    let n = |t: &mut Table<Vec<u8>>, q: &str, f: &str| count(t, &format!("select count(*) from t where search('{q}', {COLS}){f}"));
+    // without an index: the count, nothing else
+    let mut t = table();
+    let s = search_suggest(&mut t, &[0, 1, 2], "mental hea", None, &opts).unwrap();
+    assert!(!s.indexed && s.completions.is_empty() && s.did_you_mean.is_none());
+    assert_eq!(s.rows as i64, n(&mut t, "mental hea", ""));
+
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    // the word being typed alone: the index's counts
+    let s = search_suggest(&mut t, &[0, 1, 2], "men", None, &opts).unwrap();
+    assert_eq!(s.rows as i64, n(&mut t, "men", ""));
+    let mental = s.completions.iter().find(|c| c.word == "mental").expect("mental completes men");
+    assert_eq!(mental.query, "mental");
+    assert_eq!(mental.rows as i64, n(&mut t, "mental ", ""));
+    assert!(s.prefix_rows > 0);
+    // after other words: counted on the rows they leave, so the completed query's count
+    let s = search_suggest(&mut t, &[0, 1, 2], "mental hea", None, &opts).unwrap();
+    let health = s.completions.iter().find(|c| c.word == "health").expect("health completes hea");
+    assert_eq!(health.query, "mental health");
+    assert_eq!(health.rows as i64, n(&mut t, "mental health ", ""));
+    assert!(s.completions.windows(2).all(|w| w[0].rows >= w[1].rows), "most rows first");
+    // under a filter
+    let mind = " and org = 'Mind'";
+    let s = search_suggest(&mut t, &[0, 1, 2], "hea", Some("org = 'Mind'"), &opts).unwrap();
+    let health = s.completions.iter().find(|c| c.word == "health").unwrap();
+    assert_eq!(health.rows as i64, n(&mut t, "health ", mind));
+    assert_eq!(s.rows as i64, n(&mut t, "hea", mind));
+    // a typo: corrected by itself, and did-you-mean spells it out
+    let s = search_suggest(&mut t, &[0, 1, 2], "mentl helth ", None, &opts).unwrap();
+    assert_eq!(s.corrected, [("mentl".to_string(), vec!["mental".to_string()]), ("helth".to_string(), vec!["health".to_string()])]);
+    let (q, rows) = s.did_you_mean.expect("a better query");
+    assert_eq!(q, "mental health ");
+    assert_eq!(rows as i64, n(&mut t, "mental health ", ""));
+    // the word being typed, when nothing starts with it: completions from
+    // prefixes one edit away, and did-you-mean takes the top one, whole
+    let s = search_suggest(&mut t, &[0, 1, 2], "youth londn", None, &opts).unwrap();
+    assert!(s.completions.iter().any(|c| c.word == "london" && c.query == "youth london"));
+    let (q, rows) = s.did_you_mean.expect("a whole word for the misspelt one being typed");
+    assert_eq!(q, "youth london ");
+    assert_eq!(rows as i64, n(&mut t, "youth london ", ""));
+    // nothing to complete after a space; a quoted word is not respelled
+    assert!(search_suggest(&mut t, &[0, 1, 2], "mental ", None, &opts).unwrap().completions.is_empty());
+    assert!(search_suggest(&mut t, &[0, 1, 2], "\"helth\"", None, &opts).unwrap().did_you_mean.is_none());
+
+    // a real word with a far more common neighbour: not corrected, but offered
+    let mut texts = vec!["community health"; 25];
+    texts.push("heath walk");
+    texts.push("news today");
+    texts.extend(vec!["new things"; 25]);
+    let mut w = word_table(&texts);
+    w.build_search_index(&[0]).unwrap();
+    let s = search_suggest(&mut w, &[0], "heath ", None, &opts).unwrap();
+    assert!(s.corrected.is_empty());
+    assert_eq!(s.rows, 5);
+    assert_eq!(s.did_you_mean, Some(("health ".to_string(), 125)));
+    // a word's own plural is not offered
+    assert!(search_suggest(&mut w, &[0], "news ", None, &opts).unwrap().did_you_mean.is_none());
+}

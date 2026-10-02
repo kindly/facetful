@@ -462,6 +462,43 @@ impl Strategy {
     }
 }
 
+/// The rows a query's WHERE keeps, per row group: one byte per row, `None`
+/// for a group it does not filter. Through the same conjuncts and mask
+/// cache as a query, so a later query with the same filter reuses them.
+pub fn filter_rows<S: ReadAt>(table: &mut Table<S>, q: &BoundQuery) -> Result<Vec<Option<Vec<u8>>>, FormatError> {
+    let folded = fold_query(q, table.catalog());
+    let sh = Shared::new(table, folded.as_ref())?;
+    let mut out = Vec::with_capacity(table.group_count());
+    for g in 0..table.group_count() {
+        let rows = table.group_rows(g);
+        if group_prunable(table, g, &sh.constraints) {
+            out.push(Some(vec![0u8; rows]));
+            continue;
+        }
+        let mut cols: Cols = HashMap::new();
+        let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols)?;
+        // an empty mask means "nothing kept" (see where_mask)
+        out.push(keep.map(|k| if k.is_empty() { vec![0u8; rows] } else { k }));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "search")]
+pub use search::{Completion, SuggestOptions, Suggestions};
+
+/// search()'s suggestions for a query typed so far: see `search::suggest`.
+/// `filter` is the rows the app's other conditions keep (from `filter_rows`).
+#[cfg(feature = "search")]
+pub fn search_suggest<S: ReadAt>(
+    table: &mut Table<S>,
+    cols: &[usize],
+    q: &str,
+    filter: Option<&[Option<Vec<u8>>]>,
+    opts: &SuggestOptions,
+) -> Result<Suggestions, FormatError> {
+    search::suggest(table, cols, q, filter, opts)
+}
+
 pub fn execute<S: ReadAt>(
     table: &mut Table<S>,
     q: &BoundQuery,
