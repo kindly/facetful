@@ -7,7 +7,7 @@
 
 **Where it landed.**
 
-- Search lives **inside facetful**, behind the `search` cargo feature, as a `search()` predicate plus `search_rank()` and `next_words()`. There's no separate module and no extension mechanism.
+- Search lives **inside facetful**, behind the `search` cargo feature, as a `search()` predicate, with `search_rank()` for ordering and a `searchSuggest` call for word completions and did-you-mean. There's no separate module and no extension mechanism.
 - The match set comes from a **word index that the browser builds while the image loads**, held **in memory**. Nothing extra is downloaded. Until the index is ready, and in the lite build, `search()` scans the text instead (built, see *Prototype*).
 - Words match at **word starts**, after spell checking against the data's own vocabulary and expansion to variants and inflections. Every word must match. Ranking is rule-based tiers, Algolia and Meilisearch style, not Lucene-style relevance.
 - **Load time** is the main bottleneck. The plan is to split the image into two aligned files (descriptions and identifiers second) that the engine scans as one table, to stream the load, and to let each app ship its own pre-aggregates for the first screen.
@@ -72,7 +72,7 @@ Measure first. The build may already be hidden behind the download.
 
 **OPFS as a cache, never read on demand.** After the first build, write the whole index to OPFS as one file in its in-memory layout. Later visits read it all back into memory (on the order of 0.1 s for 60 to 80 MB, estimated) instead of rebuilding for 2 to 4 s. A small header holds the image's version, the split id if any, and a format and tokenizer version. Any mismatch, or a missing or unreadable file, means rebuild. Without OPFS, rebuild each visit. Paged reads from OPFS or IndexedDB were considered and left out: they only help when the index doesn't fit in memory, and then the scan path is the fallback.
 
-**What the index changes:** finding rows for a word or prefix becomes a lookup, not a scan. Typo, variant and inflection expansion becomes a union of word lists. Common words get cheap too: `support` (35% of rows) is about a millisecond to turn into a mask, against 40+ ms of scanning with 530K hits. The text scan stays for `search_rank` and `next_words`, which only look at rows that pass the search and the facets.
+**What the index changes:** finding rows for a word or prefix becomes a lookup, not a scan. Typo, variant and inflection expansion becomes a union of word lists. Common words get cheap too: `support` (35% of rows) is about a millisecond to turn into a mask, against 40+ ms of scanning with 530K hits. A text scan would only remain for phrase-order ranking in `search_rank`, if kept, on rows that pass the search and the facets.
 
 **Tokenizer and folding**, shared by the index build, the scan and the converter:
 
@@ -100,7 +100,14 @@ limit 50
 - **Expansion** comes from the vocabulary: spell check, variants, inflections (see *Query model*).
 - **Too broad.** The vocabulary gives a prefix's row count before any work, so `m` or `co` can report "keep typing".
 
-**`search_rank('q')`** is a sort key: tiers for typos, exact over inflected forms, and phrase order and adjacency, checked in the text of rows that reach ORDER BY. **`next_words(col, 'q', n)`** returns the next n words after the typed phrase, for phrase autocomplete through GROUP BY. Its counts are exact and follow the facets. Count per distinct text, not per row, so repeated boilerplate doesn't dominate (*mental health lead training*, 8,056 rows from one funder).
+**`search_rank('q')`** is a sort key: tiers for typos and exact over inflected forms, and possibly phrase order and adjacency (checked in the text of rows that reach ORDER BY; still open).
+
+**Suggestions** come from one engine call, something like `db.searchSuggest(table, q, { where, didYouMean })`, not SQL:
+
+- **Word completions** for the word being typed: the vocabulary's prefix range, the most common candidates counted against the rows the other words and the facets leave (each candidate's row list ANDed with the current mask). Spell-checked candidates come from the same vocabulary.
+- **Did you mean**, on request: the query stays as typed, and the best alternative comes back with its count. Candidates within 1 to 2 edits per word; a few combinations counted through the index; prefer ones that return rows, then fewer edits, then more rows. Also split words (`climatechange`) and joined words (`fund raising`).
+
+**Phrase completion was dropped** (3 October): taken from document text it needs an arbitrary length (one word, two, up to punctuation), its suggestions read oddly (*mental health lead to*), and repeated boilerplate dominates row counts. Query-log systems get phrase ends from users; we have no logs. A single next word after a space would avoid the length question, but needs a text scan or positions, so it is left out unless word completion feels thin.
 </sv-prose>
 
 <sv-prose id="fts-load">
@@ -183,7 +190,7 @@ Without Description Rare (the first image of a split) the build is 0.61 s native
 - Reusing a repeated short value's words within a group: too few repeats in 65,536 rows to pay for hashing every value.
 - **A words file** written beforehand from the image (sorted vocabulary with row counts, and per group each word's row count, 1.47 MB brotli for grantnav) so the browser could allocate exactly and write each row straight into place: correct, but **slower** (1.71 s against 1.31 s natively). Lookups in a prebuilt vocabulary cost more than the normal build's lookups and appends, and the direct fill writes scattered. Sorted ids, its one real gain, come from the renumbering pass instead.
 
-**Positions (estimated, not built).** About 35M word occurrences in the plain columns, about 1 byte each delta-coded plus a count per (word, row): roughly +60 to 70 MB, doubling the index, and perhaps +20 to 30% build time. They would give phrase and adjacency matching from the index, not `next_words`. Phrase ranking stays a text check on the rows that survive the search and the facets, unless that proves too slow.
+**Positions (estimated, not built).** About 35M word occurrences in the plain columns, about 1 byte each delta-coded plus a count per (word, row): roughly +60 to 70 MB, doubling the index, and perhaps +20 to 30% build time. They would give phrase and adjacency matching from the index. Phrase-order ranking, if kept, would be a text check on the rows that survive the search and the facets.
 
 The scan path with word starts is slower than the substring version committed on 30 September (typing `mental health` 1,262 against 566 ms). It only serves until the index is built and in the lite build.
 
@@ -197,7 +204,7 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
 2. **Build peak memory**, if it matters on phones: build each group in halves, or 6-byte pairs.
 3. **Build while loading:** group by group as the image streams in, then the OPFS cache of the whole index.
 4. **Split images with attach.**
-5. `search_rank` and `next_words`.
+5. `searchSuggest`: word completions and did-you-mean, then `search_rank`.
 6. Accent folding with the 958-character table.
 7. Scan path speed, only if the build window or the lite build need it.
 </sv-prose>
