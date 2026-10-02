@@ -257,7 +257,7 @@ fn index_rows_and_pairs() {
         for g in 0..t.group_count() {
             let rows = t.catalog().groups[g].row_count as usize;
             let mut m = vec![0u8; rows];
-            idx.mark_group(&mut t, g, ids.clone(), &idx.value_sets(ids.clone()), &mut m).unwrap();
+            idx.mark_group(&mut t, g, std::slice::from_ref(&ids), &idx.value_sets(std::slice::from_ref(&ids)), &mut m).unwrap();
             got.extend(m.iter().map(|&b| b == 1));
         }
         assert_eq!(got, expected(prefix, |_| true).1, "prefix '{prefix}'");
@@ -317,4 +317,46 @@ fn incremental_build_with_queries_in_between() {
     // a step with no build in progress does nothing
     assert_eq!(t.search_index_step(5).unwrap(), 0);
     assert!(t.search_index().is_some());
+}
+
+#[test]
+fn typos_are_corrected_with_the_index() {
+    let mut t = table();
+    t.masks().set_budget(1 << 20);
+    let q = |t: &mut Table<Vec<u8>>, s: &str| count(t, &format!("select count(*) from t where search('{s}', {COLS})"));
+    // the scan path has no vocabulary, so no corrections
+    assert_eq!(q(&mut t, "helth "), 0);
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    // finished words: a missing word becomes its neighbours within the edit limit
+    for (typo, right) in [
+        ("helth ", "health "),
+        ("sprot ", "sport "),
+        ("mentl helth ", "mental health "),
+        ("climte chnage ", "climate change "),
+        // two edits, allowed from 8 letters, found by measuring against words
+        ("partnrshp ", "partnership "),
+        // non-ASCII, also measured
+        ("münchn ", "münchen "),
+    ] {
+        let want = expected(right, |_| true).0;
+        assert!(want > 0, "{right}");
+        assert_eq!(q(&mut t, typo), want, "'{typo}' should find what '{right}' finds");
+    }
+    // the word being typed: nothing starts with `londn`, so prefixes one edit away count
+    assert_eq!(q(&mut t, "youth londn"), expected("youth london", |_| true).0);
+    // words that exist stay as typed; words under 4 letters are never corrected
+    assert_eq!(q(&mut t, "sport "), expected("sport ", |_| true).0);
+    assert_eq!(q(&mut t, "zzz "), 0);
+    // the scan's cached answer is not reused once the index can correct
+    let mut t = table();
+    t.masks().set_budget(1 << 20);
+    assert_eq!(q(&mut t, "helth "), 0);
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    assert_eq!(q(&mut t, "helth "), expected("health ", |_| true).0);
+    // and the index says what it did
+    let idx = t.search_index().unwrap();
+    let f = idx.word_forms(b"helth", false);
+    assert_eq!(f.own_rows, 0);
+    assert_eq!(f.corrections.iter().map(|c| c.0.as_slice()).collect::<Vec<_>>(), [b"health".as_slice()]);
+    assert!(idx.word_forms(b"health", false).corrections.is_empty());
 }

@@ -54,8 +54,10 @@ pub(super) struct Spec {
     pub(super) scope: String,
     /// computed once per statement rather than once per row group
     dict_tables: DictTables,
-    /// per word, the dictionary codes the index admits (once per statement)
-    value_sets: std::cell::RefCell<HashMap<Word, Rc<crate::search_index::ValueSets>>>,
+    /// per word, its forms in the index (corrections included) and the
+    /// dictionary codes they admit (once per statement)
+    #[allow(clippy::type_complexity)]
+    index_forms: std::cell::RefCell<HashMap<Word, Rc<(crate::search_index::Forms, crate::search_index::ValueSets)>>>,
 }
 
 /// The query's words, folded and split as the index splits text. The last
@@ -114,7 +116,7 @@ pub(super) fn spec_of(b: &Bound) -> Option<Spec> {
     cols.sort_unstable();
     cols.dedup();
     let scope = format!("{cols:?}");
-    Some(Spec { cols, words: words(q), scope, dict_tables: Default::default(), value_sets: Default::default() })
+    Some(Spec { cols, words: words(q), scope, dict_tables: Default::default(), index_forms: Default::default() })
 }
 
 /// The conjunct's mask for row group `g`: the AND of its words' masks.
@@ -129,31 +131,33 @@ pub(super) fn group_mask<S: ReadAt>(
     let idx = table.search_index().filter(|i| i.cols == spec.cols);
     let n_groups = table.group_count();
     for w in &spec.words {
-        // each word's mask is cached on its own (same key on both paths: they
-        // give the same rows), so a keystroke computes only its last word
-        let key = w.key(&spec.scope);
+        // the word's forms in the index, corrections included; once per statement
+        let forms = idx.as_ref().map(|idx| {
+            spec.index_forms
+                .borrow_mut()
+                .entry(w.clone())
+                .or_insert_with(|| {
+                    let f = idx.word_forms(w.text.as_bytes(), w.prefix);
+                    let v = idx.value_sets(&f.ranges);
+                    Rc::new((f, v))
+                })
+                .clone()
+        });
+        // each word's mask is cached on its own, so a keystroke computes only
+        // its last word. Both paths give the same rows for the word as typed,
+        // so they share a key; a corrected word (index only) has its own
+        let corrected = forms.as_ref().is_some_and(|f| !f.0.corrections.is_empty());
+        let key = if corrected { format!("{}~", w.key(&spec.scope)) } else { w.key(&spec.scope) };
         let bits = match table.masks().get(&key, g) {
             Some(b) => b,
             None => {
-                let m = match &idx {
-                    // the index: the word a range of the vocabulary, its rows a union
-                    Some(idx) => {
-                        let ids = if w.prefix {
-                            idx.prefix_ids(w.text.as_bytes())
-                        } else {
-                            idx.word_id(w.text.as_bytes()).map_or(0..0, |id| id..id + 1)
-                        };
-                        let values = spec
-                            .value_sets
-                            .borrow_mut()
-                            .entry(w.clone())
-                            .or_insert_with(|| Rc::new(idx.value_sets(ids.clone())))
-                            .clone();
+                let m = match (&idx, &forms) {
+                    (Some(idx), Some(f)) => {
                         let mut m = vec![0u8; rows];
-                        idx.mark_group(table, g, ids, &values, &mut m)?;
+                        idx.mark_group(table, g, &f.0.ranges, &f.1, &mut m)?;
                         m
                     }
-                    None => {
+                    _ => {
                         // narrow only through a selective superset: checking
                         // row by row is slower than one SIMD scan of the blob
                         // once most rows are candidates (`m` → `me`). Only
@@ -167,7 +171,7 @@ pub(super) fn group_mask<S: ReadAt>(
                     }
                 };
                 let b = Rc::new(pack_bits(&m));
-                if w.prefix {
+                if w.prefix && !corrected {
                     table.masks().put_word(&key, g, n_groups, b.clone(), &spec.scope, &w.text);
                 } else {
                     table.masks().put(&key, g, n_groups, b.clone(), None);

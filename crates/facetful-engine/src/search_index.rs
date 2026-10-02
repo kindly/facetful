@@ -246,9 +246,11 @@ impl GroupIndex {
 
     /// Rows of this group the row lists give `ids` (for the NULL correction
     /// of a nullable dictionary column, a rare path).
-    fn plain_hits(&self, ids: std::ops::Range<u32>, rows: usize) -> Vec<u8> {
+    fn plain_hits(&self, ids: &[std::ops::Range<u32>], rows: usize) -> Vec<u8> {
         let mut m = vec![0u8; rows];
-        self.mark_range(ids, &mut m);
+        for r in ids {
+            self.mark_range(r.clone(), &mut m);
+        }
         m
     }
 
@@ -841,6 +843,112 @@ impl IndexBuilder {
     }
 }
 
+/// A range of word ids (ids are in word order, so a prefix is one).
+pub type Ids = std::ops::Range<u32>;
+
+/// Edits a word of `n` bytes may be off by and still count as a typo of
+/// another: none under 4 (`cat` would find `car`, `hat`, `cut`), 1 up to 7,
+/// 2 from 8. Algolia's defaults; bytes, so before accent folding a
+/// non-ASCII letter costs 2.
+pub fn max_edits(n: usize) -> usize {
+    match n {
+        0..=3 => 0,
+        4..=7 => 1,
+        _ => 2,
+    }
+}
+
+/// Optimal-string-alignment distance (Damerau-Levenshtein where a swap of
+/// two neighbouring letters is one edit) if it is at most `k`.
+pub fn osa_within(a: &[u8], b: &[u8], k: usize) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > k {
+        return None;
+    }
+    let m = b.len();
+    let (mut pp, mut p, mut c) = (vec![0usize; m + 1], (0..=m).collect::<Vec<_>>(), vec![0usize; m + 1]);
+    for i in 1..=a.len() {
+        c[0] = i;
+        let mut best = i;
+        for j in 1..=m {
+            let cost = (a[i - 1] != b[j - 1]) as usize;
+            let mut v = (p[j] + 1).min(c[j - 1] + 1).min(p[j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(pp[j - 2] + 1);
+            }
+            c[j] = v;
+            best = best.min(v);
+        }
+        if best > k {
+            return None;
+        }
+        std::mem::swap(&mut pp, &mut p);
+        std::mem::swap(&mut p, &mut c);
+    }
+    (p[m] <= k).then_some(p[m])
+}
+
+/// Every string one edit (delete, swap, substitute, insert) from ASCII word
+/// `w`, over letters and digits, sorted and without duplicates or `w`. Each
+/// is one binary search away in the vocabulary, which beats measuring the
+/// distance to every word (grantnav: 4 to 14 ms a word natively, 35 ms for
+/// a prefix).
+fn edits1(w: &[u8]) -> Vec<Vec<u8>> {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let n = w.len();
+    let mut out = Vec::with_capacity(n * 2 * ALPHABET.len() + 2 * n);
+    for i in 0..n {
+        let mut d = w.to_vec();
+        d.remove(i);
+        out.push(d);
+        if i + 1 < n {
+            let mut s = w.to_vec();
+            s.swap(i, i + 1);
+            out.push(s);
+        }
+        for &c in ALPHABET {
+            if c != w[i] {
+                let mut s = w.to_vec();
+                s[i] = c;
+                out.push(s);
+            }
+        }
+    }
+    for i in 0..=n {
+        for &c in ALPHABET {
+            let mut s = w.to_vec();
+            s.insert(i, c);
+            out.push(s);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out.retain(|v| v != w);
+    out
+}
+
+/// Corrections kept per word: the most common few…
+const CORRECTIONS: usize = 5;
+/// …each with at least 1/this of the best one's rows (`sprot` keeps `sport`,
+/// not `spot`, `prot`, `sprout`, `sprog`).
+const KEEP_BELOW_BEST: u64 = 100;
+/// A finished word that exists is still corrected when a neighbour has this
+/// many times its rows: `helth` (2 rows) beside `health` (120,730),
+/// `enviromental` (39) beside `environmental` (38,091). A real word like
+/// `heath` (2,258) beside `health` (53 times) is left alone, for
+/// did-you-mean.
+const TYPO_RATIO: u64 = 200;
+
+/// How a query word matches the index: the id ranges of its accepted forms,
+/// and which of them are corrections (with their rows).
+#[derive(Debug, Clone, Default)]
+pub struct Forms {
+    pub ranges: Vec<Ids>,
+    /// rows the word as typed has (for a prefix, summed over its words)
+    pub own_rows: u64,
+    /// corrected words (or, for a word being typed, corrected prefixes)
+    pub corrections: Vec<(Vec<u8>, u64)>,
+}
+
 impl SearchIndex {
     /// Index `cols` (text columns) of every row group, in one go.
     pub fn build<S: ReadAt>(table: &mut Table<S>, cols: &[usize]) -> Result<SearchIndex, FormatError> {
@@ -888,18 +996,97 @@ impl SearchIndex {
         self.counts[id as usize]
     }
 
+    fn rows_in(&self, ids: Ids) -> u64 {
+        self.counts[ids.start as usize..ids.end as usize].iter().map(|&c| c as u64).sum()
+    }
+
+    /// The forms query word `w` (folded) matches: itself (a word, or with
+    /// `prefix` every word starting with it), plus corrections when it looks
+    /// like a typo. A finished word is corrected when it is missing or a word
+    /// within `max_edits` has `TYPO_RATIO` times its rows; a word being typed
+    /// only when nothing starts with it, and then to prefixes one edit away
+    /// (prefix typos are noisy: `helt` is one edit from `help`, `held`, `heat`).
+    pub fn word_forms(&self, w: &[u8], prefix: bool) -> Forms {
+        let own = if prefix { self.prefix_ids(w) } else { self.word_id(w).map_or(0..0, |id| id..id + 1) };
+        let own_rows = self.rows_in(own.clone());
+        let mut forms = Forms { ranges: if own.is_empty() { vec![] } else { vec![own] }, own_rows, corrections: vec![] };
+        let k = max_edits(w.len());
+        if k == 0 || (prefix && own_rows > 0) {
+            return forms;
+        }
+        let mut cands: Vec<(Vec<u8>, Ids, u64)> = Vec::new();
+        if w.is_ascii() {
+            // one edit first, even where two are allowed: generate the
+            // neighbours and look each one up. A word with a neighbour one
+            // edit away does not look further (`comunity` is `community`, not
+            // also `county`, two edits away)
+            for v in edits1(w) {
+                let ids = if prefix { self.prefix_ids(&v) } else { self.word_id(&v).map_or(0..0, |id| id..id + 1) };
+                if !ids.is_empty() {
+                    let rows = self.rows_in(ids.clone());
+                    cands.push((v, ids, rows));
+                }
+            }
+        }
+        if !cands.is_empty() {
+            // found at one edit
+        } else if prefix && !w.is_ascii() {
+            // a non-ASCII prefix (an ASCII one was covered above): distinct
+            // prefixes one shorter, as long, one longer, within 1 edit
+            for len in w.len() - 1..=w.len() + 1 {
+                let mut i = 0;
+                while i < self.words.len() {
+                    let word = self.words.get(i);
+                    if word.len() < len {
+                        i += 1;
+                        continue;
+                    }
+                    let pre = &word[..len];
+                    let end = self.words.partition_from(i, |x| x.starts_with(pre));
+                    if osa_within(w, pre, 1).is_some() {
+                        cands.push((pre.to_vec(), i as u32..end as u32, self.rows_in(i as u32..end as u32)));
+                    }
+                    i = end;
+                }
+            }
+        } else if k >= 2 || !w.is_ascii() {
+            // two edits (words of 8 or more) when one found nothing, and
+            // non-ASCII words: measure against words of a similar length
+            for i in 0..self.words.len() {
+                let word = self.words.get(i);
+                if word != w && word.len().abs_diff(w.len()) <= k && osa_within(w, word, k).is_some() {
+                    cands.push((word.to_vec(), i as u32..i as u32 + 1, self.counts[i] as u64));
+                }
+            }
+        }
+        let best = cands.iter().map(|c| c.2).max().unwrap_or(0);
+        if best == 0 || (!prefix && own_rows > 0 && own_rows * TYPO_RATIO > best) {
+            return forms;
+        }
+        cands.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        cands.retain(|c| c.2 * KEEP_BELOW_BEST >= best);
+        cands.truncate(CORRECTIONS);
+        for (text, ids, rows) in cands {
+            forms.ranges.push(ids);
+            forms.corrections.push((text, rows));
+        }
+        forms
+    }
+
     /// The dictionary codes any of `ids` occurs in, per dictionary column.
     /// Once per query word; every group's lookup reuses it.
-    pub fn value_sets(&self, ids: std::ops::Range<u32>) -> ValueSets {
+    pub fn value_sets(&self, ids: &[Ids]) -> ValueSets {
         ValueSets(
             self.dicts
                 .iter()
                 .map(|d| {
                     let mut t: Option<Vec<u8>> = None;
-                    // the range's codes are one contiguous run of `codes`
-                    let run = d.offsets[ids.start as usize] as usize..d.offsets[ids.end as usize] as usize;
-                    for &code in &d.codes[run] {
-                        t.get_or_insert_with(|| vec![0u8; d.values])[code as usize] = 1;
+                    for r in ids {
+                        // a range's codes are one contiguous run of `codes`
+                        let run = d.offsets[r.start as usize] as usize..d.offsets[r.end as usize] as usize;
+                        for &code in &d.codes[run] {
+                            t.get_or_insert_with(|| vec![0u8; d.values])[code as usize] = 1;
+                        }
                     }
                     (d.col, t)
                 })
@@ -914,11 +1101,13 @@ impl SearchIndex {
         &self,
         table: &mut Table<S>,
         g: usize,
-        ids: std::ops::Range<u32>,
+        ids: &[Ids],
         values: &ValueSets,
         out: &mut [u8],
     ) -> Result<(), FormatError> {
-        self.groups[g].mark_range(ids.clone(), out);
+        for r in ids {
+            self.groups[g].mark_range(r.clone(), out);
+        }
         let rows = out.len();
         for (c, t) in &values.0 {
             let Some(t) = t else { continue };
@@ -946,7 +1135,7 @@ impl SearchIndex {
             };
             // NULL rows carry some code; a hit there is not a hit
             if let Some(v) = valid {
-                let plain = self.groups[g].plain_hits(ids.clone(), rows);
+                let plain = self.groups[g].plain_hits(ids, rows);
                 for (r, o) in out.iter_mut().enumerate() {
                     if v[r / 8] >> (r % 8) & 1 == 0 && plain[r] == 0 {
                         *o = 0;
@@ -984,6 +1173,20 @@ mod tests {
         let mut buf = Vec::new();
         for_each_word(s.as_bytes(), &mut buf, |w| out.push(String::from_utf8(w.to_vec()).unwrap()));
         out
+    }
+
+    #[test]
+    fn edit_distance() {
+        use super::{max_edits, osa_within};
+        assert_eq!(osa_within(b"helth", b"health", 1), Some(1));
+        assert_eq!(osa_within(b"yuoth", b"youth", 1), Some(1), "a swap is one edit");
+        assert_eq!(osa_within(b"chnage", b"change", 1), Some(1));
+        assert_eq!(osa_within(b"enviromental", b"environmental", 2), Some(1));
+        assert_eq!(osa_within(b"sprot", b"spot", 1), Some(1));
+        assert_eq!(osa_within(b"cat", b"dog", 2), None);
+        assert_eq!(osa_within(b"health", b"health", 0), Some(0));
+        assert_eq!(osa_within(b"ab", b"abcd", 1), None, "length gap over k");
+        assert_eq!((max_edits(3), max_edits(4), max_edits(7), max_edits(8)), (0, 1, 1, 2));
     }
 
     #[test]

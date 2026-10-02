@@ -46,6 +46,22 @@ fn main() {
         s.phases[0], s.phases[1], s.phases[2], s.phases[3]
     );
 
+    // spelling: what each word corrects to, and how long finding it takes
+    let show = |w: &str, prefix: bool| {
+        let t0 = Instant::now();
+        let f = idx.word_forms(w.as_bytes(), prefix);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let fixes: Vec<String> = f.corrections.iter().map(|(c, n)| format!("{}{} {n}", String::from_utf8_lossy(c), if prefix { "…" } else { "" })).collect();
+        println!("{:>16}{} | own {:>7} | {:<60} | {:.2} ms", w, if prefix { "…" } else { " " }, f.own_rows, if fixes.is_empty() { "(as typed)".into() } else { fixes.join(", ") }, ms);
+    };
+    for w in ["helth", "heath", "health", "enviromental", "enviroment", "yuoth", "sprot", "londn", "climte", "chnage", "orgnisation",
+              "suport", "comunity", "projcet", "chairty", "organization", "servics", "mentl", "wellbeeing", "acommodation"] {
+        show(w, false);
+    }
+    for w in ["helt", "londn", "enviro", "climt", "comun", "suppo"] {
+        show(w, true);
+    }
+
     // typed queries: every word a prefix, ANDed (word-start matching)
     let groups = t.group_count();
     let sizes: Vec<usize> = (0..groups).map(|g| t.catalog().groups[g].row_count as usize).collect();
@@ -53,13 +69,13 @@ fn main() {
         let t0 = Instant::now();
         let words: Vec<&str> = q.split(' ').filter(|w| !w.is_empty()).collect();
         let id_sets: Vec<_> = words.iter().map(|w| idx.prefix_ids(w.as_bytes())).collect();
-        let value_sets: Vec<_> = id_sets.iter().map(|ids| idx.value_sets(ids.clone())).collect();
+        let value_sets: Vec<_> = id_sets.iter().map(|ids| idx.value_sets(std::slice::from_ref(ids))).collect();
         let mut total = 0usize;
         for (g, &rows) in sizes.iter().enumerate() {
             let mut keep = vec![1u8; rows];
             for (ids, values) in id_sets.iter().zip(&value_sets) {
                 let mut m = vec![0u8; rows];
-                idx.mark_group(&mut t, g, ids.clone(), values, &mut m).unwrap();
+                idx.mark_group(&mut t, g, std::slice::from_ref(ids), values, &mut m).unwrap();
                 for (k, b) in keep.iter_mut().zip(m) {
                     *k &= b;
                 }

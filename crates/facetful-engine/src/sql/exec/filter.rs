@@ -202,10 +202,15 @@ pub(super) fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) 
             };
             #[cfg(feature = "search")]
             {
-                // keyed on the folded words: `Mental Health` and `health mental` are one mask
+                // keyed on the folded words: `Mental Health` and `health mental`
+                // are one mask. With the word index, typos are corrected, so
+                // its answer is keyed apart from the scan's
                 let search = super::search::spec_of(&expr);
                 let key = match &search {
-                    Some(s) => format!("search:{}:{:?}", s.scope, s.words),
+                    Some(s) => {
+                        let ix = table.search_index().is_some_and(|i| i.cols == s.cols);
+                        format!("search:{}:{:?}{}", s.scope, s.words, if ix { "#ix" } else { "" })
+                    }
                     None => key,
                 };
                 Conjunct { key, expr, cols, like, search }
