@@ -123,6 +123,7 @@ impl<S: ReadAt> Table<S> {
     /// over exactly these columns then looks words up instead of scanning.
     #[cfg(feature = "search")]
     pub fn build_search_index(&mut self, cols: &[usize]) -> Result<search_index::IndexStats, FormatError> {
+        self.search_index = None; // its memory back before the new one is built
         let idx = search_index::SearchIndex::build(self, cols)?;
         let stats = idx.stats();
         self.search_index = Some(std::rc::Rc::new(idx));

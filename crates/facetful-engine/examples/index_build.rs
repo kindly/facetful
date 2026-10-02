@@ -52,14 +52,14 @@ fn main() {
     for q in ["m", "me", "men", "mental", "mental h", "mental hea", "mental health", "youth sport london", "climate change adaptation", "support", "community project", "co", "a"] {
         let t0 = Instant::now();
         let words: Vec<&str> = q.split(' ').filter(|w| !w.is_empty()).collect();
-        let id_sets: Vec<&[u32]> = words.iter().map(|w| idx.prefix_ids(w.as_bytes())).collect();
-        let value_sets: Vec<_> = id_sets.iter().map(|ids| idx.value_sets(ids)).collect();
+        let id_sets: Vec<_> = words.iter().map(|w| idx.prefix_ids(w.as_bytes())).collect();
+        let value_sets: Vec<_> = id_sets.iter().map(|ids| idx.value_sets(ids.clone())).collect();
         let mut total = 0usize;
         for (g, &rows) in sizes.iter().enumerate() {
             let mut keep = vec![1u8; rows];
             for (ids, values) in id_sets.iter().zip(&value_sets) {
                 let mut m = vec![0u8; rows];
-                idx.mark_group(&mut t, g, ids, values, &mut m).unwrap();
+                idx.mark_group(&mut t, g, ids.clone(), values, &mut m).unwrap();
                 for (k, b) in keep.iter_mut().zip(m) {
                     *k &= b;
                 }

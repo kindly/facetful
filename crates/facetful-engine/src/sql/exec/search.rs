@@ -108,7 +108,7 @@ pub(super) fn group_mask<S: ReadAt>(
                             .value_sets
                             .borrow_mut()
                             .entry(w.clone())
-                            .or_insert_with(|| Rc::new(idx.value_sets(ids)))
+                            .or_insert_with(|| Rc::new(idx.value_sets(ids.clone())))
                             .clone();
                         let mut m = vec![0u8; rows];
                         idx.mark_group(table, g, ids, &values, &mut m)?;

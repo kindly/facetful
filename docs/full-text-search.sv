@@ -151,39 +151,50 @@ Cold cost per word, split by column (each column as its own query, so each figur
 </sv-prose>
 
 <sv-prose id="fts-index-results">
-## Index prototype (2 October, uncommitted)
+## Index prototype (3 October)
 
-`crates/facetful-engine/src/search_index.rs` builds the word index; `Table::build_search_index(cols)` keeps it, and `search()` uses it when its columns match the index's exactly. Both paths match at **word starts**, folded and split by one tokenizer (`for_each_word`), cache each word's mask under the same key, and give identical rows: `tests/search.rs` checks both against a brute-force reading on every query and keystroke, and breaking the word-boundary check or the prefix lookup fails it. In JS, `buildSearchIndex(table, columns)` and `dropSearchIndex(table)`.
+`crates/facetful-engine/src/search_index.rs` builds the word index; `Table::build_search_index(cols)` keeps it, and `search()` uses it when its columns match the index's exactly. Both paths match at **word starts**, folded and split by one tokenizer (`for_each_word`), cache each word's mask under the same key, and give identical rows: `tests/search.rs` checks both against a brute-force reading on every query and keystroke. In JS, `buildSearchIndex(table, columns)` and `dropSearchIndex(table)`.
 
-**Layout as built.** Plain text columns: per row group, each word's rows (a sorted `u16` array, or a bitmap above 4,096 rows). The build reads the plain columns row by row across columns, so each word's rows arrive in order and a counting sort on word id only has to drop repeats. Dictionary columns: per word, the codes of the values that hold it; a query turns them into a byte table over codes and reads each group's codes. That keeps Description Common, whose 61K values repeat about 17 words each over 820K rows (26M of the 67M word occurrences), out of the build and the row lists. Tokenizing ASCII text finds words from a bitmask of letter-and-digit bytes, and a word of up to 15 bytes becomes its hash key in one 16-byte load, masked and lowercased by setting bit 5 of each byte. A small direct-mapped cache sits in front of the word hash map.
+**Structure.**
+
+- Vocabulary: every folded word, in one byte buffer with end offsets, **in word order**, so a prefix is a range of word ids (two binary searches). Row counts per word.
+- Plain text columns, per row group: the word ids present (ascending) and, parallel to them, each word's rows: a sorted `u16` array, or a 65,536-bit bitmap above 4,096 rows. A prefix is one contiguous run of a group's entries.
+- Dictionary columns: per word, the codes of the values that hold it (CSR). A query turns a word's codes into a byte table and reads each group's codes. That keeps Description Common, whose 61K values repeat about 17 words each over 820K rows (26M of the 67M word occurrences), out of the build and the row lists.
+
+**Build.** The vocabulary is discovered while reading; plain columns are read row by row across columns, so each word's rows arrive in order; pairs (word id, row) go into one buffer per group and a counting sort on word id turns them into lists, dropping repeats. ASCII text finds words from a bitmask of letter-and-digit bytes, and a word of up to 15 bytes becomes its hash key in one 16-byte load. A last pass renumbers the words into word order.
 
 grantnav, five search columns:
 
 | | first version | now, native | now, wasm (Node) |
 |---|---|---|---|
-| build | 2.92 s native, 3.9 s wasm | **1.31 s** | **2.15 s** |
+| build | 2.92 s native, 3.9 s wasm | **1.32 s** | **2.16 s** |
 | (word, row) pairs in row lists | 49.0M | 27.6M, plus 1.65M (word, value) pairs | same |
-| index holds | 79.6 MB | 67.3 MB | 67.2 MB |
-| wasm memory added by the build | +195 MB | | +159 MB (dictionaries, 32 MB, loaded by any query, not counted) |
+| index holds | 79.6 MB | 62.9 MB (lists 58.8, vocabulary 4.2) | 62.9 MB |
 
-Where the native 1.31 s goes: tokenizing and looking up words 0.87 s, row lists 0.27 s, dictionaries 0.11 s. Tried and dropped: a radix sort (slower than the counting sort, more memory) and reusing a repeated short value's words within a group (repeats within 65,536 rows are too rare to pay for hashing every value).
+Without Description Rare (the first image of a split) the build is 0.61 s native and the index about 40 MB.
 
-**Without Description Rare** (the first image of a split) the build is 0.61 s native and the index 40 MB; Description Rare carries most of the rest and arrives with the second image.
+**Memory.** The build raises wasm memory by about 130 MB over the loaded dictionaries, of which the index holds 63 MB. The rest is a high-water mark, not a leak: rebuilding the index twice more leaves wasm memory unchanged, so the engine reuses it. Cutting the peak further would mean building each group in halves or packing pairs into 6 bytes, for perhaps 10 to 20 MB.
 
-Typing with the index (wasm, mask cache on): 5 to 7 ms per keystroke once a word has a few letters, 17 to 35 ms for the first letter of a word (thousands of words). `mental health` letter by letter is 119 ms in total, against 1,262 ms on the scan path. Cold whole queries: 4.8 to 13 ms against 62 to 186 ms scanning. Reading the dictionary columns' codes per word (about 3M lookups) is most of a keystroke; per-group row lists by dictionary value would make that proportional to the hits if it ever matters.
+**Queries (wasm, mask cache on).** 5 to 8 ms per keystroke; the first letter of a word, which covers thousands of words, 5 to 22 ms. `mental health` letter by letter is 91 ms in total, against 1,262 ms on the scan path. Cold whole queries: 4.9 to 12.6 ms (`m` 6.6, `a` 8.7) against 62 to 186 ms scanning. Reading the dictionary columns' codes per word (about 3M lookups) is most of a keystroke.
 
-wasm memory never shrinks, so the build's temporary state (the pair buffer, the word hash map, per-value word lists) stays reserved, now about 58 MB over the dictionaries and the index.
+**Tried and dropped.**
 
-The scan path with word starts is slower than the substring version committed on 30 September (typing `mental health` 1,262 against 566 ms): the kernel checks many hits that fall inside words. It only serves until the index is built and in the lite build.
+- A radix sort on word id: slower than the counting sort, more memory.
+- Reusing a repeated short value's words within a group: too few repeats in 65,536 rows to pay for hashing every value.
+- **A words file** written beforehand from the image (sorted vocabulary with row counts, and per group each word's row count, 1.47 MB brotli for grantnav) so the browser could allocate exactly and write each row straight into place: correct, but **slower** (1.71 s against 1.31 s natively). Lookups in a prebuilt vocabulary cost more than the normal build's lookups and appends, and the direct fill writes scattered. Sorted ids, its one real gain, come from the renumbering pass instead.
 
-Size, unoptimized: lite 291.7 KB gz, full 320.4 KB gz (+29 KB for the scan path and the index).
+**Positions (estimated, not built).** About 35M word occurrences in the plain columns, about 1 byte each delta-coded plus a count per (word, row): roughly +60 to 70 MB, doubling the index, and perhaps +20 to 30% build time. They would give phrase and adjacency matching from the index, not `next_words`. Phrase ranking stays a text check on the rows that survive the search and the facets, unless that proves too slow.
+
+The scan path with word starts is slower than the substring version committed on 30 September (typing `mental health` 1,262 against 566 ms). It only serves until the index is built and in the lite build.
+
+Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path and the index).
 </sv-prose>
 
 <sv-prose id="fts-next">
 ## Next steps
 
-1. **Build memory and speed:** cut the build's temporary state (about 58 MB stays reserved in wasm); tokenize repeated plain values once per group (Recipient has 425K distinct values in 1.5M rows); a faster tokenize-and-hash loop for Description Rare.
-2. **Vocabulary section** in the converter (exact sizes and sorted ids up front), then spell check, variants and inflections over it.
+1. **Spell check, variants and inflections** over the index's vocabulary.
+2. **Build peak memory**, if it matters on phones: build each group in halves, or 6-byte pairs.
 3. **Build while loading:** group by group as the image streams in, then the OPFS cache of the whole index.
 4. **Split images with attach.**
 5. `search_rank` and `next_words`.

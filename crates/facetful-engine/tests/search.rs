@@ -35,7 +35,7 @@ const DESCS: [&str; 7] = [
     "MÜNCHEN partnership",
 ];
 
-/// title plain text (every 13th row NULL), org dict, desc plain text; groups of 64
+/// title plain text (every 13th row NULL), org dict, descr plain text; groups of 64
 fn table() -> Table<Vec<u8>> {
     let schema = Schema {
         columns: vec![
@@ -238,7 +238,7 @@ fn index_rows_and_pairs() {
         for g in 0..t.group_count() {
             let rows = t.catalog().groups[g].row_count as usize;
             let mut m = vec![0u8; rows];
-            idx.mark_group(&mut t, g, ids, &idx.value_sets(ids), &mut m).unwrap();
+            idx.mark_group(&mut t, g, ids.clone(), &idx.value_sets(ids.clone()), &mut m).unwrap();
             got.extend(m.iter().map(|&b| b == 1));
         }
         assert_eq!(got, expected(prefix, |_| true).1, "prefix '{prefix}'");
@@ -264,3 +264,4 @@ fn index_rows_and_pairs() {
     }).sum();
     assert_eq!(idx.stats().value_pairs, value_pairs);
 }
+

@@ -415,6 +415,14 @@ pub extern "C" fn table_build_search_index(t: usize, cols: *const u32, n: usize)
     }
 }
 
+/// The index build's wasm memory size (MB) at four points, packed 16 bits each.
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn table_search_index_mem(t: usize, i: u32) -> u32 {
+    let t = unsafe { &*(t as *const T) };
+    t.search_index().map_or(0, |x| x.stats().mem_mb[i as usize & 3])
+}
+
 /// Bytes the table's word index holds (row lists + vocabulary), 0 without one.
 #[cfg(feature = "search")]
 #[no_mangle]
