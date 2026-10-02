@@ -57,6 +57,23 @@ if (r.result.columns[0].values[0] !== 200) throw new Error("query on materialize
 r = await ok({ cmd: "query", table: "t", sql: "select count(*) as n from t join by_country on t.country = by_country.country" });
 if (r.result.columns[0].values[0] !== 200000) throw new Error(`join count ${r.result.columns[0].values[0]}`);
 
+// the search index builds in the background, a row group at a time: a
+// query sent while it builds is answered first (scanning), with the same
+// count as before and after
+const sq = "select count(*) as n from t where search('country 1', country, owner)";
+const before = (await ok({ cmd: "query", table: "t", sql: sq })).result.columns[0].values[0];
+const order = [];
+const building = ok({ cmd: "buildSearchIndex", table: "t", columns: ["country", "owner"] }).then((x) => (order.push("build"), x));
+const during = ok({ cmd: "query", table: "t", sql: sq }).then((x) => (order.push("query"), x));
+const [built, mid] = await Promise.all([building, during]);
+if (order[0] !== "query") throw new Error(`a query waited for the whole index build: ${order}`);
+const after = (await ok({ cmd: "query", table: "t", sql: sq })).result.columns[0].values[0];
+if (before === 0 || mid.result.columns[0].values[0] !== before || after !== before) {
+  throw new Error(`search counts before/during/after the build: ${before}/${mid.result.columns[0].values[0]}/${after}`);
+}
+if (!(built.bytes > 0) || typeof built.elapsedMs !== "number") throw new Error(`buildSearchIndex reply ${JSON.stringify(built)}`);
+await ok({ cmd: "dropSearchIndex", table: "t" });
+
 // loadCsv with a buffer source (the Blob path needs a browser); it must
 // reproduce the checked-in image's row count and be queryable by name
 const csv = fs.readFileSync(new URL("data-200000.csv", spike));

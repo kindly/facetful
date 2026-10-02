@@ -681,18 +681,35 @@ fn invert_dict(col: usize, per_value: &[Vec<u32>], n_words: usize) -> DictIndex 
     DictIndex { col, values: per_value.len(), offsets, codes }
 }
 
-impl SearchIndex {
-    /// Index `cols` (text columns) of every row group.
-    pub fn build<S: ReadAt>(table: &mut Table<S>, cols: &[usize]) -> Result<SearchIndex, FormatError> {
+/// A build in progress: `new` reads the dictionary columns, `add_group`
+/// indexes one row group (in order), `finish` renumbers the words and
+/// returns the index. Between groups the caller is free to do other work:
+/// the worker answers queries, or (streaming) waits for the next group.
+pub struct IndexBuilder {
+    cols: Vec<usize>,
+    plain: Vec<usize>,
+    vocab: Vocab,
+    /// per dictionary column: each value's word ids, and rows per value
+    dict_words: FxMap<usize, (Vec<Vec<u32>>, Vec<u32>)>,
+    groups: Vec<GroupIndex>,
+    pairs: Vec<u64>,
+    scratch: Scratch,
+    buf: Vec<u8>,
+    masks: Vec<u64>,
+    phases: [f64; 4],
+    mem: [u32; 4],
+}
+
+impl IndexBuilder {
+    /// Start indexing `cols` (text columns): the dictionary columns are
+    /// tokenized here, once per distinct value.
+    pub fn new<S: ReadAt>(table: &mut Table<S>, cols: &[usize]) -> Result<IndexBuilder, FormatError> {
         let mut cols = cols.to_vec();
         cols.sort_unstable();
         cols.dedup();
+        let t = now();
         let mut vocab = Vocab::default();
         let mut buf = Vec::new();
-        // dictionary columns: each distinct value's word ids, tokenized once
-        let mut phases = [0.0f64; 4];
-        let t = now();
-        // per dictionary column: each value's word ids, and rows per value
         let mut dict_words: FxMap<usize, (Vec<Vec<u32>>, Vec<u32>)> = FxMap::default();
         for &c in &cols {
             if table.catalog().schema.columns[c].is_dict() {
@@ -711,56 +728,71 @@ impl SearchIndex {
                 dict_words.insert(c, (per_value, vec![0u32; n]));
             }
         }
-        phases[0] = since(&t);
-        let mut mem = [mem_mb(), 0, 0, 0];
-        let mut groups = Vec::with_capacity(table.group_count());
+        let plain: Vec<usize> = cols.iter().copied().filter(|c| !dict_words.contains_key(c)).collect();
         // about one word per 7 bytes of text: one buffer sized for the largest
         // group, allocated once (growing it, or regrowing it per group, left
         // holes in wasm's never-returned memory)
         let largest_text = (0..table.group_count())
-            .map(|g| {
-                cols.iter()
-                    .filter(|c| !dict_words.contains_key(c))
-                    .map(|&c| table.catalog().groups[g].cols[c].seg_lens[1] as usize)
-                    .sum::<usize>()
-            })
+            .map(|g| plain.iter().map(|&c| table.catalog().groups[g].cols[c].seg_lens[1] as usize).sum::<usize>())
             .max()
             .unwrap_or(0);
-        let mut pairs: Vec<u64> = Vec::with_capacity(largest_text / 7);
-        let mut scratch = Scratch::default();
-        let mut masks = Vec::new();
-        for g in 0..table.group_count() {
-            let t = now();
-            let rows = table.catalog().groups[g].row_count as usize;
-            pairs.clear();
-            let plain: Vec<usize> = cols.iter().copied().filter(|c| !dict_words.contains_key(c)).collect();
-            for (&c, (_, value_rows)) in dict_words.iter_mut() {
-                // rows per value, for the words' row counts
-                let valid = table.validity(g, c)?;
-                for (r, &code) in table.codes(g, c, rows)?.iter().enumerate() {
-                    if valid.as_ref().is_none_or(|v| v[r / 8] >> (r % 8) & 1 == 1) {
-                        value_rows[code as usize] += 1;
-                    }
+        let mut phases = [0.0f64; 4];
+        phases[0] = since(&t);
+        Ok(IndexBuilder {
+            cols,
+            plain,
+            vocab,
+            dict_words,
+            groups: Vec::with_capacity(table.group_count()),
+            pairs: Vec::with_capacity(largest_text / 7),
+            scratch: Scratch::default(),
+            buf,
+            masks: Vec::new(),
+            phases,
+            mem: [mem_mb(), 0, 0, 0],
+        })
+    }
+
+    /// Row groups indexed so far; the next `add_group` takes this one.
+    pub fn groups_done(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Index the next row group.
+    pub fn add_group<S: ReadAt>(&mut self, table: &mut Table<S>) -> Result<(), FormatError> {
+        let g = self.groups.len();
+        let t = now();
+        let rows = table.catalog().groups[g].row_count as usize;
+        for (&c, (_, value_rows)) in self.dict_words.iter_mut() {
+            // rows per value, for the words' row counts
+            let valid = table.validity(g, c)?;
+            for (r, &code) in table.codes(g, c, rows)?.iter().enumerate() {
+                if valid.as_ref().is_none_or(|v| v[r / 8] >> (r % 8) & 1 == 1) {
+                    value_rows[code as usize] += 1;
                 }
             }
-            // plain columns row by row, across columns: every word's rows then
-            // arrive in ascending order, so `from_pairs` only drops repeats
-            each_row_word(table, g, &plain, &mut buf, &mut masks, |r, k| {
-                pairs.push((vocab.key_id(k) as u64) << 16 | r as u64)
-            })?;
-            phases[1] += since(&t);
-            let t = now();
-            groups.push(GroupIndex::from_pairs(&pairs, &mut scratch));
-            phases[2] += since(&t);
-            if g + 1 == table.group_count() / 2 {
-                mem[1] = mem_mb();
-            }
         }
+        // plain columns row by row, across columns: every word's rows then
+        // arrive in ascending order, so `from_pairs` only drops repeats
+        let IndexBuilder { vocab, pairs, buf, masks, .. } = self;
+        pairs.clear();
+        each_row_word(table, g, &self.plain, buf, masks, |r, k| pairs.push((vocab.key_id(k) as u64) << 16 | r as u64))?;
+        self.phases[1] += since(&t);
+        let t = now();
+        self.groups.push(GroupIndex::from_pairs(&self.pairs, &mut self.scratch));
+        self.phases[2] += since(&t);
+        if g + 1 == table.group_count() / 2 {
+            self.mem[1] = mem_mb();
+        }
+        Ok(())
+    }
+
+    /// Renumber the words into word order (a prefix becomes an id range),
+    /// invert the dictionary columns, and count each word's rows.
+    pub fn finish(self) -> SearchIndex {
+        let IndexBuilder { cols, vocab, mut dict_words, mut groups, mut phases, mut mem, .. } = self;
         mem[2] = mem_mb();
         let t = now();
-        drop(pairs);
-        drop(scratch);
-        // renumber the words into word order: a prefix becomes an id range
         let unsorted = vocab.into_words();
         let mut order: Vec<u32> = (0..unsorted.len() as u32).collect();
         order.sort_unstable_by(|&a, &b| unsorted.get(a as usize).cmp(unsorted.get(b as usize)));
@@ -805,7 +837,18 @@ impl SearchIndex {
         }
         phases[3] = since(&t);
         mem[3] = mem_mb();
-        Ok(SearchIndex { cols, words, counts, groups, dicts, phases, mem })
+        SearchIndex { cols, words, counts, groups, dicts, phases, mem }
+    }
+}
+
+impl SearchIndex {
+    /// Index `cols` (text columns) of every row group, in one go.
+    pub fn build<S: ReadAt>(table: &mut Table<S>, cols: &[usize]) -> Result<SearchIndex, FormatError> {
+        let mut b = IndexBuilder::new(table, cols)?;
+        while b.groups_done() < table.group_count() {
+            b.add_group(table)?;
+        }
+        Ok(b.finish())
     }
 
     pub fn stats(&self) -> IndexStats {

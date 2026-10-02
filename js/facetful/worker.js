@@ -237,6 +237,22 @@ self.onmessage = async (e) => {
         await new Promise((r) => setTimeout(r, 0));
       }
       reply({ ok: true, bytes });
+    } else if (cmd === "buildSearchIndex") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error("no table loaded");
+      const t0 = performance.now();
+      engine.beginSearchIndex(handle, e.data.columns);
+      // a row group at a time, yielding between groups so queued queries run
+      // meanwhile (scanning, until the index is finished)
+      while (engine.stepSearchIndex(handle, 1) > 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      reply({ ok: true, ...engine.searchIndexStats(handle), elapsedMs: performance.now() - t0 });
+    } else if (cmd === "dropSearchIndex") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error("no table loaded");
+      engine.dropSearchIndex(handle);
+      reply({ ok: true });
     } else if (cmd === "setMaskBudget") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");

@@ -56,6 +56,10 @@ pub struct Table<S: ReadAt> {
     /// The word index search() uses when its columns match (search_index.rs).
     #[cfg(feature = "search")]
     search_index: Option<std::rc::Rc<search_index::SearchIndex>>,
+    /// A word index being built a row group at a time; search() scans
+    /// until it is finished.
+    #[cfg(feature = "search")]
+    search_builder: Option<search_index::IndexBuilder>,
 }
 
 /// Default derived-table budget: a few large rollups, dozens of facet-sized ones.
@@ -116,24 +120,60 @@ impl<S: ReadAt> Table<S> {
             derived_misses: 0,
             #[cfg(feature = "search")]
             search_index: None,
+            #[cfg(feature = "search")]
+            search_builder: None,
         })
     }
 
     /// Build the word index over `cols` (text columns) and keep it: search()
     /// over exactly these columns then looks words up instead of scanning.
+    /// In one go; `begin_search_index` and `search_index_step` do the same a
+    /// row group at a time.
     #[cfg(feature = "search")]
     pub fn build_search_index(&mut self, cols: &[usize]) -> Result<search_index::IndexStats, FormatError> {
+        self.begin_search_index(cols)?;
+        self.search_index_step(usize::MAX)?;
+        Ok(self.search_index.as_ref().expect("finished").stats())
+    }
+
+    /// Start building the word index over `cols`, replacing any index or
+    /// build in progress. The dictionary columns are read here.
+    #[cfg(feature = "search")]
+    pub fn begin_search_index(&mut self, cols: &[usize]) -> Result<(), FormatError> {
         self.search_index = None; // its memory back before the new one is built
-        let idx = search_index::SearchIndex::build(self, cols)?;
-        let stats = idx.stats();
-        self.search_index = Some(std::rc::Rc::new(idx));
-        Ok(stats)
+        self.search_builder = None;
+        self.search_builder = Some(search_index::IndexBuilder::new(self, cols)?);
+        Ok(())
+    }
+
+    /// Index up to `groups` more row groups of the build in progress. The
+    /// index takes over when the last group is done. Returns the row groups
+    /// still to index (0 when finished, or when no build is in progress).
+    #[cfg(feature = "search")]
+    pub fn search_index_step(&mut self, groups: usize) -> Result<usize, FormatError> {
+        let Some(mut b) = self.search_builder.take() else { return Ok(0) };
+        let total = self.group_count();
+        let mut n = 0;
+        while n < groups && b.groups_done() < total {
+            if let Err(e) = b.add_group(self) {
+                return Err(e); // the build is dropped; search() keeps scanning
+            }
+            n += 1;
+        }
+        let left = total - b.groups_done();
+        if left == 0 {
+            self.search_index = Some(std::rc::Rc::new(b.finish()));
+        } else {
+            self.search_builder = Some(b);
+        }
+        Ok(left)
     }
 
     /// Drop the word index; search() scans again.
     #[cfg(feature = "search")]
     pub fn drop_search_index(&mut self) {
         self.search_index = None;
+        self.search_builder = None;
     }
 
     #[cfg(feature = "search")]

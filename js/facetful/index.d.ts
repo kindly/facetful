@@ -207,6 +207,20 @@ export declare class Facetful {
   /** Delete an OPFS file (closes any open handles on it first). */
   removeOpfs(path: string): Promise<void>;
 
+  /**
+   * Build the word index search() uses over these text columns, in the
+   * background: a row group at a time, with queries answered in between
+   * (search() scans until the index is finished). Resolves when it is in use.
+   * Not in the lite build.
+   */
+  buildSearchIndex(
+    columns: string[],
+    options?: { table?: string },
+  ): Promise<{ pairs: number; bytes: number; elapsedMs: number }>;
+
+  /** Drop a table's search index (search() scans again). */
+  dropSearchIndex(options?: { table?: string }): Promise<void>;
+
   /** Pre-touch columns into the segment cache; queries interleave with warming. */
   warm(cols: string[], options?: { table?: string }): Promise<{ bytes: number }>;
 

@@ -208,21 +208,42 @@ export class Engine {
 
   /** Build the search() word index over these text columns and keep it on
    *  the table: search() over exactly these columns then looks words up
-   *  instead of scanning. Returns { pairs, bytes }. Needs a build with the
-   *  `search` feature. */
+   *  instead of scanning. In one go (blocks for the whole build); see
+   *  beginSearchIndex/stepSearchIndex for a row group at a time. Returns
+   *  { pairs, bytes }. Needs a build with the `search` feature. */
   buildSearchIndex(tableHandle, columns) {
-    if (!this.w.table_build_search_index) throw new Error("this facetful build has no search index (lite build)");
+    this.beginSearchIndex(tableHandle, columns);
+    if (this.stepSearchIndex(tableHandle, 0xffffffff) !== 0) throw new Error("buildSearchIndex: did not finish");
+    return { pairs: this.w.table_search_index_pairs(tableHandle), bytes: this.w.table_search_index_bytes(tableHandle) };
+  }
+
+  /** Start building the search index a row group at a time (replacing any
+   *  index or build in progress). search() scans until it is finished. */
+  beginSearchIndex(tableHandle, columns) {
+    if (!this.w.table_search_index_begin) throw new Error("this facetful build has no search index (lite build)");
     const idx = columns.map((c) => {
       const i = this.colByName(tableHandle, c);
-      if (i < 0) throw new Error(`buildSearchIndex: no column ${JSON.stringify(c)}`);
+      if (i < 0) throw new Error(`search index: no column ${JSON.stringify(c)}`);
       return i;
     });
     const p = u32(this.w.alloc(idx.length * 4));
     new Uint32Array(this.mem(), p, idx.length).set(idx);
-    const pairs = this.w.table_build_search_index(tableHandle, p, idx.length);
+    const rc = this.w.table_search_index_begin(tableHandle, p, idx.length);
     this.w.dealloc(p, idx.length * 4);
-    if (pairs < 0) throw new Error("buildSearchIndex: could not read the table");
-    return { pairs, bytes: this.w.table_search_index_bytes(tableHandle) };
+    if (rc < 0) throw new Error("search index: could not read the table's dictionaries");
+  }
+
+  /** Index up to `groups` more row groups; returns the row groups left (0:
+   *  finished, the index is in use). */
+  stepSearchIndex(tableHandle, groups = 1) {
+    const left = this.w.table_search_index_step(tableHandle, groups);
+    if (left < 0) throw new Error("search index: could not read the table");
+    return left;
+  }
+
+  /** { pairs, bytes } of a table's finished search index (zeros without one). */
+  searchIndexStats(tableHandle) {
+    return { pairs: this.w.table_search_index_pairs(tableHandle), bytes: this.w.table_search_index_bytes(tableHandle) };
   }
 
   /** Drop a table's search index; search() scans again. */

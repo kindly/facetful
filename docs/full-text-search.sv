@@ -201,7 +201,7 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
 ## Next steps
 
 1. ~~Last word only as a prefix~~ (done 3 October): finished words match whole words; the last word is a prefix unless the query ends in a separator. On grantnav `mental health` went from 45,916 to 45,825 rows (`mental` no longer matches `mentally`).
-2. **Incremental build.** Start, index row group g, finish: the worker stays free between groups, so facet clicks and searches run (scanning) while the index builds in the background. Today's build is one synchronous call that blocks the worker for about 2 s on grantnav. This is also the interface step 7 calls.
+2. ~~Incremental build~~ (done 3 October): `IndexBuilder` (`new`, `add_group`, `finish`); `Table::begin_search_index` / `search_index_step`; in JS `beginSearchIndex` / `stepSearchIndex` on the core, and `db.buildSearchIndex(columns)` in the worker, which steps a row group at a time and yields between groups. Queries run meanwhile, scanning; the worker smoke checks a query sent mid-build is answered first, with the same count. On grantnav (wasm) a query waits at most one step: begin 198 ms (the dictionaries), a row group 71 ms, the last step 165 ms (with the renumbering). Begin and finish could be split further if that ever matters.
 3. **Spell checker** over the index's vocabulary: length-based edit limits, the frequency filters, automatic expansion for clear typos, did-you-mean for real words, typo-tolerant completion of the word being typed.
 4. **Inflections and UK/US variants.**
 5. **`searchSuggest`:** word completions ranked by co-occurrence with the current results and facets; did-you-mean on request.

@@ -284,3 +284,37 @@ fn index_rows_and_pairs() {
     assert_eq!(idx.stats().value_pairs, value_pairs);
 }
 
+
+#[test]
+fn incremental_build_with_queries_in_between() {
+    let mut t = table();
+    t.masks().set_budget(1 << 20);
+    let groups = t.group_count();
+    assert!(groups > 2, "the test table has several row groups");
+    t.begin_search_index(&[0, 1, 2]).unwrap();
+    let mut left = groups;
+    let mut step = 0;
+    while left > 0 {
+        // between steps the index is not there yet: search() scans, correctly
+        assert!(t.search_index().is_none());
+        let q = QUERIES[step % QUERIES.len()];
+        let got = count(&mut t, &format!("select count(*) from t where search('{q}', {COLS})"));
+        assert_eq!(got, expected(q, |_| true).0, "during the build, step {step}: search('{q}')");
+        left = t.search_index_step(1).unwrap();
+        assert_eq!(left, groups - step - 1);
+        step += 1;
+    }
+    // finished: the index answers, the same rows as a one-shot build
+    let idx = t.search_index().expect("built");
+    let mut t2 = table();
+    let one = SearchIndex::build(&mut t2, &[0, 1, 2]).unwrap();
+    assert_eq!(idx.stats().pairs, one.stats().pairs);
+    assert_eq!(idx.stats().words, one.stats().words);
+    for q in QUERIES {
+        let got = count(&mut t, &format!("select count(*) from t where search('{q}', {COLS})"));
+        assert_eq!(got, expected(q, |_| true).0, "after the build: search('{q}')");
+    }
+    // a step with no build in progress does nothing
+    assert_eq!(t.search_index_step(5).unwrap(), 0);
+    assert!(t.search_index().is_some());
+}

@@ -140,6 +140,22 @@ export class Facetful {
     return this._call({ cmd: "removeOpfs", path });
   }
 
+  /**
+   * Build the word index search() uses over these text columns, in the
+   * background: a row group at a time, with queries answered in between
+   * (search() scans until the index is finished). Resolves when it is in
+   * use. Needs a build with search (not the lite build).
+   */
+  async buildSearchIndex(columns, { table } = {}) {
+    const { pairs, bytes, elapsedMs } = await this._call({ cmd: "buildSearchIndex", columns, table });
+    return { pairs, bytes, elapsedMs };
+  }
+
+  /** Drop a table's search index (search() scans again). */
+  async dropSearchIndex({ table } = {}) {
+    await this._call({ cmd: "dropSearchIndex", table });
+  }
+
   /** Pre-touch columns into the cache (background; queries interleave). */
   async warm(cols, { table } = {}) {
     const { bytes } = await this._call({ cmd: "warm", cols, table });
