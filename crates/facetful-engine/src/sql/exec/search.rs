@@ -727,6 +727,205 @@ pub(super) fn suggest<S: ReadAt>(
     Ok(out)
 }
 
+// ---- search_rank: field weights, then exact, then typo ----
+
+/// A query word missing from a row (search_rank without search()) costs this
+/// much weight, so such rows sort after every row that has it.
+const MISSING_WEIGHT: u64 = 1000;
+
+thread_local! {
+    /// The row group `execute` is scanning, and the table's word index: an
+    /// ORDER BY evaluated over a whole group (or its first rows) lines up
+    /// with the index row for row.
+    static RANK_GROUP: std::cell::RefCell<Option<RankGroup>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One search_rank word looked up in the index: its forms, and per
+/// dictionary column holding it the tags of its values (see `value_tags`).
+struct RankForms {
+    forms: Forms,
+    values: Vec<(usize, Vec<u8>)>,
+}
+
+thread_local! {
+    /// search_rank's words for the statement being run, by (word, prefix,
+    /// literal): looked up once, not once per row group.
+    static RANK_FORMS: std::cell::RefCell<HashMap<(String, bool, bool), Rc<RankForms>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The tag of a word id among a word's forms: reached, exact, not a typo.
+fn rank_tag(f: &Forms, id: u32) -> u8 {
+    let within = |rs: &[crate::search_index::Ids]| rs.iter().any(|r| r.contains(&id));
+    HIT | if within(&f.exact) { EXACT } else { 0 } | if within(&f.typo) { 0 } else { NOT_TYPO }
+}
+
+fn forms_of(idx: &SearchIndex, w: &Word) -> Rc<RankForms> {
+    RANK_FORMS.with(|c| {
+        c.borrow_mut()
+            .entry((w.text.clone(), w.prefix, w.literal))
+            .or_insert_with(|| {
+                let forms = idx.word_forms(w.text.as_bytes(), w.prefix, w.literal);
+                let mut values = idx.value_tags(&forms.ranges, |id| rank_tag(&forms, id));
+                values.retain(|(_, t)| t.iter().any(|&x| x != 0));
+                Rc::new(RankForms { forms, values })
+            })
+            .clone()
+    })
+}
+
+const HIT: u8 = 1;
+const EXACT: u8 = 2;
+const NOT_TYPO: u8 = 4;
+
+/// Clears the rank group when a query's scan ends, however it ends.
+pub(super) struct RankScope;
+impl RankScope {
+    pub(super) fn new() -> RankScope {
+        RANK_GROUP.with(|c| *c.borrow_mut() = None);
+        RANK_FORMS.with(|c| c.borrow_mut().clear());
+        RankScope
+    }
+}
+impl Drop for RankScope {
+    fn drop(&mut self) {
+        RANK_GROUP.with(|c| *c.borrow_mut() = None);
+        RANK_FORMS.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// (index, row group, its rows, the rows its WHERE keeps)
+type RankGroup = (Rc<SearchIndex>, usize, usize, Option<Rc<Vec<u8>>>);
+
+pub(super) fn set_rank_group(idx: Option<Rc<SearchIndex>>, g: usize, rows: usize, keep: Option<&[u8]>) {
+    RANK_GROUP.with(|c| *c.borrow_mut() = idx.map(|i| (i, g, rows, keep.map(|k| Rc::new(k.to_vec())))));
+}
+
+/// search_rank's words: the query's words, and its phrases' words as
+/// quoted words (phrases themselves do not rank).
+fn rank_words(q: &str) -> Vec<Word> {
+    let mut out = Vec::new();
+    for it in parse(q) {
+        match it {
+            Item::Word(w) => out.push(w),
+            Item::Phrase(p) => out.extend(p.word_items()),
+        }
+    }
+    out
+}
+
+/// search_rank('q', col[, weight], …): a sort key, lower first. Per row:
+/// 1. the sum over the query's words of the lowest weight among the fields
+///    the word matched in (a column's weight is the number after it, or its
+///    place in the list, from 1); a word the row lacks weighs
+///    `MISSING_WEIGHT`;
+/// 2. then the words matched only inexactly: the word being typed only as
+///    the start of a longer word (plurals and other spellings are exact);
+/// 3. then the words matched only through a typo correction.
+///
+/// Through the word index (when it covers these columns and the rows are
+/// the scan's own), the words match as search() matches them, with
+/// respellings, inflections and corrections; otherwise each row's fields are
+/// read and the words match as typed.
+pub(super) fn eval_rank(args: &[Bound], ctx: &GroupCtx) -> VV {
+    let rows = ctx.rows;
+    let Bound::Str(q) = &args[0] else { unreachable!("the binder checks the query literal") };
+    // (column, weight)
+    let mut fields: Vec<(usize, u64)> = Vec::new();
+    for a in &args[1..] {
+        match a {
+            Bound::Column { index, .. } => fields.push((*index, fields.len() as u64 + 1)),
+            Bound::Number(n, _) => fields.last_mut().expect("the binder checks a weight follows a column").1 = *n as u64,
+            _ => unreachable!("the binder checks search_rank's arguments"),
+        }
+    }
+    let weight_of = |c: usize| fields.iter().filter(|f| f.0 == c).map(|f| f.1).min().unwrap_or(MISSING_WEIGHT);
+    let words = rank_words(q);
+    let mut cols: Vec<usize> = fields.iter().map(|f| f.0).collect();
+    cols.sort_unstable();
+    cols.dedup();
+    // the columns' values for these rows: with the index, only the dictionary
+    // columns' codes are read (plain columns come from the row lists)
+    let lanes_of = |cols: &mut dyn Iterator<Item = usize>| -> HashMap<usize, VV> { cols.map(|c| (c, eval_vec(&Bound::Column { index: c, ty: Ty::Text }, ctx))).collect() };
+    let mut weight = vec![0u64; rows];
+    let mut inexact = vec![0u64; rows];
+    let mut typos = vec![0u64; rows];
+    let group = RANK_GROUP.with(|c| c.borrow().clone()).filter(|(i, _, n, _)| i.cols == cols && rows <= *n);
+    match group {
+        Some((idx, g, _, keep)) => {
+            // only the rows the WHERE keeps are ranked (the others get any key)
+            let live: Vec<u32> = match &keep {
+                Some(k) => (0..rows as u32).filter(|&i| k[i as usize] != 0).collect(),
+                None => (0..rows as u32).collect(),
+            };
+            let lanes = lanes_of(&mut cols.iter().copied().filter(|c| !idx.plain.contains(c)));
+            let field_weight: Vec<u16> = idx.plain.iter().map(|&c| weight_of(c) as u16).collect();
+            let mut best = vec![0u16; rows];
+            let mut tags = vec![0u8; rows];
+            for w in &words {
+                let rf = forms_of(&idx, w);
+                let f = &rf.forms;
+                best.fill(MISSING_WEIGHT as u16);
+                tags.fill(0);
+                // plain fields from the per-field row lists, dictionary columns by value
+                for r in &f.ranges {
+                    idx.each_field_row(g, r.clone(), |id, field, row| {
+                        if row < rows {
+                            best[row] = best[row].min(field_weight[field as usize]);
+                            tags[row] |= rank_tag(f, id);
+                        }
+                    });
+                }
+                for (c, t) in &rf.values {
+                    let Some(v) = lanes.get(c) else { continue };
+                    let Data::Codes { codes, .. } = &v.data else { continue };
+                    let wt = weight_of(*c) as u16;
+                    for &i in &live {
+                        let i = i as usize;
+                        let tc = t[codes[i] as usize];
+                        if tc != 0 && v.is_valid(i) {
+                            best[i] = best[i].min(wt);
+                            tags[i] |= tc;
+                        }
+                    }
+                }
+                for &i in &live {
+                    let i = i as usize;
+                    weight[i] += best[i] as u64;
+                    let found = tags[i] != 0;
+                    inexact[i] += (found && tags[i] & EXACT == 0) as u64;
+                    typos[i] += (found && tags[i] & NOT_TYPO == 0) as u64;
+                }
+            }
+        }
+        None => {
+            // each row's own fields, the words as typed
+            let lanes = lanes_of(&mut cols.iter().copied());
+            let mut buf = Vec::new();
+            for w in &words {
+                let whole = Word { prefix: false, ..w.clone() };
+                for i in 0..rows {
+                    let (mut best, mut exact) = (MISSING_WEIGHT, false);
+                    for (c, v) in &lanes {
+                        let text: Option<String> = match &v.data {
+                            Data::Codes { codes, dict } => v.is_valid(i).then(|| dict[codes[i] as usize].to_string()),
+                            _ => v.is_valid(i).then(|| v.text_at(i)).flatten().map(|s| s.to_string()),
+                        };
+                        let Some(text) = text else { continue };
+                        if has_word(text.as_bytes(), w, &mut buf) {
+                            best = best.min(weight_of(*c));
+                            exact |= !w.prefix || has_word(text.as_bytes(), &whole, &mut buf);
+                        }
+                    }
+                    weight[i] += best;
+                    inexact[i] += (best < MISSING_WEIGHT && !exact) as u64;
+                }
+            }
+        }
+    }
+    let key: Vec<i64> = (0..rows).map(|i| ((weight[i] << 20) | (inexact[i].min(1023) << 10) | typos[i].min(1023)) as i64).collect();
+    VV::all_valid(Data::I64(Rc::new(key)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{has_phrase, has_phrase_ascii, has_phrase_words, parse, Item, Phrase, Word};

@@ -474,6 +474,8 @@ pub(super) fn eval_call_vec(name: &str, args: &[Bound], ty: Ty, ctx: &GroupCtx) 
         }
         #[cfg(feature = "search")]
         "search" => super::search::eval_search(args, ctx),
+        #[cfg(feature = "search")]
+        "search_rank" => super::search::eval_rank(args, ctx),
         "isnull" => {
             let a = eval_vec(&args[0], ctx);
             let out: Vec<u8> = (0..rows).map(|i| !a.is_valid(i) as u8).collect();

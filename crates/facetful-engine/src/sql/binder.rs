@@ -214,6 +214,9 @@ pub static FUNCS: &[FuncDef] = &[
     // search('q', col, …): every word of q in one of the columns (exec/search.rs)
     #[cfg(feature = "search")]
     FuncDef { name: "search", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::Any(Ty::Bool) },
+    // search_rank('q', col[, weight], …): a sort key, lower first (exec/search.rs)
+    #[cfg(feature = "search")]
+    FuncDef { name: "search_rank", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::Any(Ty::Int) },
     FuncDef { name: "if", kind: FuncKind::Scalar, arity: (3, Some(3)), sig: Sig::SameAsFirst },
     FuncDef { name: "case", kind: FuncKind::Scalar, arity: (2, None), sig: Sig::SameAsFirst },
     FuncDef { name: "int", kind: FuncKind::Scalar, arity: (1, Some(1)), sig: Sig::Any(Ty::Int) },
@@ -534,6 +537,26 @@ impl<'a> Binder<'a> {
                 let func = lookup_func("in_set").expect("registered");
                 let needle = bound_args.swap_remove(0);
                 return Ok(Bound::Call { func, args: vec![needle, Bound::Set(std::rc::Rc::new(set))], ty });
+            }
+        }
+        // search_rank('q', col[, weight], …): a literal query, then text
+        // columns, each optionally followed by a whole-number weight
+        if func.name == "search_rank" {
+            if !matches!(bound_args[0], Bound::Str(_)) {
+                return Err(Diagnostic::new("search_rank() query must be a text literal", args[0].span()));
+            }
+            let mut after_column = false;
+            for (i, b) in bound_args.iter().enumerate().skip(1) {
+                match b {
+                    Bound::Column { ty: Ty::Text, .. } => after_column = true,
+                    Bound::Number(n, _) if after_column && *n >= 0.0 && n.fract() == 0.0 => after_column = false,
+                    _ => {
+                        return Err(Diagnostic::new(
+                            "search_rank() takes text columns, each optionally followed by a whole-number weight",
+                            args[i].span(),
+                        ))
+                    }
+                }
             }
         }
         // search('q', col, …): the query is a literal (the executor splits it

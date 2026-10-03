@@ -104,6 +104,28 @@ fn collect_columns(b: &Bound, out: &mut Vec<usize>) {
     }
 }
 
+/// Columns of `b`, split into those only search_rank() calls over exactly
+/// `index_cols` read (`ranked`) and the rest (`other`).
+#[cfg(feature = "search")]
+fn collect_ranked(b: &Bound, index_cols: &[usize], ranked: &mut Vec<usize>, other: &mut Vec<usize>) {
+    if let Bound::Call { func, args, .. } = b {
+        if func.name == "search_rank" {
+            let mut cols = Vec::new();
+            args.iter().for_each(|a| collect_columns(a, &mut cols));
+            cols.sort_unstable();
+            cols.dedup();
+            if cols == index_cols {
+                ranked.extend(cols);
+            } else {
+                other.extend(cols);
+            }
+            return;
+        }
+        return args.iter().for_each(|a| collect_ranked(a, index_cols, ranked, other));
+    }
+    collect_columns(b, other);
+}
+
 // grouped-context evaluation (per output group — groups are few)
 
 #[cfg(test)]
@@ -328,6 +350,21 @@ impl<'q> Shared<'q> {
         let grp: Vec<&Bound> = q.group_by.iter().collect();
         let proj_needed = cols_of(&[sel.as_slice(), grp.as_slice(), ord.as_slice()].concat());
         let ord_needed = cols_of(&ord);
+        // a search_rank() over the index's columns reads plain columns from
+        // the row lists, not the column (top-k only: there every row group
+        // is evaluated whole, so it lines up with the index)
+        #[cfg(feature = "search")]
+        let ord_needed = match table.search_index() {
+            Some(idx) => {
+                let mut other = Vec::new();
+                let mut ranked = Vec::new();
+                for e in &ord {
+                    collect_ranked(e, &idx.cols, &mut ranked, &mut other);
+                }
+                ord_needed.into_iter().filter(|c| other.contains(c) || !(ranked.contains(c) && idx.plain.contains(c))).collect()
+            }
+            None => ord_needed,
+        };
         let mut needed = proj_needed.clone();
         if let Some(f) = &q.filter {
             collect_columns(f, &mut needed);
@@ -506,6 +543,8 @@ pub fn execute<S: ReadAt>(
     let folded = fold_query(q, table.catalog());
     let mut sh = Shared::new(table, folded.as_ref())?;
     let mut strategy = Strategy::plan(table, &sh)?;
+    #[cfg(feature = "search")]
+    let _rank_scope = search::RankScope::new();
 
     for g in 0..table.group_count() {
         if group_prunable(table, g, &sh.constraints) {
@@ -522,7 +561,20 @@ pub fn execute<S: ReadAt>(
         let (which, cap, eval_rows) = strategy.load_plan(&sh, keep.as_deref(), rows);
         sh.load(table, g, &mut cols, which, cap)?;
         let ctx = GroupCtx { cols, rows: eval_rows };
-        if let Flow::Stop = strategy.scan_group(&sh, g, &ctx, keep.as_deref()) {
+        // search_rank reads the word index row by row, so only where an
+        // ORDER BY is evaluated over this group's own rows: the two sorts
+        #[cfg(feature = "search")]
+        let sorting = matches!(strategy, Strategy::TopK(_) | Strategy::FullSort(_));
+        #[cfg(feature = "search")]
+        if sorting {
+            search::set_rank_group(table.search_index(), g, rows, keep.as_deref());
+        }
+        let flow = strategy.scan_group(&sh, g, &ctx, keep.as_deref());
+        #[cfg(feature = "search")]
+        if sorting {
+            search::set_rank_group(None, 0, 0, None);
+        }
+        if let Flow::Stop = flow {
             break;
         }
     }

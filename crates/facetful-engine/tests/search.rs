@@ -337,16 +337,33 @@ fn index_rows_and_pairs() {
         assert_eq!(got, expected(prefix, |_| true).1, "prefix '{prefix}'");
     }
     assert!(idx.prefix_ids(b"ntal").is_empty());
+    // per field: the rows where a word is in that column
+    assert_eq!(idx.plain, [0, 2]);
+    for (field, text_of) in [(0u32, &(|i: usize| if i % 13 != 0 { TITLES[i % TITLES.len()] } else { "" }) as &dyn Fn(usize) -> &'static str), (1, &|i: usize| DESCS[(i * 3) % DESCS.len()])] {
+        for prefix in ["mental", "health", "sport", "s", "climate"] {
+            let ids = idx.prefix_ids(prefix.as_bytes());
+            let mut got = Vec::new();
+            for g in 0..t.group_count() {
+                let mut m = vec![0u8; t.catalog().groups[g].row_count as usize];
+                idx.mark_field(g, ids.clone(), field, &mut m);
+                got.extend(m.iter().map(|&b| b == 1));
+            }
+            let want: Vec<bool> = (0..ROWS).map(|i| words_of(text_of(i)).iter().any(|w| w.starts_with(prefix.as_bytes()))).collect();
+            assert_eq!(got, want, "field {field}, prefix '{prefix}'");
+        }
+    }
     assert!(idx.word_id(b"london").is_some() && idx.word_id(b"lond").is_none());
-    // the row lists hold the plain columns (title, descr); org is a
+    // the row lists hold the plain columns (title, descr), one list per
+    // field, so a word in both fields of a row counts twice; org is a
     // dictionary column, indexed by value
+    let distinct = |t: &str| {
+        let mut w = words_of(t);
+        w.sort();
+        w.dedup();
+        w.len()
+    };
     let pairs: usize = (0..ROWS)
-        .map(|i| {
-            let mut w: Vec<Vec<u8>> = texts(i)[1..].iter().flat_map(|t| words_of(t)).collect();
-            w.sort();
-            w.dedup();
-            w.len()
-        })
+        .map(|i| distinct(DESCS[(i * 3) % DESCS.len()]) + if i % 13 != 0 { distinct(TITLES[i % TITLES.len()]) } else { 0 })
         .sum();
     assert_eq!(idx.stats().pairs, pairs);
     let value_pairs: usize = ORGS.iter().map(|o| {
@@ -573,4 +590,166 @@ fn suggestions() {
     assert_eq!(s.did_you_mean.as_deref(), Some("health "));
     // a word's own plural is not offered
     assert!(search_suggest(&mut w, &[0], "news ", None, &opts).unwrap().did_you_mean.is_none());
+}
+
+type Ranges = Vec<std::ops::Range<u32>>;
+
+/// One query word as search_rank sees it, with the word ids it accepts
+/// (None = compare text, no index).
+struct RankWord {
+    text: Vec<u8>,
+    prefix: bool,
+    forms: Option<(Ranges, Ranges, Ranges)>, // (all, exact, not a typo)
+}
+
+fn rank_words(idx: Option<&SearchIndex>, q: &str) -> Vec<RankWord> {
+    let mut out = Vec::new();
+    for it in query_items(q) {
+        let n = it.words.len();
+        for (k, w) in it.words.into_iter().enumerate() {
+            let prefix = it.prefix && k + 1 == n;
+            let forms = idx.map(|ix| {
+                let f = ix.word_forms(&w, prefix, it.literal);
+                let plain = f.ranges.iter().filter(|r| !f.typo.contains(r)).cloned().collect();
+                (f.ranges.clone(), f.exact.clone(), plain)
+            });
+            out.push(RankWord { text: w, prefix, forms });
+        }
+    }
+    out
+}
+
+/// search_rank's key for one row, read off its fields: per query word, the
+/// lowest weight among the fields holding one of its accepted words (1000
+/// when none), then words matched only inexactly, then only through a typo.
+fn rank_key(idx: Option<&SearchIndex>, words: &[RankWord], fields: &[(&str, u64)]) -> i64 {
+    let (mut weight, mut inexact, mut typos) = (0u64, 0u64, 0u64);
+    for w in words {
+        let (mut best, mut exact, mut plain) = (1000u64, false, false);
+        for (text, wt) in fields {
+            for t in words_of(text) {
+                let (hit, ex, pl) = match (&w.forms, idx) {
+                    (Some((all, ex, pl)), Some(ix)) => {
+                        let id = ix.word_id(&t);
+                        let inr = |rs: &[std::ops::Range<u32>]| id.is_some_and(|id| rs.iter().any(|r| r.contains(&id)));
+                        (inr(all), inr(ex), inr(pl))
+                    }
+                    _ => {
+                        let hit = if w.prefix { t.starts_with(&w.text) } else { t == w.text };
+                        (hit, t == w.text, hit)
+                    }
+                };
+                if hit {
+                    best = best.min(*wt);
+                }
+                exact |= ex;
+                plain |= pl;
+            }
+        }
+        weight += best;
+        if best < 1000 {
+            inexact += !exact as u64;
+            typos += !plain as u64;
+        }
+    }
+    ((weight << 20) | (inexact << 10) | typos) as i64
+}
+
+#[test]
+fn rank_by_field_weights_then_exact_then_typo() {
+    let text = |v: &Val| match v {
+        Val::Text(s) => s.to_string(),
+        _ => String::new(),
+    };
+    for indexed in [false, true] {
+        let mut t = table();
+        if indexed {
+            t.build_search_index(&[0, 1, 2]).unwrap();
+        }
+        let ix = t.search_index();
+        for (cols, weights) in [("title, 1, org, 3, descr, 5", [1u64, 3, 5]), ("descr, title, org", [2, 3, 1]), ("org, 2, title, 2, descr, 1", [2, 2, 1])] {
+            for q in ["mental health", "health ", "youth sport london", "climate chnage ", "sport", "\"mental health\" fund", "mentl helth "] {
+                let words = rank_words(ix.as_deref(), q);
+                let hits = expected_on(ix.as_deref(), q, |_| true).1;
+                let all: Vec<i64> = (0..ROWS)
+                    .filter(|&i| hits[i])
+                    .map(|i| {
+                        let title = if i % 13 != 0 { TITLES[i % TITLES.len()] } else { "" };
+                        rank_key(ix.as_deref(), &words, &[(title, weights[0]), (ORGS[(i * 7) % ORGS.len()], weights[1]), (DESCS[(i * 3) % DESCS.len()], weights[2])])
+                    })
+                    .collect();
+                let mut sorted = all.clone();
+                sorted.sort();
+                for limit in [Some(7usize), None] {
+                    let sql = format!(
+                        "select title, org, descr from t where search('{q}', title, org, descr) order by search_rank('{q}', {cols}){}",
+                        limit.map(|l| format!(" limit {l}")).unwrap_or_default()
+                    );
+                    let mut r = run_query(&mut t, &sql).unwrap_or_else(|d| panic!("{}", d.render(&sql)));
+                    r.ensure_rows();
+                    let got: Vec<i64> = r
+                        .rows
+                        .iter()
+                        .map(|row| rank_key(ix.as_deref(), &words, &[(&text(&row[0]), weights[0]), (&text(&row[1]), weights[1]), (&text(&row[2]), weights[2])]))
+                        .collect();
+                    let want: Vec<i64> = sorted.iter().copied().take(limit.unwrap_or(usize::MAX)).collect();
+                    assert_eq!(got, want, "indexed={indexed} {cols} '{q}' limit {limit:?}");
+                }
+            }
+        }
+    }
+    // a word in the title beats the same word only in the description
+    let mut t = table();
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    let mut r = run_query(&mut t, "select title, descr from t where search('wellbeing', title, org, descr) order by search_rank('wellbeing', title, org, descr) limit 1").unwrap();
+    r.ensure_rows();
+    assert!(matches!(&r.rows[0][0], Val::Text(s) if s.to_lowercase().contains("wellbeing")), "title match first: {:?}", r.rows[0]);
+    // a rare word next to a far more common one also finds the common one as a
+    // typo. Typos are never exact, so for the word being typed the order is:
+    // the word as typed, longer words it starts, then typos
+    let mut texts = vec!["health matters"; 400];
+    texts.extend(["heathland walks", "heath and moor"]);
+    let mut w = word_table(&texts);
+    w.build_search_index(&[0]).unwrap();
+    let f = w.search_index().unwrap().word_forms(b"heath", true, false);
+    assert!(f.own_rows > 0 && !f.typo.is_empty(), "heath should keep its rows and add health as a typo");
+    let mut r = run_query(&mut w, "select t from t where search('heath', t) order by search_rank('heath', t) limit 10").unwrap();
+    r.ensure_rows();
+    let got: Vec<String> = r.rows.iter().map(|row| match &row[0] { Val::Text(s) => s.to_string(), _ => String::new() }).collect();
+    assert_eq!(got, [vec!["heath and moor"; 5], vec!["heathland walks"; 5]].concat());
+}
+
+#[test]
+fn rank_without_a_search_filter_and_in_the_select_list() {
+    // no WHERE: every row is ranked, matches first; selected, the key is
+    // computed on the gathered rows from the text (the word as typed)
+    let mut t = table();
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    let rank = "search_rank('sport ', title, 1, org, 3, descr, 5)";
+    let mut r = run_query(&mut t, &format!("select {rank}, title, org, descr from t order by {rank} limit 40")).unwrap();
+    r.ensure_rows();
+    let keys: Vec<i64> = r.rows.iter().map(|row| match row[0] { Val::Int(k) => k, ref v => panic!("{v:?}") }).collect();
+    let words = rank_words(None, "sport ");
+    let text = |v: &Val| match v {
+        Val::Text(s) => s.to_string(),
+        _ => String::new(),
+    };
+    for (row, &k) in r.rows.iter().zip(&keys) {
+        assert_eq!(k, rank_key(None, &words, &[(&text(&row[1]), 1), (&text(&row[2]), 3), (&text(&row[3]), 5)]), "{row:?}");
+    }
+    assert!(keys.windows(2).all(|w| w[0] <= w[1]), "{keys:?}");
+    assert_eq!(keys[0] >> 20, 1, "a title match leads");
+}
+
+#[test]
+fn rank_bind_errors() {
+    let mut t = table();
+    for sql in [
+        "select search_rank(title, title) from t",
+        "select search_rank('x', 3) from t",
+        "select search_rank('x', title, 1, 2) from t",
+        "select search_rank('x', title, -1) from t",
+    ] {
+        assert!(run_query(&mut t, sql).is_err(), "{sql} should not bind");
+    }
 }

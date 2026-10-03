@@ -38,7 +38,7 @@ A word's bitmap is the union of its accepted forms. The query ANDs one bitmap pe
 
 **The dictionary is the data's own vocabulary**, with each term's row count. No language dictionary is shipped. Corrections only matter if they find rows, names and specialist terms aren't in language dictionaries, and mixed languages come for free. The data's own misspellings sit in the vocabulary too, which is why the typo rule compares against more common neighbours instead of only checking whether the word exists.
 
-**Ranking is rule-based tiers, not a relevance score.** In order: fewest typos, then exact forms over inflections, then phrase order and adjacency, checked in the text of the rows being ranked. `search_rank` computes all three (see *The `search()` operator*). BM25 and term frequencies are not planned.
+**Ranking is rule-based tiers, not a relevance score.** In order: field weights (each word counts the best-weighted field it is in, summed over the words, lower first), then words matched exactly (as typed, another spelling, an inflection) over words matched only as the start of a longer word, then words matched only through a typo, then the app's own ORDER BY. `search_rank` computes all three (see *The `search()` operator*). Phrase order and adjacency were dropped as tiers (3 October): too costly per keystroke without positions. BM25 and term frequencies are not planned.
 
 **The engine reports what it did.** For each word it returns the forms it used with their row counts (`halth: health 41K, halt 310`). The app can show "including results for *health*" and pin a correction with one click, which just re-queries. Quoting a word turns its expansion off.
 
@@ -72,7 +72,7 @@ Measure first. The build may already be hidden behind the download.
 
 **OPFS as a cache, never read on demand.** After the first build, write the whole index to OPFS as one file in its in-memory layout. Later visits read it all back into memory (on the order of 0.1 s for 60 to 80 MB, estimated) instead of rebuilding for 2 to 4 s. A small header holds the image's version, the split id if any, and a format and tokenizer version. Any mismatch, or a missing or unreadable file, means rebuild. Without OPFS, rebuild each visit. Paged reads from OPFS or IndexedDB were considered and left out: they only help when the index doesn't fit in memory, and then the scan path is the fallback.
 
-**What the index changes:** finding rows for a word or prefix becomes a lookup, not a scan. Typo, variant and inflection expansion becomes a union of word lists. Common words get cheap too: `support` (35% of rows) is about a millisecond to turn into a mask, against 40+ ms of scanning with 530K hits. A text scan would only remain for phrase-order ranking in `search_rank`, if kept, on rows that pass the search and the facets.
+**What the index changes:** finding rows for a word or prefix becomes a lookup, not a scan. Typo, variant and inflection expansion becomes a union of word lists. Common words get cheap too: `support` (35% of rows) is about a millisecond to turn into a mask, against 40+ ms of scanning with 530K hits. `search_rank` reads the same row lists, kept per field.
 
 **Tokenizer and folding**, shared by the index build, the scan and the converter:
 
@@ -88,7 +88,7 @@ Measure first. The build may already be hidden behind the download.
 ```sql
 select … from grants
 where search('mental helth') and country = 'UK'
-order by search_rank('mental helth') desc
+order by search_rank('mental helth', title, 1, recipient, 3, description, 5), amount desc
 limit 50
 ```
 
@@ -100,7 +100,7 @@ limit 50
 - **Expansion** comes from the vocabulary: spell check, variants, inflections (see *Query model*).
 - **Too broad.** The vocabulary gives a prefix's row count before any work, so `m` or `co` can report "keep typing".
 
-**`search_rank('q')`** is a sort key: tiers for typos and exact over inflected forms, and possibly phrase order and adjacency (checked in the text of rows that reach ORDER BY; still open).
+**`search_rank('q', col[, weight], …)`** is a sort key, lower first: field weights, then exact, then typos (see step 6 of *Next steps*).
 
 **Suggestions** come from one engine call, something like `db.searchSuggest(table, q, { where, didYouMean })`, not SQL:
 
@@ -165,7 +165,7 @@ Cold cost per word, split by column (each column as its own query, so each figur
 **Structure.**
 
 - Vocabulary: every folded word, in one byte buffer with end offsets, **in word order**, so a prefix is a range of word ids (two binary searches). Row counts per word.
-- Plain text columns, per row group: the word ids present (ascending) and, parallel to them, each word's rows: a sorted `u16` array, or a 65,536-bit bitmap above 4,096 rows. A prefix is one contiguous run of a group's entries.
+- Plain text columns, per row group: one row list per word and field (list id = word id × fields + field, so a word range is still one run), the list ids present (ascending) and, parallel to them, each list's rows: a sorted `u16` array, or a 65,536-bit bitmap above 4,096 rows. A prefix is one contiguous run of a group's entries.
 - Dictionary columns: per word, the codes of the values that hold it (CSR). A query turns a word's codes into a byte table and reads each group's codes. That keeps Description Common, whose 61K values repeat about 17 words each over 820K rows (26M of the 67M word occurrences), out of the build and the row lists.
 
 **Build.** The vocabulary is discovered while reading; plain columns are read row by row across columns, so each word's rows arrive in order; pairs (word id, row) go into one buffer per group and a counting sort on word id turns them into lists, dropping repeats. ASCII text finds words from a bitmask of letter-and-digit bytes, and a word of up to 15 bytes becomes its hash key in one 16-byte load. A last pass renumbers the words into word order.
@@ -174,9 +174,11 @@ grantnav, five search columns:
 
 | | first version | now, native | now, wasm (Node) |
 |---|---|---|---|
-| build | 2.92 s native, 3.9 s wasm | **1.32 s** | **2.16 s** |
-| (word, row) pairs in row lists | 49.0M | 27.6M, plus 1.65M (word, value) pairs | same |
-| index holds | 79.6 MB | 62.9 MB (lists 58.8, vocabulary 4.2) | 62.9 MB |
+| build | 2.92 s native, 3.9 s wasm | **1.42 s** | **2.29 s** |
+| (word, row) pairs in row lists | 49.0M | 30.8M, plus 1.65M (word, value) pairs | same |
+| index holds | 79.6 MB | 75.4 MB | 75.4 MB |
+
+Row lists per field (3 October, for `search_rank`'s field weights) cost 12.5 MB, 0.1 s of build and 34 MB of wasm high-water memory. Before them, one list per word: 27.6M pairs, 62.9 MB (lists 58.8, vocabulary 4.2), 1.32 s native, 2.16 s wasm.
 
 Without Description Rare (the first image of a split) the build is 0.61 s native and the index about 40 MB.
 
@@ -190,7 +192,7 @@ Without Description Rare (the first image of a split) the build is 0.61 s native
 - Reusing a repeated short value's words within a group: too few repeats in 65,536 rows to pay for hashing every value.
 - **A words file** written beforehand from the image (sorted vocabulary with row counts, and per group each word's row count, 1.47 MB brotli for grantnav) so the browser could allocate exactly and write each row straight into place: correct, but **slower** (1.71 s against 1.31 s natively). Lookups in a prebuilt vocabulary cost more than the normal build's lookups and appends, and the direct fill writes scattered. Sorted ids, its one real gain, come from the renumbering pass instead.
 
-**Positions (estimated, not built).** About 35M word occurrences in the plain columns, about 1 byte each delta-coded plus a count per (word, row): roughly +60 to 70 MB, doubling the index, and perhaps +20 to 30% build time. They would give phrase and adjacency matching from the index. Phrase-order ranking, if kept, would be a text check on the rows that survive the search and the facets.
+**Positions (estimated, not built).** About 35M word occurrences in the plain columns, about 1 byte each delta-coded plus a count per (word, row): roughly +60 to 70 MB, doubling the index, and perhaps +20 to 30% build time. They would give phrase and adjacency matching from the index. Phrase and adjacency ranking were dropped (3 October): checking text on the matching rows cost up to 157 ms a keystroke (`community project`), and a two-word index (pairs of words that both have 20K rows or more: 82K pairs, about 29 MB) was not pursued.
 
 The scan path with word starts is slower than the substring version committed on 30 September (typing `mental health` 1,262 against 566 ms). It only serves until the index is built and in the lite build.
 
@@ -215,7 +217,15 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
    - **The word being typed is corrected** like a finished word when a prefix one edit away has 200 times its rows (`comun…` 322 rows → *commun…*), not only when nothing starts with it; corrections add to it, never replace it.
    - **Did-you-mean:** each corrected word replaced by its best correction (the word being typed by its first completion, a whole word: `climt` → *climate*), each real word whose neighbour has 20 times its rows by that neighbour (`heath` → *health*), never a word's own singular or plural (`news`, *new*); offered when it finds a row under the filter.
    - grantnav, wasm, every keystroke of `mental health`, `youth sport london`, `climte chnage`, `comunity projcet`, with and without a Region filter: median 4.5 to 8.5 ms, worst 18 ms (`spikes/fts-bench/suggest-bench.mjs`; with counts it was 10 to 17 and 30). To tune: corrected prefixes can be loose (`comun…` also takes *coun…*: *council*, *country*).
-6. **`search_rank` tiers.**
+6. ~~`search_rank`~~ (done 3 October). `search_rank('q', col[, weight], …)`, an integer sort key, lower first. Weights are whole numbers after a column; a column without one gets its position (1, 2, …). Per row:
+   - **Field weights:** for each query word, the lowest weight among the fields it matched in (with all its accepted forms: inflections, spellings, corrections, the prefix of the word being typed), summed over the words. A word in no field adds 1000.
+   - **Exact:** then fewer words matched only inexactly. The word as typed, its UK/US spellings and the inflections of both are exact; the longer words the word being typed starts (`heath` → *heathland*) and typos are not.
+   - **Typo:** words matched only through a correction.
+   - Phrases rank as their words, quoted. Then the app's own ORDER BY.
+   - With the index (top-k and full sorts over the index's columns), weights come from the per-field row lists and dictionary values; a top-k does not load the plain columns for it, only the rows the WHERE keeps are ranked, and each word's forms are looked up once per statement. Otherwise (no index, a SELECT item) it reads the text, words as typed.
+   - grantnav, wasm, every keystroke, top 20 by rank then amount (`spikes/fts-bench/rank-bench.mjs`): median 15 to 30 ms against 9 to 13 ordering by amount alone, worst 85 ms (the first letter). Natively 10 to 23 ms against 8 to 12 for a cheap expression key (`examples/rank_time.rs`). The first version took 526 ms: it loaded the five text columns per group (the long descriptions), looked forms up per group and ranked every row.
+   - Size, unoptimized: full 356.1 KB gz (lite unchanged, 291.9 KB).
+   - A misspelling that is itself in the data ranks as exact: `comunity project` leads with *Barley Croft Comunity Counselling Project*.
 7. **Streaming load with the build integrated** (load-time work): the worker reads the response stream front to back, tokenizes dictionary columns as soon as they arrive, indexes each row group as its bytes complete (step 2's interface), writes to OPFS as it goes, and finishes the index when the footer arrives, so search is ready with the table. The app names the columns to index when it starts the load.
 8. **Split images with attach,** each image's columns indexed as it streams, merged into one index at attach (same row groups; combine the two sorted vocabularies).
 9. **OPFS cache of the whole index,** read back in full on later visits.
@@ -419,7 +429,6 @@ Sources: [Lucene101PostingsFormat](https://lucene.apache.org/core/10_1_0/core/or
 ## Open questions
 
 - Build time and memory of the index on grantnav, in wasm, and on a phone.
-- The tier order, in detail.
 - Tokenizing identifiers and numbers (`GB-CHC-123`, `2024`), and scripts written without spaces.
 - Plural folding only, or the full inflection rules, as the default for description fields.
 - When a real word should still expand to a far more common neighbour (`heath` to `health` adds 120K rows to the counts).

@@ -4,9 +4,10 @@
 //!
 //! Group-major, so it can be built one row group at a time as an image
 //! streams in, and so a query reads one entry per group, the way the
-//! executor already runs. Within a group a word's rows are a sorted `u16`
-//! array, or a 65,536-bit bitmap once that is smaller (over 4,096 rows),
-//! as Roaring does. Dictionary columns are indexed by value, not by row:
+//! executor already runs. Within a group a word has a row list per plain
+//! field (so ranking and field scoping know which field a row matched in),
+//! each a sorted `u16` array, or a 65,536-bit bitmap once that is smaller
+//! (over 4,096 rows), as Roaring does. Dictionary columns are indexed by value, not by row:
 //! word -> the dictionary codes whose value holds it. A query turns those
 //! codes into a lookup table and reads each group's codes, which keeps the
 //! rows of a column like grantnav's Description Common (61K values, about 17
@@ -224,9 +225,9 @@ impl GroupIndex {
         g
     }
 
-    /// Give the words their final ids (`rank[old]`) and keep `ids` ascending.
-    fn renumber(&mut self, rank: &[u32]) {
-        let mut both: Vec<(u32, Entry)> = self.ids.iter().map(|&id| rank[id as usize]).zip(self.entries.iter().copied()).collect();
+    /// Give the lists their final ids (`to(old)`) and keep `ids` ascending.
+    fn renumber(&mut self, to: impl Fn(u32) -> u32) {
+        let mut both: Vec<(u32, Entry)> = self.ids.iter().map(|&id| to(id)).zip(self.entries.iter().copied()).collect();
         both.sort_unstable_by_key(|&(id, _)| id);
         for (k, (id, e)) in both.into_iter().enumerate() {
             self.ids[k] = id;
@@ -281,6 +282,25 @@ impl GroupIndex {
         true
     }
 
+    /// Calls `f` with each row of one list.
+    #[inline]
+    fn each_row(&self, e: Entry, mut f: impl FnMut(usize)) {
+        if e.len == BITMAP {
+            let s = e.start as usize * BITMAP_WORDS;
+            for (w, &bits) in self.bitmaps[s..s + BITMAP_WORDS].iter().enumerate() {
+                let mut b = bits;
+                while b != 0 {
+                    f(w * 64 + b.trailing_zeros() as usize);
+                    b &= b - 1;
+                }
+            }
+        } else {
+            for &r in &self.rows[e.start as usize..(e.start + e.len) as usize] {
+                f(r as usize);
+            }
+        }
+    }
+
     fn mark_entry(&self, e: Entry, out: &mut [u8]) {
         if e.len == BITMAP {
             let s = e.start as usize * BITMAP_WORDS;
@@ -322,7 +342,8 @@ fn now() {}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IndexStats {
     pub words: usize,
-    /// distinct (word, row) pairs held in row lists (the plain text columns)
+    /// (word, field, row) entries held in row lists (the plain text columns;
+    /// a word in two fields of a row counts twice)
     pub pairs: usize,
     /// (word, value) pairs of the dictionary columns
     pub value_pairs: usize,
@@ -352,6 +373,11 @@ fn mem_mb() -> u32 {
 pub struct SearchIndex {
     /// the searched columns, ascending
     pub cols: Vec<usize>,
+    /// the plain text columns among them: field `f` of a row list is `plain[f]`
+    pub plain: Vec<usize>,
+    /// row lists per word: one per plain field, word `w`'s for field `f` at
+    /// list id `w * fields + f`, so a word range is a list range too
+    fields: u32,
     /// word text by id; ids are in word order, so a prefix is an id range
     words: Words,
     /// rows each word occurs in (over the whole table), by id
@@ -625,22 +651,23 @@ fn row_keys(text: &[u8], buf: &mut Vec<u8>, masks: &mut Vec<u64>, mut f: impl Fn
     }
 }
 
-/// Plain text columns of one group, row by row across columns: `f(row, key)`
-/// for every word, so each word's rows come in ascending order.
+/// Plain text columns of one group, row by row across columns: `f(row,
+/// field, key)` for every word (field: the column's place in `plain`), so
+/// each word's rows come in ascending order.
 fn each_row_word<S: ReadAt>(
     table: &mut Table<S>,
     g: usize,
     plain: &[usize],
     buf: &mut Vec<u8>,
     masks: &mut Vec<u64>,
-    mut f: impl FnMut(usize, Key),
+    mut f: impl FnMut(usize, usize, Key),
 ) -> Result<(), FormatError> {
     let rows = table.catalog().groups[g].row_count as usize;
     let mut each = |segs: &[(Offsets, &[u8], Option<&[u8]>)]| {
         for r in 0..rows {
-            for (off, blob, valid) in segs {
+            for (field, (off, blob, valid)) in segs.iter().enumerate() {
                 if valid.is_none_or(|v| v[r / 8] >> (r % 8) & 1 == 1) {
-                    row_keys(&blob[off.at(r)..off.at(r + 1)], buf, masks, |k| f(r, k));
+                    row_keys(&blob[off.at(r)..off.at(r + 1)], buf, masks, |k| f(r, field, k));
                 }
             }
         }
@@ -778,7 +805,10 @@ impl IndexBuilder {
         // arrive in ascending order, so `from_pairs` only drops repeats
         let IndexBuilder { vocab, pairs, buf, masks, .. } = self;
         pairs.clear();
-        each_row_word(table, g, &self.plain, buf, masks, |r, k| pairs.push((vocab.key_id(k) as u64) << 16 | r as u64))?;
+        let fields = self.plain.len().max(1) as u64;
+        each_row_word(table, g, &self.plain, buf, masks, |r, field, k| {
+            pairs.push((vocab.key_id(k) as u64 * fields + field as u64) << 16 | r as u64)
+        })?;
         self.phases[1] += since(&t);
         let t = now();
         self.groups.push(GroupIndex::from_pairs(&self.pairs, &mut self.scratch));
@@ -792,7 +822,8 @@ impl IndexBuilder {
     /// Renumber the words into word order (a prefix becomes an id range),
     /// invert the dictionary columns, and count each word's rows.
     pub fn finish(self) -> SearchIndex {
-        let IndexBuilder { cols, vocab, mut dict_words, mut groups, mut phases, mut mem, .. } = self;
+        let IndexBuilder { cols, plain, vocab, mut dict_words, mut groups, mut phases, mut mem, .. } = self;
+        let fields = plain.len().max(1) as u32;
         mem[2] = mem_mb();
         let t = now();
         let unsorted = vocab.into_words();
@@ -807,7 +838,7 @@ impl IndexBuilder {
         drop(order);
         drop(unsorted);
         for g in &mut groups {
-            g.renumber(&rank);
+            g.renumber(|list| rank[(list / fields) as usize] * fields + list % fields);
         }
         let mut counts = vec![0u32; words.len()];
         // invert each dictionary column: word -> codes (CSR); a word's row
@@ -827,9 +858,9 @@ impl IndexBuilder {
             dicts.push(invert_dict(c, &per_value, words.len()));
         }
         for g in &groups {
-            for (k, &id) in g.ids.iter().enumerate() {
+            for (k, &list) in g.ids.iter().enumerate() {
                 let e = g.entries[k];
-                counts[id as usize] += if e.len == BITMAP {
+                counts[(list / fields) as usize] += if e.len == BITMAP {
                     let s = e.start as usize * BITMAP_WORDS;
                     g.bitmaps[s..s + BITMAP_WORDS].iter().map(|b| b.count_ones()).sum()
                 } else {
@@ -839,7 +870,7 @@ impl IndexBuilder {
         }
         phases[3] = since(&t);
         mem[3] = mem_mb();
-        SearchIndex { cols, words, counts, groups, dicts, phases, mem }
+        SearchIndex { cols, plain, fields, words, counts, groups, dicts, phases, mem }
     }
 }
 
@@ -1096,6 +1127,13 @@ pub struct Forms {
     pub corrections: Vec<(Vec<u8>, u64)>,
     /// plural, `-ed` and `-ing` forms of the word, its variants and corrections
     pub inflections: Vec<(Vec<u8>, u64)>,
+    /// the ranges that count as an exact match, for ranking: the whole word
+    /// as typed (for the word being typed, not the longer words its prefix
+    /// reaches), its other spellings, and their inflections
+    pub exact: Vec<Ids>,
+    /// the ranges that count as a typo, for ranking: corrections and their
+    /// inflections
+    pub typo: Vec<Ids>,
 }
 
 impl Forms {
@@ -1171,33 +1209,45 @@ impl SearchIndex {
             return forms;
         }
         let mut seen: Vec<u32> = forms.ranges.iter().flat_map(|r| r.clone()).collect();
-        let mut add = |v: &[u8], to: &mut Vec<(Vec<u8>, u64)>, ranges: &mut Vec<Ids>, min_rows: u64| {
-            if let Some(id) = self.word_id(v) {
-                let rows = self.counts[id as usize] as u64;
-                if rows >= min_rows && !seen.contains(&id) {
-                    seen.push(id);
-                    ranges.push(id..id + 1);
-                    to.push((v.to_vec(), rows));
-                }
+        // a word that exists with enough rows, not seen yet: its range
+        let mut add = |v: &[u8], to: &mut Vec<(Vec<u8>, u64)>, min_rows: u64| -> Option<Ids> {
+            let id = self.word_id(v)?;
+            let rows = self.counts[id as usize] as u64;
+            if rows < min_rows || seen.contains(&id) {
+                return None;
             }
+            seen.push(id);
+            to.push((v.to_vec(), rows));
+            Some(id..id + 1)
         };
         let mut variants = Vec::new();
         for v in spelling_variants(w) {
-            add(&v, &mut variants, &mut forms.ranges, 1);
+            if let Some(r) = add(&v, &mut variants, 1) {
+                forms.ranges.push(r.clone());
+                forms.exact.push(r);
+            }
         }
-        // inflect the word as typed (when it exists), its variants and corrections
-        let mut bases: Vec<Vec<u8>> = Vec::new();
+        // inflect the word as typed (when it exists), its variants and
+        // corrections; a correction's forms are typos too
+        let mut bases: Vec<(Vec<u8>, bool)> = Vec::new();
         if forms.own_rows > 0 {
-            bases.push(w.to_vec());
+            bases.push((w.to_vec(), false));
         }
-        bases.extend(variants.iter().map(|v| v.0.clone()));
-        bases.extend(forms.corrections.iter().map(|c| c.0.clone()));
+        bases.extend(variants.iter().map(|v| (v.0.clone(), false)));
+        bases.extend(forms.corrections.iter().map(|c| (c.0.clone(), true)));
         let reference = forms.own_rows.max(forms.corrections.iter().map(|c| c.1).max().unwrap_or(0));
         let min_rows = MIN_FORM_ROWS.max(reference / FORM_SHARE);
         let mut inflected = Vec::new();
-        for b in bases {
+        for (b, typo) in bases {
             for f in inflections(&b, |x| self.word_id(x).is_some()) {
-                add(&f, &mut inflected, &mut forms.ranges, min_rows);
+                if let Some(r) = add(&f, &mut inflected, min_rows) {
+                    forms.ranges.push(r.clone());
+                    if typo {
+                        forms.typo.push(r);
+                    } else {
+                        forms.exact.push(r);
+                    }
+                }
             }
         }
         forms.variants = variants;
@@ -1266,8 +1316,59 @@ impl SearchIndex {
     /// Whether `f` holds for some row (within group `g`) of word `id`'s row
     /// list, stopping at the first.
     pub fn any_row(&self, g: usize, id: u32, mut f: impl FnMut(usize) -> bool) -> bool {
+        (id * self.fields..(id + 1) * self.fields).any(|list| self.list_any(g, list, &mut f))
+    }
+
+    /// Mark the rows (within group `g`) where a word of `ids` is in plain
+    /// field `field` (its place in `plain`).
+    pub fn mark_field(&self, g: usize, ids: Ids, field: u32, out: &mut [u8]) {
+        self.each_field_row(g, ids, |_, f, row| {
+            if f == field && row < out.len() {
+                out[row] = 1;
+            }
+        });
+    }
+
+    /// Calls `f(word, field, row)` for each row of group `g` holding a word
+    /// of `ids` in a plain field (once per word and field the row holds).
+    pub fn each_field_row(&self, g: usize, ids: Ids, mut f: impl FnMut(u32, u32, usize)) {
         let gi = &self.groups[g];
-        let Ok(k) = gi.ids.binary_search(&id) else { return false };
+        let lo = gi.ids.partition_point(|&l| l < ids.start * self.fields);
+        let hi = lo + gi.ids[lo..].partition_point(|&l| l < ids.end * self.fields);
+        for k in lo..hi {
+            let (word, field) = (gi.ids[k] / self.fields, gi.ids[k] % self.fields);
+            gi.each_row(gi.entries[k], |row| f(word, field, row));
+        }
+    }
+
+    /// Per dictionary column of the index, one byte per code: the OR of
+    /// `tag(word)` over the words of `ids` its value holds (0 for none).
+    pub fn value_tags(&self, ids: &[Ids], tag: impl Fn(u32) -> u8) -> Vec<(usize, Vec<u8>)> {
+        self.dicts
+            .iter()
+            .map(|d| {
+                let mut t = vec![0u8; d.values];
+                for r in ids {
+                    for w in r.clone() {
+                        let tw = tag(w);
+                        for &code in &d.codes[d.offsets[w as usize] as usize..d.offsets[w as usize + 1] as usize] {
+                            t[code as usize] |= tw;
+                        }
+                    }
+                }
+                (d.col, t)
+            })
+            .collect()
+    }
+
+    /// The number of plain fields (`plain.len()`, at least 1).
+    pub fn fields(&self) -> u32 {
+        self.fields
+    }
+
+    fn list_any(&self, g: usize, list: u32, f: &mut impl FnMut(usize) -> bool) -> bool {
+        let gi = &self.groups[g];
+        let Ok(k) = gi.ids.binary_search(&list) else { return false };
         let e = gi.entries[k];
         if e.len == BITMAP {
             let s = e.start as usize * BITMAP_WORDS;
@@ -1300,7 +1401,13 @@ impl SearchIndex {
     fn typo_forms(&self, w: &[u8], prefix: bool, literal: bool) -> Forms {
         let own = if prefix { self.prefix_ids(w) } else { self.word_id(w).map_or(0..0, |id| id..id + 1) };
         let own_rows = self.rows_in(own.clone());
-        let mut forms = Forms { ranges: if own.is_empty() { vec![] } else { vec![own] }, own_rows, ..Default::default() };
+        let whole = if prefix { self.word_id(w).map_or(0..0, |id| id..id + 1) } else { own.clone() };
+        let mut forms = Forms {
+            ranges: if own.is_empty() { vec![] } else { vec![own] },
+            own_rows,
+            exact: if whole.is_empty() { vec![] } else { vec![whole] },
+            ..Default::default()
+        };
         if literal || max_edits(w.len()) == 0 {
             return forms;
         }
@@ -1322,7 +1429,8 @@ impl SearchIndex {
         cands.retain(|c| c.2 * KEEP_BELOW_BEST >= best);
         cands.truncate(CORRECTIONS);
         for (text, ids, rows) in cands {
-            forms.ranges.push(ids);
+            forms.ranges.push(ids.clone());
+            forms.typo.push(ids);
             forms.corrections.push((text, rows));
         }
         forms
@@ -1361,7 +1469,7 @@ impl SearchIndex {
         out: &mut [u8],
     ) -> Result<(), FormatError> {
         for r in ids {
-            self.groups[g].mark_range(r.clone(), out);
+            self.groups[g].mark_range(r.start * self.fields..r.end * self.fields, out);
         }
         let rows = out.len();
         for (c, t) in &values.0 {
@@ -1390,7 +1498,8 @@ impl SearchIndex {
             };
             // NULL rows carry some code; a hit there is not a hit
             if let Some(v) = valid {
-                let plain = self.groups[g].plain_hits(ids, rows);
+                let lists: Vec<Ids> = ids.iter().map(|r| r.start * self.fields..r.end * self.fields).collect();
+                let plain = self.groups[g].plain_hits(&lists, rows);
                 for (r, o) in out.iter_mut().enumerate() {
                     if v[r / 8] >> (r % 8) & 1 == 0 && plain[r] == 0 {
                         *o = 0;
