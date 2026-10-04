@@ -27,6 +27,7 @@
     "core.js",
     "worker.js",
     "parquet.js",
+    "fzstd.js",
     "udfs.js",
     "udfs.d.ts",
     "bin/facetful.mjs",

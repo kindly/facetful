@@ -4,7 +4,7 @@
 // are transferred, not cloned.
 
 import { instantiate, transferables, QueryError } from "./core.js";
-import { parquetToColumns } from "./parquet.js";
+import { parquetToColumns, zstdCompressors } from "./parquet.js";
 import { udfs as builtinUdfs } from "./udfs.js";
 
 let engine = null;
@@ -108,9 +108,14 @@ async function loadHyparquet() {
   return hp;
 }
 
+// ZSTD pages need fzstd (vendored, ~3 KB gz), loaded only for a file that uses it
+async function compressorsFor(codecs) {
+  return codecs.has("ZSTD") ? zstdCompressors(await import("./fzstd.js")) : {};
+}
+
 /** Transcode Parquet -> image handle (in wasm memory). */
 async function transcodeParquet(buffer) {
-  const { rows, columns } = await parquetToColumns(await loadHyparquet(), buffer);
+  const { rows, columns } = await parquetToColumns(await loadHyparquet(), buffer, { compressorsFor });
   return { rows, img: engine.compileTable(rows, columns) };
 }
 
