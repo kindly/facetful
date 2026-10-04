@@ -158,6 +158,10 @@ function convert(input, output, groupSize) {
   feedFile();
   if (engine.w.convert_finish(h) < 0) fail();
   drain();
+  // the header went out first: its image-length field is filled in now
+  const len = new Uint8Array(8);
+  new DataView(len.buffer).setBigUint64(0, BigInt(written), true);
+  writeSync(out, len, 0, 8, engine.w.convert_len_offset(h));
   closeSync(out);
   const rows = engine.w.convert_rows(h);
   engine.w.convert_free(h);

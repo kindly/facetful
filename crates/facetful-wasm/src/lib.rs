@@ -1515,6 +1515,8 @@ pub struct Converter {
     error: Option<String>,
     rows: u64,
     schema: Option<facetful_engine::format::Schema>,
+    /// where the image's length goes in its header
+    len_at: u64,
 }
 
 #[no_mangle]
@@ -1527,6 +1529,7 @@ pub extern "C" fn convert_begin(group_target: u32) -> usize {
         error: None,
         rows: 0,
         schema: None,
+        len_at: 0,
     })) as usize
 }
 
@@ -1609,6 +1612,7 @@ pub extern "C" fn convert_pass2(h: usize) -> i32 {
     match facetful_engine::format::stream::Encoder::new(sniffer.finish(), c.group_target) {
         Ok(enc) => {
             c.schema = Some(enc.schema().clone());
+            c.len_at = enc.len_offset();
             c.reader = facetful_engine::format::stream::CsvReader::new();
             c.phase = Phase::Encode { enc, header_seen: false };
             0
@@ -1647,6 +1651,13 @@ pub extern "C" fn convert_finish(h: usize) -> i32 {
             -1
         }
     }
+}
+
+/// Where the image's length goes in its header (u64 LE): the output went
+/// out a piece at a time, so the caller writes it there once it has it all.
+#[no_mangle]
+pub extern "C" fn convert_len_offset(h: usize) -> f64 {
+    converter(h).len_at as f64
 }
 
 /// Bytes ready to be written; `convert_output_copy` copies and clears them.

@@ -2,7 +2,8 @@
 //!
 //! Layout (see docs/design.sv for the rationale):
 //! ```text
-//! [header: magic "FCT1", header_len, version, row-group target, schema, sorted_by]
+//! [header: magic "FCT1", header_len, version, row-group target, schema, sorted_by,
+//!          image length (u64; added later, so readers find it by header_len)]
 //! [row-group 0: group header (row count, per-column null counts + segment lengths) + segments…]
 //! …
 //! [footer: total rows, group directory (offsets, row counts, per-column lens + min/max stats),
@@ -162,6 +163,9 @@ pub struct Catalog {
     /// Per column: each non-NULL value forms one run in file order
     /// (`layout::CLUSTERED`).
     pub clustered: Vec<bool>,
+    /// The whole image's length, from the header; `None` in images from
+    /// before the field, or streamed out by a writer nobody patched.
+    pub image_len: Option<u64>,
 }
 
 pub fn align_up(n: usize) -> usize {

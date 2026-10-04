@@ -499,10 +499,13 @@ export class Engine {
     if (this.w.convert_finish(h) < 0) fail();
     drain();
     const rows = this.w.convert_rows(h);
+    const lenAt = this.w.convert_len_offset(h);
     this.w.convert_free(h);
     const bytes = new Uint8Array(total);
     let pos = 0;
     for (const q of parts) { bytes.set(q, pos); pos += q.byteLength; }
+    // the header went out first: its image-length field is filled in now
+    new DataView(bytes.buffer).setBigUint64(lenAt, BigInt(total), true);
     return { bytes, rows, schema };
   }
 

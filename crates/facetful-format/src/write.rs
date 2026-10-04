@@ -46,6 +46,8 @@ pub struct Writer {
     total_rows: u64,
     /// per column: whether its values still form one run each (footer trailer)
     clusters: Vec<crate::cluster::Cluster>,
+    /// file position of the header's image-length field
+    len_at: usize,
 }
 
 impl Writer {
@@ -76,6 +78,7 @@ impl Writer {
             flushed: 0,
             groups: Vec::new(),
             total_rows: 0,
+            len_at: 0,
         };
         w.write_header();
         w.write_dict_block(dicts);
@@ -119,6 +122,12 @@ impl Writer {
             self.put_u16(s.column);
             self.buf.push(s.descending as u8);
         }
+        // the whole image's length, so a reader receiving it as a stream can
+        // allocate once: 0 until `finish` (or, when the header was already
+        // handed out, the caller: see `len_offset`) fills it in. Readers from
+        // before it skip it: they go by header_len.
+        self.len_at = self.buf.len();
+        self.put_u64(0);
         self.pad();
         let hlen = self.buf.len() as u32;
         self.buf[len_pos..len_pos + 4].copy_from_slice(&hlen.to_le_bytes());
@@ -255,6 +264,13 @@ impl Writer {
         self.total_rows
     }
 
+    /// File position of the header's image-length field (u64 LE). `finish`
+    /// fills it in when it still holds the header; a caller that took the
+    /// header out with `take_output` writes the image's length there itself.
+    pub fn len_offset(&self) -> u64 {
+        self.len_at as u64
+    }
+
     /// Write the footer and return the finished file bytes (the remainder,
     /// after any `take_output`).
     pub fn finish(mut self) -> Vec<u8> {
@@ -301,6 +317,10 @@ impl Writer {
         let footer_len = (self.buf.len() - footer_start) as u32;
         self.put_u32(footer_len);
         self.buf.extend_from_slice(&MAGIC);
+        if self.flushed == 0 {
+            let len = (self.buf.len() as u64).to_le_bytes();
+            self.buf[self.len_at..self.len_at + 8].copy_from_slice(&len);
+        }
         self.buf
     }
 }

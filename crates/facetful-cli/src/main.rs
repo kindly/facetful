@@ -371,9 +371,15 @@ fn convert(args: &[String]) {
     })
     .unwrap_or_else(|e| fail(e));
     let rows = enc.rows();
+    let len_at = enc.len_offset();
     let tail = enc.finish().unwrap_or_else(|e| fail(e));
     out.write_all(&tail).unwrap_or_else(|e| fail(format!("write {output}: {e}")));
     written += tail.len() as u64;
+    // the header went out first: its image-length field is filled in now
+    use std::io::{Seek, SeekFrom};
+    out.seek(SeekFrom::Start(len_at))
+        .and_then(|_| out.write_all(&written.to_le_bytes()))
+        .unwrap_or_else(|e| fail(format!("write {output}: {e}")));
     eprintln!("{output}: {written} bytes ({} row groups)", (rows as u32).div_ceil(group_size));
 }
 

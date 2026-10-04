@@ -107,6 +107,13 @@ impl<'a> Cursor<'a> {
 /// Parse the header bytes (which begin at file offset 0, magic included).
 /// `buf` must contain at least the whole header; pass the first few KB.
 pub fn parse_header(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32), FormatError> {
+    parse_header_len(buf).map(|(schema, sorted_by, version, target, hlen, _)| (schema, sorted_by, version, target, hlen))
+}
+
+/// `parse_header`, and the image's length when the header carries it: a u64
+/// after the sort keys, present when the header (padded to 8 bytes) has at
+/// least 8 bytes left after them; 0 means not filled in.
+fn parse_header_len(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32, Option<u64>), FormatError> {
     let mut c = Cursor::new(buf);
     if c.take(4)? != MAGIC {
         return Err(FormatError::BadMagic);
@@ -140,7 +147,8 @@ pub fn parse_header(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32),
         let descending = c.u8()? != 0;
         sorted_by.push(SortKey { column, descending });
     }
-    Ok((Schema { columns }, sorted_by, version, row_group_target, header_len))
+    let image_len = if header_len as usize >= c.p + 8 { Some(c.u64()?).filter(|&n| n > 0) } else { None };
+    Ok((Schema { columns }, sorted_by, version, row_group_target, header_len, image_len))
 }
 
 /// Open a file: reads header + footer through `src`, returns the parsed catalog.
@@ -153,7 +161,7 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
     let hprobe = file_len.min(64 * 1024) as usize;
     let mut hbuf = vec![0u8; hprobe];
     src.read_at(0, &mut hbuf)?;
-    let (schema, sorted_by, version, row_group_target, _hlen) = parse_header(&hbuf)?;
+    let (schema, sorted_by, version, row_group_target, _hlen, image_len) = parse_header_len(&hbuf)?;
 
     // Tail: footer_len + magic.
     let mut tail = [0u8; 8];
@@ -217,6 +225,7 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
 
     Ok(Catalog {
         clustered,
+        image_len,
         version,
         row_group_target,
         schema,
@@ -267,7 +276,7 @@ pub fn open_prefix(bytes: &[u8]) -> Result<Option<(Catalog, u64)>, FormatError> 
     if bytes.len() < hlen {
         return Ok(None);
     }
-    let (schema, sorted_by, version, row_group_target, hlen) = parse_header(&bytes[..hlen])?;
+    let (schema, sorted_by, version, row_group_target, hlen, image_len) = parse_header_len(&bytes[..hlen])?;
     let table_end = hlen as usize + dict_table_len(&schema);
     if bytes.len() < table_end {
         return Ok(None);
@@ -279,6 +288,7 @@ pub fn open_prefix(bytes: &[u8]) -> Result<Option<(Catalog, u64)>, FormatError> 
     let ncols = schema.columns.len();
     let cat = Catalog {
         clustered: vec![false; ncols],
+        image_len,
         version,
         row_group_target,
         schema,
@@ -547,6 +557,20 @@ mod tests {
             no[..20].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         assert_eq!(offs, vec![0, 1, 1, 15, 16]);
 
+        // the length is in the header; a writer whose header was taken out
+        // before the end leaves it 0, which reads as unknown
+        assert_eq!(cat.image_len, Some(file.len() as u64));
+        let mut w = Writer::new(cat.schema.clone(), vec![], 4, &dicts);
+        let mut streamed = w.take_output();
+        let at = w.len_offset() as usize;
+        streamed.extend(w.finish());
+        let s: &[u8] = &streamed;
+        assert_eq!(open(&s).unwrap().image_len, None);
+        let len = (streamed.len() as u64).to_le_bytes();
+        streamed[at..at + 8].copy_from_slice(&len);
+        let s: &[u8] = &streamed;
+        assert_eq!(open(&s).unwrap().image_len, Some(streamed.len() as u64));
+
         // header alone parses (streaming path)
         let (schema2, _, _, _, hlen) = parse_header(&file[..file.len().min(1024)]).unwrap();
         assert_eq!(schema2.columns[4].name, "note");
@@ -558,12 +582,14 @@ mod tests {
     fn stream_matches_footer(file: &[u8]) {
         let src: &[u8] = file;
         let full = open(&src).unwrap();
+        assert_eq!(full.image_len, Some(file.len() as u64), "the header gives the image's length");
         let mut found: Vec<GroupMeta> = Vec::new();
         let (mut cat, mut at, mut ended) = (None::<Catalog>, 0u64, false);
         for n in 0..=file.len() {
             let bytes = &file[..n];
             if cat.is_none() {
                 if let Some((c, first)) = open_prefix(bytes).unwrap() {
+                    assert_eq!(c.image_len, full.image_len);
                     assert_eq!(c.schema.columns.len(), full.schema.columns.len());
                     assert_eq!(c.dicts, full.dicts);
                     cat = Some(c);

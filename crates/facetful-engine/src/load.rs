@@ -33,6 +33,7 @@ pub struct TableLoad<S: ReadAt> {
 impl<S: ReadAt> TableLoad<S> {
     /// `expected_len`: the image's size when known (an uncompressed
     /// Content-Length), so the buffer is allocated once instead of growing.
+    /// Images whose header gives their length need none.
     pub fn new(expected_len: usize) -> TableLoad<S> {
         TableLoad {
             pending: Vec::with_capacity(expected_len),
@@ -54,7 +55,12 @@ impl<S: ReadAt> TableLoad<S> {
             None => {
                 self.pending.extend_from_slice(chunk);
                 let Some((cat, first)) = read::open_prefix(&self.pending)? else { return Ok(()) };
-                let bytes = std::mem::take(&mut self.pending);
+                let mut bytes = std::mem::take(&mut self.pending);
+                // the header says how long the image is: room for all of it
+                // now rather than doubling as it arrives
+                if let Some(n) = cat.image_len {
+                    bytes.reserve_exact((n as usize).saturating_sub(bytes.len()));
+                }
                 let src = S::from_memory(bytes).ok_or(FormatError::Io("source cannot hold memory"))?;
                 self.table = Some(Table::from_catalog(src, cat));
                 self.next = first;

@@ -465,6 +465,12 @@ impl Encoder {
         self.writer.take_output()
     }
 
+    /// Where the image's length goes in the header (u64 LE): a caller that
+    /// took the header out with `take_output` writes it there at the end.
+    pub fn len_offset(&self) -> u64 {
+        self.writer.len_offset()
+    }
+
     pub fn rows(&self) -> u64 {
         self.rows
     }
@@ -545,7 +551,10 @@ pub fn convert_csv(csv: &[u8], group_target: u32, chunk: usize) -> Result<(Vec<u
         return Err(e);
     }
     out.extend(enc.take_output());
+    let at = enc.len_offset() as usize;
     out.extend(enc.finish()?);
+    let len = (out.len() as u64).to_le_bytes();
+    out[at..at + 8].copy_from_slice(&len);
     Ok((out, schema))
 }
 
