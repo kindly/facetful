@@ -160,6 +160,20 @@ export declare class Facetful {
     options?: { searchColumns?: string[]; persist?: string; expectedBytes?: number },
   ): Promise<{ name: string; rows: number; indexedWhileLoading: number; searchReady: boolean; persisted: boolean; elapsedMs: number }>;
 
+  /**
+   * Fetch the other part of a table's split image (`facetful split`) and
+   * append its columns to the table. With `searchColumns` (of this part) it
+   * is indexed as it arrives and the two indexes become one over both
+   * parts' columns. `persist` writes it to OPFS as it arrives.
+   */
+  attach(
+    url: string | URL,
+    options?: { table?: string; searchColumns?: string[]; persist?: string; expectedBytes?: number },
+  ): Promise<{ columns: number; persisted: boolean; elapsedMs: number }>;
+
+  /** `attach` from a part stored in OPFS (opened lazily, like `loadOpfs`). */
+  attachOpfs(path: string, options?: { table?: string; cacheBytes?: number }): Promise<{ columns: number; elapsedMs: number }>;
+
   /** Resolves when the table's search index, from `loadUrl`, is in use. */
   searchReady(options?: { table?: string }): Promise<void>;
 

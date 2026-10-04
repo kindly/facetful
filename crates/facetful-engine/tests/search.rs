@@ -832,3 +832,89 @@ fn index_built_while_the_image_arrives() {
     assert!(load.finish().is_err());
 }
 
+
+/// Each part of a split image indexed on its own (as it streams), merged at
+/// attach: the same index and answers as building over the whole table.
+#[test]
+fn split_parts_merge_their_indexes() {
+    use facetful_engine::format::split::split;
+    use facetful_engine::load::TableLoad;
+    use facetful_engine::sql::exec::SuggestOptions;
+    use facetful_engine::sql::search_suggest;
+    let img = image();
+    let src: &[u8] = &img;
+    let (a, b) = split(&src, &[2], 7).unwrap(); // descr goes to the second part
+    let mut whole = table();
+    let want = whole.build_search_index(&[0, 1, 2]).unwrap();
+    let sql = |q: &str| format!("select count(*) from t where search('{q}', {COLS})");
+    let rank = "select title, org, descr from t where search('mental helth', title, org, descr) \
+                order by search_rank('mental helth', title, 1, org, 3, descr, 5) limit 30";
+    let rows = |t: &mut Table<Vec<u8>>, sql: &str| {
+        let mut r = run_query(t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+        r.ensure_rows();
+        r.rows.iter().map(|row| format!("{row:?}")).collect::<Vec<_>>()
+    };
+    let check = |t: &mut Table<Vec<u8>>, whole: &mut Table<Vec<u8>>, how: &str| {
+        let got = t.search_index().expect("merged").stats();
+        assert_eq!(
+            (got.words, got.pairs, got.value_pairs, got.bitmap_entries),
+            (want.words, want.pairs, want.value_pairs, want.bitmap_entries),
+            "{how}"
+        );
+        for q in QUERIES {
+            assert_eq!(count(t, &sql(q)), count(whole, &sql(q)), "{how}: '{q}'");
+        }
+        assert_eq!(rows(t, rank), rows(whole, rank), "{how}: ranked");
+        let cols = [0, 1, 2];
+        for q in ["men", "mental heal", "youth sp", "helth "] {
+            let s = |t: &mut Table<Vec<u8>>| format!("{:?}", search_suggest(t, &cols, q, None, &SuggestOptions { limit: 5, did_you_mean: true }).unwrap());
+            assert_eq!(s(t), s(whole), "{how}: suggest '{q}'");
+        }
+    };
+    let stream = |bytes: &[u8], cols: &[&str]| {
+        let mut l = TableLoad::<Vec<u8>>::new(0);
+        l.index_columns(cols).unwrap();
+        for c in bytes.chunks(500) {
+            l.push(c).unwrap();
+            l.index_step(1).unwrap();
+        }
+        l.finish().unwrap()
+    };
+    // descr alone to the second part, then the dictionary column org with it
+    for (second_cols, first_names, second_names) in
+        [(vec![2], vec!["title", "org"], vec!["descr"]), (vec![1, 2], vec!["title"], vec!["org", "descr"])]
+    {
+        let (a, b) = split(&src, &second_cols, 7).unwrap();
+        let idx = |t: &Table<Vec<u8>>, names: &[&str]| names.iter().map(|n| t.column_index(n).unwrap()).collect::<Vec<_>>();
+        // opened whole, indexed, attached
+        let mut t = Table::open(a.clone()).unwrap();
+        let cols = idx(&t, &first_names);
+        t.build_search_index(&cols).unwrap();
+        let mut second = Table::open(b.clone()).unwrap();
+        let cols = idx(&second, &second_names);
+        second.build_search_index(&cols).unwrap();
+        t.attach(second).unwrap();
+        check(&mut t, &mut whole, &format!("opened, {second_names:?} second"));
+        // streamed, each indexed as it arrives
+        let mut t = stream(&a, &first_names);
+        t.attach(stream(&b, &second_names)).unwrap();
+        check(&mut t, &mut whole, &format!("streamed, {second_names:?} second"));
+    }
+    // only one side indexed: the first keeps its index, the second's moves over
+    let mut t = Table::open(a.clone()).unwrap();
+    t.build_search_index(&[0, 1]).unwrap();
+    t.attach(Table::open(b.clone()).unwrap()).unwrap();
+    assert_eq!(t.search_index().unwrap().cols, vec![0, 1]);
+    let mut t = Table::open(a.clone()).unwrap();
+    let mut second = Table::open(b.clone()).unwrap();
+    second.build_search_index(&[0]).unwrap();
+    t.attach(second).unwrap();
+    assert_eq!(t.search_index().unwrap().cols, vec![2]);
+    let mut w2 = table();
+    w2.build_search_index(&[2]).unwrap();
+    for q in QUERIES {
+        let one = |t: &mut Table<Vec<u8>>| count(t, &format!("select count(*) from t where search('{q}', descr)"));
+        assert_eq!(one(&mut t), one(&mut w2), "descr only: '{q}'");
+    }
+}
+

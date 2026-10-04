@@ -98,8 +98,49 @@ async function opfsAppender(path) {
   }
 }
 
+/** Fetch an image and open it as it arrives (`openStream`): indexed as it
+ *  comes with `searchColumns`, written to OPFS with `persist`. */
+async function streamImage({ url, searchColumns, persist, expectedBytes }) {
+  const r = await fetch(url);
+  if (!r.ok || !r.body) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+  // Content-Length is the image's size only when the response is not
+  // compressed in transit (images also say their size in their header)
+  expectedBytes ??= r.headers.get("content-encoding") ? 0 : Number(r.headers.get("content-length")) || 0;
+  const out = persist ? await opfsAppender(persist) : null;
+  let loaded;
+  try {
+    loaded = await engine.openStream(bodyChunks(r.body), {
+      expectedBytes,
+      searchColumns,
+      onChunk: out ? (c) => out.write(c) : undefined,
+    });
+  } catch (err) {
+    await out?.abort();
+    throw err;
+  }
+  out?.close();
+  return { ...loaded, persisted: !!out };
+}
+
+/** Index the groups a download outran, in the background: a group at a
+ *  time, yielding so queries run meanwhile (search() scans until done). */
+function finishIndexLater(handle) {
+  searchBuilds.set(handle, (async () => {
+    while (engine.stepSearchIndex(handle, 1) > 0) await new Promise((r) => setTimeout(r, 0));
+    searchBuilds.delete(handle);
+  })());
+}
+
 /** Open an OPFS-backed table lazily (metadata now, segments on demand). */
 async function opfsOpenTable(name, path, cacheBytes) {
+  const { handle, rows, fileLen } = await opfsOpenHandle(path, cacheBytes);
+  setTable(name, handle);
+  lastTable = handle;
+  return { rows, fileLen };
+}
+
+/** `opfsOpenTable` without registering the table: its handle. */
+async function opfsOpenHandle(path, cacheBytes) {
   // sync access handles are exclusive — reuse ours if this path is already
   // open (positional reads are stateless, so tables can share a handle)
   let fileId = null;
@@ -121,9 +162,7 @@ async function opfsOpenTable(name, path, cacheBytes) {
   }
   try {
     const { handle, rows } = engine.openOpfsTable(fileId, h.getSize(), cacheBytes);
-    setTable(name, handle);
-    lastTable = handle;
-    return { rows, fileLen: h.getSize() };
+    return { handle, rows, fileLen: h.getSize() };
   } catch (err) {
     if (opened) {
       opfsFiles.delete(fileId);
@@ -187,25 +226,7 @@ self.onmessage = async (e) => {
       // built a row group at a time meanwhile, and with `persist` the bytes
       // go to OPFS as they come
       const t0 = performance.now();
-      const r = await fetch(e.data.url);
-      if (!r.ok || !r.body) throw new Error(`fetch ${e.data.url}: HTTP ${r.status}`);
-      // Content-Length is the image's size only when the response is not
-      // compressed in transit
-      const expectedBytes =
-        e.data.expectedBytes ?? (r.headers.get("content-encoding") ? 0 : Number(r.headers.get("content-length")) || 0);
-      const out = e.data.persist ? await opfsAppender(e.data.persist) : null;
-      let loaded;
-      try {
-        loaded = await engine.openStream(bodyChunks(r.body), {
-          expectedBytes,
-          searchColumns: e.data.searchColumns,
-          onChunk: out ? (c) => out.write(c) : undefined,
-        });
-      } catch (err) {
-        await out?.abort();
-        throw err;
-      }
-      out?.close();
+      const loaded = await streamImage(e.data);
       setTable(e.data.name, loaded.handle);
       lastTable = loaded.handle;
       reply({
@@ -213,17 +234,25 @@ self.onmessage = async (e) => {
         rows: loaded.rows,
         indexedWhileLoading: loaded.indexedWhileLoading,
         searchReady: loaded.indexLeft === 0,
-        persisted: !!out,
+        persisted: loaded.persisted,
         elapsedMs: performance.now() - t0,
       });
-      // groups the download outran: indexed now, yielding between groups so
-      // queries run meanwhile (search() scans until the index is finished)
-      if (loaded.indexLeft > 0) {
-        searchBuilds.set(loaded.handle, (async () => {
-          while (engine.stepSearchIndex(loaded.handle, 1) > 0) await new Promise((r) => setTimeout(r, 0));
-          searchBuilds.delete(loaded.handle);
-        })());
-      }
+      if (loaded.indexLeft > 0) finishIndexLater(loaded.handle);
+    } else if (cmd === "attach" || cmd === "attachOpfs") {
+      // the other part of a split image, streamed in (indexed as it comes)
+      // or reopened from OPFS, appended to the table's columns
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error("no table loaded");
+      const t0 = performance.now();
+      const part = cmd === "attach" ? await streamImage(e.data) : await opfsOpenHandle(e.data.path, e.data.cacheBytes);
+      // finishes any index build under way on either part, then merges them
+      engine.attach(handle, part.handle);
+      reply({
+        ok: true,
+        columns: engine.describe(handle).columns.length,
+        persisted: !!part.persisted,
+        elapsedMs: performance.now() - t0,
+      });
     } else if (cmd === "searchReady") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");

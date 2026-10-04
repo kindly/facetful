@@ -246,6 +246,15 @@ export class Engine {
     return { handle, rows: this.w.table_total_rows(handle), indexedWhileLoading: indexed, indexLeft };
   }
 
+  /** Append the columns of `otherHandle`, the other part of the table's
+   *  split image (`facetful split`), to the table. `otherHandle` is used up
+   *  either way. Search indexes on either part become one over both. */
+  attach(tableHandle, otherHandle) {
+    if (this.w.table_attach(tableHandle, otherHandle) < 0) {
+      throw new Error("attach: not the other part of this table's split (split id or row groups differ, or a column name repeats)");
+    }
+  }
+
   /** Open a table backed by a registered OPFS file (reads go through opfs_read). */
   openOpfsTable(fileId, fileLen, cacheBytes) {
     const handle = this.w.table_open_opfs(fileId, fileLen, cacheBytes ?? 0);

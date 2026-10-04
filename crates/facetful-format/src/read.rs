@@ -110,10 +110,16 @@ pub fn parse_header(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32),
     parse_header_len(buf).map(|(schema, sorted_by, version, target, hlen, _)| (schema, sorted_by, version, target, hlen))
 }
 
-/// `parse_header`, and the image's length when the header carries it: a u64
-/// after the sort keys, present when the header (padded to 8 bytes) has at
-/// least 8 bytes left after them; 0 means not filled in.
-fn parse_header_len(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32, Option<u64>), FormatError> {
+/// Header fields added after the first images, each a u64 after the sort
+/// keys, present when the header (padded to 8 bytes) has room for it; 0
+/// means not set.
+struct Later {
+    image_len: Option<u64>,
+    split_id: Option<u64>,
+}
+
+/// `parse_header`, and the fields added since.
+fn parse_header_len(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32, Later), FormatError> {
     let mut c = Cursor::new(buf);
     if c.take(4)? != MAGIC {
         return Err(FormatError::BadMagic);
@@ -147,8 +153,11 @@ fn parse_header_len(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32, 
         let descending = c.u8()? != 0;
         sorted_by.push(SortKey { column, descending });
     }
-    let image_len = if header_len as usize >= c.p + 8 { Some(c.u64()?).filter(|&n| n > 0) } else { None };
-    Ok((Schema { columns }, sorted_by, version, row_group_target, header_len, image_len))
+    let mut later = || -> Result<Option<u64>, FormatError> {
+        Ok(if header_len as usize >= c.p + 8 { Some(c.u64()?).filter(|&n| n > 0) } else { None })
+    };
+    let later = Later { image_len: later()?, split_id: later()? };
+    Ok((Schema { columns }, sorted_by, version, row_group_target, header_len, later))
 }
 
 /// Open a file: reads header + footer through `src`, returns the parsed catalog.
@@ -161,7 +170,7 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
     let hprobe = file_len.min(64 * 1024) as usize;
     let mut hbuf = vec![0u8; hprobe];
     src.read_at(0, &mut hbuf)?;
-    let (schema, sorted_by, version, row_group_target, _hlen, image_len) = parse_header_len(&hbuf)?;
+    let (schema, sorted_by, version, row_group_target, _hlen, later) = parse_header_len(&hbuf)?;
 
     // Tail: footer_len + magic.
     let mut tail = [0u8; 8];
@@ -225,7 +234,8 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
 
     Ok(Catalog {
         clustered,
-        image_len,
+        image_len: later.image_len,
+        split_id: later.split_id,
         version,
         row_group_target,
         schema,
@@ -276,7 +286,7 @@ pub fn open_prefix(bytes: &[u8]) -> Result<Option<(Catalog, u64)>, FormatError> 
     if bytes.len() < hlen {
         return Ok(None);
     }
-    let (schema, sorted_by, version, row_group_target, hlen, image_len) = parse_header_len(&bytes[..hlen])?;
+    let (schema, sorted_by, version, row_group_target, hlen, later) = parse_header_len(&bytes[..hlen])?;
     let table_end = hlen as usize + dict_table_len(&schema);
     if bytes.len() < table_end {
         return Ok(None);
@@ -288,7 +298,8 @@ pub fn open_prefix(bytes: &[u8]) -> Result<Option<(Catalog, u64)>, FormatError> 
     let ncols = schema.columns.len();
     let cat = Catalog {
         clustered: vec![false; ncols],
-        image_len,
+        image_len: later.image_len,
+        split_id: later.split_id,
         version,
         row_group_target,
         schema,
@@ -368,7 +379,13 @@ pub fn next_group(cat: &Catalog, bytes: &[u8], at: u64) -> NextGroup {
 /// Absolute file offset of segment `seg` of column `col` within group `g`.
 /// Segments follow the (padded) group header in column order.
 pub fn segment_offset(cat: &Catalog, g: &GroupMeta, col: usize, seg: usize) -> u64 {
-    let header_len = align_up(4 + cat.schema.columns.len() * (4 + 4 * MAX_SEGS));
+    segment_offset_in(g, cat.schema.columns.len(), col, seg)
+}
+
+/// `segment_offset` for a group of an image with `ncols` columns, whose
+/// metadata may list more after them (a table with an image attached).
+pub fn segment_offset_in(g: &GroupMeta, ncols: usize, col: usize, seg: usize) -> u64 {
+    let header_len = align_up(4 + ncols * (4 + 4 * MAX_SEGS));
     let mut off = g.offset + header_len as u64;
     for (ci, cm) in g.cols.iter().enumerate() {
         for (si, len) in cm.seg_lens.iter().enumerate() {

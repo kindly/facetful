@@ -50,6 +50,9 @@ pub struct Writer {
     len_at: usize,
 }
 
+/// The split id follows the image length in the header.
+const SPLIT_ID_AFTER_LEN: usize = 8;
+
 impl Writer {
     /// `dicts` must align with the schema: `Some(DictData)` exactly for columns
     /// flagged DICTIONARY.
@@ -127,6 +130,9 @@ impl Writer {
         // handed out, the caller: see `len_offset`) fills it in. Readers from
         // before it skip it: they go by header_len.
         self.len_at = self.buf.len();
+        self.put_u64(0);
+        // split id: the images one source was split into share a random id
+        // (`split`); 0 for an image that stands alone
         self.put_u64(0);
         self.pad();
         let hlen = self.buf.len() as u32;
@@ -262,6 +268,14 @@ impl Writer {
 
     pub fn total_rows(&self) -> u64 {
         self.total_rows
+    }
+
+    /// Mark the image as one part of a split (see `split`): the parts share
+    /// `id`. Before any output is taken: it goes in the header.
+    pub fn set_split_id(&mut self, id: u64) {
+        assert_eq!(self.flushed, 0, "the header was already handed out");
+        let at = self.len_at + SPLIT_ID_AFTER_LEN;
+        self.buf[at..at + 8].copy_from_slice(&id.to_le_bytes());
     }
 
     /// File position of the header's image-length field (u64 LE). `finish`

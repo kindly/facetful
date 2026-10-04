@@ -96,6 +96,25 @@ const viaStream = (await ok({ cmd: "query", table: "s", sql: sqs })).result.colu
 if (viaStream !== after) throw new Error(`search over the streamed table: ${viaStream} against ${after}`);
 const sgs = (await ok({ cmd: "searchSuggest", table: "s", q: "countr", columns: ["country", "owner"] })).suggestions;
 if (!sgs.indexed) throw new Error("the streamed table's index is not in use");
+// a split image (facetful split): the first part streamed in, the second
+// attached, each indexed as it arrives: the same answers as the whole image
+const part = (n) => new URL(`data-200000.part${n}.facetful`, spike).href;
+await ok({ cmd: "loadUrl", name: "p", url: part(1), searchColumns: ["country"] });
+const early = await send({ cmd: "query", table: "p", sql: "select count(*) as n from p where owner = 'owner_1'" });
+if (early.ok || !/owner/.test(early.error)) throw new Error(`a column of the unattached part answered: ${JSON.stringify(early)}`);
+const att = await ok({ cmd: "attach", table: "p", url: part(2), searchColumns: ["owner"] });
+if (att.columns !== 8 || att.persisted) throw new Error(`attach reply ${JSON.stringify(att)}`);
+const viaParts = (await ok({ cmd: "query", table: "p", sql: sq.replace("from t", "from p") })).result.columns[0].values[0];
+if (viaParts !== after) throw new Error(`search over the attached parts: ${viaParts} against ${after}`);
+const across = "select fuel, count(*) as n, round(sum(capacity), 3) as mw from t where country = 'country_3' group by fuel order by fuel";
+const cells = (r) => JSON.stringify(r.result.columns.map((c) => c.values ? [...c.values] : c.offsets ? [...c.offsets] : null));
+const [p, w] = [await ok({ cmd: "query", table: "p", sql: across.replace("from t", "from p") }), await ok({ cmd: "query", table: "t", sql: across })];
+if (cells(p) !== cells(w)) throw new Error("a query over both parts differs from the whole image");
+if (!(await ok({ cmd: "searchSuggest", table: "p", q: "countr", columns: ["country", "owner"] })).suggestions.indexed) {
+  throw new Error("the merged index is not in use");
+}
+const wrong = await send({ cmd: "attach", table: "s", url: part(2) });
+if (wrong.ok) throw new Error("attached a part to a table that is not its split");
 const missing = await send({ cmd: "loadUrl", name: "x", url: new URL("data-200000.facetful", spike).href, searchColumns: ["nope"] });
 if (missing.ok) throw new Error("loadUrl indexed a column that is not there");
 
@@ -151,7 +170,7 @@ if (be.ok || !be.isQueryError || !/statement 1: .*unknown column 'contry'/s.test
 // memoryStats: the worker's wasm high-water and table count
 {
   const m = await ok({ cmd: "memoryStats" });
-  if (!(m.wasmBytes > 1 << 20) || m.tables !== 4) throw new Error(`memoryStats ${JSON.stringify(m)}`);
+  if (!(m.wasmBytes > 1 << 20) || m.tables !== 5) throw new Error(`memoryStats ${JSON.stringify(m)}`);
 }
 
 // errors come back as replies, with the query flag set for SQL errors

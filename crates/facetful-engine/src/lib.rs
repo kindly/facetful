@@ -61,6 +61,19 @@ pub struct Table<S: ReadAt> {
     /// until it is finished.
     #[cfg(feature = "search")]
     search_builder: Option<search_index::IndexBuilder>,
+    /// columns read from `src`: the first image's; columns after them come
+    /// from attached images (`attach`)
+    base_cols: usize,
+    attached: Vec<Attached<S>>,
+}
+
+/// An image whose columns were appended to a table's (`Table::attach`).
+struct Attached<S: ReadAt> {
+    src: S,
+    /// its own catalog: segment offsets are within its file
+    cat: Catalog,
+    /// the table's index of its first column
+    first: usize,
 }
 
 /// Default derived-table budget: a few large rollups, dozens of facet-sized ones.
@@ -107,6 +120,7 @@ impl<S: ReadAt> Table<S> {
     /// A table over `src` described by `cat` (from `read::open`, or a
     /// catalog still growing while the image arrives: see `load`).
     fn from_catalog(src: S, cat: Catalog) -> Self {
+        let base_cols = cat.schema.columns.len();
         let dict_cache = cat.schema.columns.iter().map(|_| None).collect();
         let dict_rc_cache = cat.schema.columns.iter().map(|_| None).collect();
         Self {
@@ -129,6 +143,70 @@ impl<S: ReadAt> Table<S> {
             search_index: None,
             #[cfg(feature = "search")]
             search_builder: None,
+            base_cols,
+            attached: Vec::new(),
+        }
+    }
+
+    /// Append the columns of `other`, the other part of a split image
+    /// (`format::split`), to this table: same split id, same row groups.
+    /// Column indices of this table stay as they were, so cached masks stay
+    /// valid; derived tables are dropped (a `select *` among them would miss
+    /// the new columns). The two word indexes, if built, become one over
+    /// both images' columns (a build under way is finished first).
+    pub fn attach(&mut self, other: Table<S>) -> Result<(), FormatError> {
+        let (a, b) = (&self.cat, &other.cat);
+        if a.split_id.is_none() || a.split_id != b.split_id {
+            return Err(FormatError::Corrupt("attach: the images are not parts of one split"));
+        }
+        if a.groups.len() != b.groups.len() || a.groups.iter().zip(&b.groups).any(|(x, y)| x.row_count != y.row_count) {
+            return Err(FormatError::Corrupt("attach: the images' row groups differ"));
+        }
+        if b.schema.columns.iter().any(|c| a.schema.columns.iter().any(|d| d.name == c.name)) {
+            return Err(FormatError::Corrupt("attach: a column name is in both images"));
+        }
+        if !other.attached.is_empty() {
+            return Err(FormatError::Corrupt("attach: the image to attach has images attached"));
+        }
+        let first = self.cat.schema.columns.len();
+        #[cfg(feature = "search")]
+        let mut other = other;
+        #[cfg(feature = "search")]
+        let index = {
+            self.search_index_step(usize::MAX)?;
+            other.search_index_step(usize::MAX)?;
+            match (self.search_index.take(), other.search_index.take()) {
+                (a, None) => a,
+                (a, Some(b)) => {
+                    let a = a.unwrap_or_else(|| std::rc::Rc::new(search_index::SearchIndex::empty(self.group_count())));
+                    Some(std::rc::Rc::new(search_index::SearchIndex::merge(&a, &b, first)))
+                }
+            }
+        };
+        let Table { src, cat, .. } = other;
+        self.cat.schema.columns.extend(cat.schema.columns.iter().cloned());
+        self.cat.dicts.extend(cat.dicts.iter().copied());
+        self.cat.clustered.extend(cat.clustered.iter().copied());
+        for (g, h) in self.cat.groups.iter_mut().zip(&cat.groups) {
+            g.cols.extend(h.cols.iter().cloned());
+        }
+        self.dict_cache.extend(cat.schema.columns.iter().map(|_| None));
+        self.dict_rc_cache.extend(cat.schema.columns.iter().map(|_| None));
+        self.derived.clear();
+        self.derived_bytes = 0;
+        self.attached.push(Attached { src, cat, first });
+        #[cfg(feature = "search")]
+        {
+            self.search_index = index;
+        }
+        Ok(())
+    }
+
+    /// Where segment `seg` of (`group`, `col`) is: its source and offset.
+    fn locate(&self, group: usize, col: usize, seg: usize) -> (&S, u64) {
+        match self.attached.iter().rev().find(|a| col >= a.first) {
+            None => (&self.src, read::segment_offset_in(&self.cat.groups[group], self.base_cols, col, seg)),
+            Some(a) => (&a.src, read::segment_offset(&a.cat, &a.cat.groups[group], col - a.first, seg)),
         }
     }
 
@@ -438,10 +516,9 @@ impl<S: ReadAt> Table<S> {
 
     /// A segment already in memory (borrowed source, or LRU-resident), if so.
     fn resident(&self, group: usize, col: usize, seg: usize) -> Option<&[u8]> {
-        let g = &self.cat.groups[group];
-        let len = g.cols[col].seg_lens[seg] as usize;
-        let off = read::segment_offset(&self.cat, g, col, seg);
-        self.src.read_ref(off, len).or_else(|| {
+        let len = self.cat.groups[group].cols[col].seg_lens[seg] as usize;
+        let (src, off) = self.locate(group, col, seg);
+        src.read_ref(off, len).or_else(|| {
             self.cache.get(&(group as u32, col as u32, seg as u8)).map(|e| e.data.as_slice())
         })
     }
@@ -460,18 +537,20 @@ impl<S: ReadAt> Table<S> {
     fn segment(&mut self, group: usize, col: usize, seg: usize) -> Result<&[u8], FormatError> {
         // In-memory sources are borrowed zero-copy: no cache entry, no 2x
         // resident cost. Only positional sources (OPFS) fill the LRU below.
+        let len = self.cat.groups[group].cols[col].seg_lens[seg] as usize;
         {
-            let g = &self.cat.groups[group];
-            let len = g.cols[col].seg_lens[seg] as usize;
-            let off = read::segment_offset(&self.cat, g, col, seg);
-            if self.src.read_ref(off, len).is_some() {
-                return Ok(self.src.read_ref(off, len).unwrap());
+            let (src, off) = self.locate(group, col, seg);
+            if src.read_ref(off, len).is_some() {
+                let (src, off) = self.locate(group, col, seg);
+                return Ok(src.read_ref(off, len).unwrap());
             }
         }
         let key = (group as u32, col as u32, seg as u8);
         self.tick += 1;
         if !self.cache.contains_key(&key) {
-            let bytes = read::read_segment(&self.src, &self.cat, group, col, seg)?;
+            let (src, off) = self.locate(group, col, seg);
+            let mut bytes = vec![0u8; len];
+            src.read_at(off, &mut bytes)?;
             self.evict_to_budget(bytes.len());
             self.cache_bytes += bytes.len();
             self.cache.insert(key, SegEntry { data: bytes, last_used: self.tick });
@@ -584,7 +663,10 @@ impl<S: ReadAt> Table<S> {
     /// Dictionary values of `col`, from the file-level dictionary block (cached).
     pub fn dictionary(&mut self, col: usize) -> Result<Vec<String>, FormatError> {
         if self.dict_cache[col].is_none() {
-            let d = read::read_dictionary(&self.src, &self.cat, col)?;
+            // the merged catalog's dictionary locations are within each
+            // column's own image
+            let src = self.attached.iter().rev().find(|a| col >= a.first).map_or(&self.src, |a| &a.src);
+            let d = read::read_dictionary(src, &self.cat, col)?;
             self.dict_cache[col] = Some(d);
         }
         Ok(self.dict_cache[col].clone().unwrap())

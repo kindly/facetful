@@ -78,6 +78,33 @@ export class Facetful {
     return { name, rows, indexedWhileLoading, searchReady, persisted, elapsedMs };
   }
 
+  /**
+   * Fetch the other part of a table's split image (`facetful split`) and
+   * append its columns to the table as one: same rows, and queries over
+   * columns of both parts. With `searchColumns` (of this part) it is indexed
+   * as it arrives, and the table's index and its become one over both, so
+   * search() then takes the columns of both. `persist` writes it to OPFS
+   * as it arrives (`attachOpfs` on a later visit).
+   */
+  async attach(url, { table, searchColumns, persist, expectedBytes } = {}) {
+    const { columns, persisted, elapsedMs } = await this._call({
+      cmd: "attach",
+      table,
+      url: String(new URL(url, globalThis.location?.href)),
+      searchColumns,
+      persist,
+      expectedBytes,
+    });
+    return { columns, persisted, elapsedMs };
+  }
+
+  /** `attach` from a part stored in OPFS (opened lazily, like `loadOpfs`). */
+  async attachOpfs(path, { table, cacheBytes } = {}) {
+    const budget = cacheBytes ?? defaultCacheBudget();
+    const { columns, elapsedMs } = await this._call({ cmd: "attachOpfs", table, path, cacheBytes: budget });
+    return { columns, elapsedMs };
+  }
+
   /** Resolves when the table's search index, from `loadUrl`, is in use. */
   async searchReady({ table } = {}) {
     await this._call({ cmd: "searchReady", table });
@@ -179,6 +206,7 @@ export class Facetful {
     const { pairs, bytes, elapsedMs } = await this._call({ cmd: "buildSearchIndex", columns, table });
     return { pairs, bytes, elapsedMs };
   }
+
 
   /**
    * What to offer for a search query typed so far over these columns:

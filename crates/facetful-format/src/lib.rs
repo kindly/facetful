@@ -3,7 +3,7 @@
 //! Layout (see docs/design.sv for the rationale):
 //! ```text
 //! [header: magic "FCT1", header_len, version, row-group target, schema, sorted_by,
-//!          image length (u64; added later, so readers find it by header_len)]
+//!          image length, split id (u64s; added later, so readers find them by header_len)]
 //! [row-group 0: group header (row count, per-column null counts + segment lengths) + segments…]
 //! …
 //! [footer: total rows, group directory (offsets, row counts, per-column lens + min/max stats),
@@ -21,6 +21,7 @@ pub mod compile;
 pub mod stream;
 pub mod time;
 pub mod read;
+pub mod split;
 pub mod write;
 
 pub const MAGIC: [u8; 4] = *b"FCT1";
@@ -166,6 +167,8 @@ pub struct Catalog {
     /// The whole image's length, from the header; `None` in images from
     /// before the field, or streamed out by a writer nobody patched.
     pub image_len: Option<u64>,
+    /// For one part of a split image: the id its parts share (`split`).
+    pub split_id: Option<u64>,
 }
 
 pub fn align_up(n: usize) -> usize {

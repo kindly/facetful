@@ -64,6 +64,19 @@ window.__smoke = (async () => {
     const viaStream = (await db.query(sq("u"), { table: "u" })).column("n")[0];
     if (!(viaStream > 0)) throw new Error("search on the streamed table found nothing");
     eq(viaStream, (await db.query(sq("v"), { table: "v" })).column("n")[0], "streamed index agrees");
+    // a split image: part 1 streamed in, part 2 attached, both written to
+    // OPFS as they arrive; reopened from OPFS they attach the same way
+    await step("loadUrl(part 1)", () => db.loadUrl("p1", "/spikes/facet-spike/data-200000.part1.facetful", { persist: "smoke/p1.facetful" }));
+    const at = await step("attach(part 2)", () => db.attach("/spikes/facet-spike/data-200000.part2.facetful", { table: "p1", persist: "smoke/p2.facetful" }));
+    eq(at.columns, 8, "attached columns");
+    eq(at.persisted, true, "attach wrote OPFS");
+    await db.loadOpfs("q1", "smoke/p1.facetful");
+    await step("attachOpfs", () => db.attachOpfs("smoke/p2.facetful", { table: "q1" }));
+    const across = (t) => "select fuel, count(*) as n, round(sum(capacity), 3) as mw from " + t + " where country = 'country_3' group by fuel order by fuel";
+    const res = async (t) => JSON.stringify((await db.query(across(t), { table: t })).column("mw"));
+    const wholeRes = await res("t");
+    eq(await res("p1"), wholeRes, "streamed parts agree with the whole image");
+    eq(await res("q1"), wholeRes, "OPFS parts agree with the whole image");
     await step("registerFunction", () => db.registerFunction("twice", { params: ["int"], returns: "int", perRow: true }, (x) => x * 2));
     eq((await db.query("select twice(count(*)) as n from t", { table: "t" })).column("n")[0], 400000, "registered function");
     const batch = await step("query batch", () => db.query([
@@ -79,11 +92,13 @@ window.__smoke = (async () => {
     eq(info.rows, 200000, "describe rows");
     eq(info.columns.find((c) => c.name === "country").dict, 200, "describe dictionary size");
     const mem = await step("memoryStats", () => db.memoryStats());
-    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 6) throw new Error("memoryStats: " + JSON.stringify(mem));
+    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 8) throw new Error("memoryStats: " + JSON.stringify(mem));
     let msg = "";
     try { await db.query("select contry from t", { table: "t" }); } catch (e) { msg = String(e.message); }
     if (!/unknown column 'contry'/.test(msg)) throw new Error("error path: " + msg);
     await db.removeOpfs("smoke/u.facetful");
+    await db.removeOpfs("smoke/p1.facetful");
+    await db.removeOpfs("smoke/p2.facetful");
     db.close();
     return { ok: true, log };
   } catch (e) {

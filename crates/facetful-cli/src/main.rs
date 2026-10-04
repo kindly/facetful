@@ -39,14 +39,60 @@ fn main() {
         Some("query") => query(&args[1..]),
         Some("materialize") => materialize(&args[1..]),
         Some("join") => join(&args[1..]),
+        Some("split") => split(&args[1..]),
         _ => {
             eprintln!("usage: facetful convert in.csv out.facetful [--row-group-size N]");
             eprintln!("       facetful inspect file.facetful");
             eprintln!("       facetful query file.facetful [\"select …\"]   (no SQL = REPL)");
             eprintln!("       facetful materialize in.facetful \"select …\" out.facetful [--row-group-size N]");
             eprintln!("       facetful join left.facetful right.facetful out.facetful --on l=r[,l2=r2] [--columns a,b] [--inner]");
+            eprintln!("       facetful split in.facetful first.facetful second.facetful --columns a,b");
             exit(2);
         }
+    }
+}
+
+// ---------------- split ----------------
+
+/// Write an image as two with the same row groups: the named columns in the
+/// second, the rest in the first. A page opens the first and attaches the
+/// second when it arrives (`db.attach`); they share a random split id.
+fn split(args: &[String]) {
+    use std::hash::{BuildHasher, Hasher};
+    let usage = || -> ! {
+        eprintln!("usage: facetful split in.facetful first.facetful second.facetful --columns a,b");
+        exit(2);
+    };
+    let mut pos = Vec::new();
+    let mut columns: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--columns" => columns = Some(it.next().cloned().unwrap_or_else(|| usage())),
+            _ => pos.push(a.as_str()),
+        }
+    }
+    let (&[input, first, second], Some(columns)) = (pos.as_slice(), columns) else { usage() };
+    let fail = |e: String| -> ! {
+        eprintln!("{e}");
+        exit(1);
+    };
+    let bytes = std::fs::read(input).unwrap_or_else(|e| fail(format!("cannot read {input}: {e}")));
+    let src: &[u8] = &bytes;
+    let cat = fmt::read::open(&src).unwrap_or_else(|e| fail(format!("{input}: {e:?}")));
+    let cols: Vec<usize> = columns
+        .split(',')
+        .map(|n| {
+            let n = n.trim();
+            cat.schema.columns.iter().position(|c| c.name == n).unwrap_or_else(|| fail(format!("{input} has no column {n:?}")))
+        })
+        .collect();
+    // random: std's per-process hasher keys (never 0)
+    let id = std::collections::hash_map::RandomState::new().build_hasher().finish() | 1;
+    let (a, b) = fmt::split::split(&src, &cols, id).unwrap_or_else(|e| fail(format!("split: {e:?}")));
+    for (path, out) in [(first, &a), (second, &b)] {
+        std::fs::write(path, out).unwrap_or_else(|e| fail(format!("cannot write {path}: {e}")));
+        eprintln!("{path}: {} bytes", out.len());
     }
 }
 

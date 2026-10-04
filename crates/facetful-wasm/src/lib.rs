@@ -339,6 +339,16 @@ pub extern "C" fn load_free(h: usize) {
     drop(unsafe { Box::from_raw(h as *mut facetful_engine::load::TableLoad<Src>) });
 }
 
+/// Attach table `other`, the other part of `t`'s split image, to `t`
+/// (`Table::attach`); `other` is consumed either way. 0 ok, -1 not the
+/// other part (split id or row groups differ, or a column name repeats).
+#[no_mangle]
+pub extern "C" fn table_attach(t: usize, other: usize) -> i32 {
+    let t = unsafe { &mut *(t as *mut T) };
+    let other = unsafe { Box::from_raw(other as *mut T) };
+    if t.attach(*other).is_ok() { 0 } else { -1 }
+}
+
 /// Pre-touch a column's segments (background warming). Returns bytes read.
 #[no_mangle]
 pub extern "C" fn table_warm(t: usize, col: u32) -> f64 {

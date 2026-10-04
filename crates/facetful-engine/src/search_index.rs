@@ -1150,6 +1150,123 @@ impl Forms {
 }
 
 impl SearchIndex {
+    /// An index of no columns over `groups` row groups (what a table without
+    /// an index brings to `merge`).
+    pub fn empty(groups: usize) -> SearchIndex {
+        SearchIndex {
+            cols: Vec::new(),
+            plain: Vec::new(),
+            fields: 1,
+            words: Words::default(),
+            counts: Vec::new(),
+            groups: (0..groups).map(|_| GroupIndex::default()).collect(),
+            dicts: Vec::new(),
+            phases: [0.0; 4],
+            mem: [0; 4],
+        }
+    }
+
+    /// One index over both images' columns, from a table's index and that
+    /// of the image attached to it (`Table::attach`), whose columns come
+    /// `shift` places later: what building over the attached table would
+    /// give. The vocabularies merge in word order, so each side's ids map up
+    /// in order: its lists stay sorted, the second image's fields follow the
+    /// first's, and each group's two runs merge like sorted lists.
+    pub fn merge(a: &SearchIndex, b: &SearchIndex, shift: usize) -> SearchIndex {
+        use std::cmp::Ordering;
+        let mut words = Words::default();
+        let mut counts = Vec::with_capacity(a.words.len().max(b.words.len()));
+        let (mut ma, mut mb) = (Vec::with_capacity(a.words.len()), Vec::with_capacity(b.words.len()));
+        let (mut i, mut j) = (0, 0);
+        while i < a.words.len() || j < b.words.len() {
+            let ord = if i == a.words.len() {
+                Ordering::Greater
+            } else if j == b.words.len() {
+                Ordering::Less
+            } else {
+                a.words.get(i).cmp(b.words.get(j))
+            };
+            let id = words.len() as u32;
+            if ord != Ordering::Greater {
+                words.push(a.words.get(i));
+                ma.push(id);
+            } else {
+                words.push(b.words.get(j));
+            }
+            if ord != Ordering::Less {
+                mb.push(id);
+            }
+            counts.push(if ord != Ordering::Greater { a.counts[i] } else { 0 } + if ord != Ordering::Less { b.counts[j] } else { 0 });
+            i += (ord != Ordering::Greater) as usize;
+            j += (ord != Ordering::Less) as usize;
+        }
+        let fa = a.plain.len() as u32;
+        let fields = (fa + b.plain.len() as u32).max(1);
+        let groups = a
+            .groups
+            .iter()
+            .zip(&b.groups)
+            .map(|(ga, gb)| {
+                let (rows_at, maps_at) = (ga.rows.len() as u32, (ga.bitmaps.len() / BITMAP_WORDS) as u32);
+                let from_a = ga.ids.iter().zip(&ga.entries).map(|(&l, &e)| (ma[(l / a.fields) as usize] * fields + l % a.fields, e));
+                let from_b = gb.ids.iter().zip(&gb.entries).map(|(&l, &e)| {
+                    let e = Entry { start: e.start + if e.len == BITMAP { maps_at } else { rows_at }, len: e.len };
+                    (mb[(l / b.fields) as usize] * fields + fa + l % b.fields, e)
+                });
+                let mut g = GroupIndex {
+                    ids: Vec::with_capacity(ga.ids.len() + gb.ids.len()),
+                    entries: Vec::with_capacity(ga.ids.len() + gb.ids.len()),
+                    rows: [ga.rows.as_slice(), gb.rows.as_slice()].concat(),
+                    bitmaps: [ga.bitmaps.as_slice(), gb.bitmaps.as_slice()].concat(),
+                };
+                let (mut x, mut y) = (from_a.peekable(), from_b.peekable());
+                while let Some(&(id, e)) = match (x.peek(), y.peek()) {
+                    (Some(p), Some(q)) if p.0 < q.0 => x.peek(),
+                    (Some(_), Some(_)) => y.peek(),
+                    (p, q) => p.or(q),
+                } {
+                    if x.peek().is_some_and(|p| p.0 == id) {
+                        x.next();
+                    } else {
+                        y.next();
+                    }
+                    g.ids.push(id);
+                    g.entries.push(e);
+                }
+                g
+            })
+            .collect();
+        // dictionary columns: a word's codes keep their order, as the ids do
+        let dicts = a
+            .dicts
+            .iter()
+            .map(|d| (d, &ma, 0))
+            .chain(b.dicts.iter().map(|d| (d, &mb, shift)))
+            .map(|(d, map, sh)| {
+                let mut offsets = vec![0u32; words.len() + 1];
+                for (w, &m) in map.iter().enumerate() {
+                    offsets[m as usize + 1] = d.offsets[w + 1] - d.offsets[w];
+                }
+                for k in 0..words.len() {
+                    offsets[k + 1] += offsets[k];
+                }
+                DictIndex { col: d.col + sh, values: d.values, offsets, codes: d.codes.clone() }
+            })
+            .collect();
+        let shifted = |v: &[usize]| v.iter().map(|c| c + shift).collect::<Vec<_>>();
+        SearchIndex {
+            cols: [a.cols.clone(), shifted(&b.cols)].concat(),
+            plain: [a.plain.clone(), shifted(&b.plain)].concat(),
+            fields,
+            words,
+            counts,
+            groups,
+            dicts,
+            phases: [0.0; 4],
+            mem: [0; 4],
+        }
+    }
+
     /// Index `cols` (text columns) of every row group, in one go.
     pub fn build<S: ReadAt>(table: &mut Table<S>, cols: &[usize]) -> Result<SearchIndex, FormatError> {
         let mut b = IndexBuilder::new(table, cols)?;
