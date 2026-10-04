@@ -1,0 +1,4 @@
+{
+  "dims": ["Status", "Type", "Region", "Country/area", "Technology"],
+  "description": "Initial unfiltered five-facet dashboard; first interaction selects operating status, dropping the Status filter on its own facet."
+}
