@@ -206,6 +206,13 @@ declared as an optional peer dependency and loaded dynamically only when a
 Parquet method is called. Under a bundler, `npm install hyparquet` is enough;
 without one, pass `hyparquetUrl` to `Facetful.open`.
 
+Compression: SNAPPY, ZSTD or none. ZSTD uses a vendored copy of
+[fzstd](https://github.com/101arrowz/fzstd) (~3 KB gz), loaded only for a file
+that needs it. ZSTD at a high level (DuckDB: `COMPRESSION ZSTD,
+COMPRESSION_LEVEL 19`) makes a file a little over half the size of Snappy, so
+the download is shorter, and costs little to decode. Other codecs fail with a
+clear error.
+
 Flat schemas only (no nested/repeated columns). BOOLEAN/INT32/INT64 →
 integers (narrowed), FLOAT/DOUBLE → float64, strings → dictionary-encoded when
 it pays, DATE/TIMESTAMP → real date/timestamp columns (days / ms since epoch,

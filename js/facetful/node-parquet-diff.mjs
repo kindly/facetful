@@ -4,7 +4,7 @@
 // match the CLI-built .facetful image cell-for-cell.
 import { readFileSync } from "node:fs";
 import { instantiate } from "./core.js";
-import { parquetToColumns } from "./parquet.js";
+import { parquetToColumns, zstdCompressors } from "./parquet.js";
 
 const root = new URL("../../", import.meta.url);
 const hp = await import(
@@ -20,14 +20,21 @@ const cli = engine.openTable(
   readFileSync(new URL("spikes/facet-spike/data-200000.facetful", root)),
 );
 
-// path B: parquet -> browser baseline compiler
-const pq = readFileSync(new URL("spikes/facet-spike/data-200000.parquet", root));
-const t0 = performance.now();
-const { rows, columns } = await parquetToColumns(hp, pq.buffer.slice(pq.byteOffset, pq.byteOffset + pq.byteLength));
-const img = engine.compileTable(rows, columns);
-const transcodeMs = performance.now() - t0;
-const compiled = engine.openImage(img);
-if (compiled.rows !== cli.rows) throw new Error(`row counts differ: ${compiled.rows} vs ${cli.rows}`);
+// path B: parquet -> browser baseline compiler, from the Snappy file and the
+// same data written with ZSTD (the worker's lazy decompressor wiring)
+const compressorsFor = async (codecs) => (codecs.has("ZSTD") ? zstdCompressors(await import("./fzstd.js")) : {});
+async function transcode(file) {
+  const pq = readFileSync(new URL(`spikes/facet-spike/${file}`, root));
+  const t0 = performance.now();
+  const { rows, columns } = await parquetToColumns(hp, pq.buffer.slice(pq.byteOffset, pq.byteOffset + pq.byteLength), { compressorsFor });
+  const img = engine.compileTable(rows, columns);
+  const ms = performance.now() - t0;
+  const compiled = engine.openImage(img);
+  if (compiled.rows !== cli.rows) throw new Error(`${file}: row counts differ: ${compiled.rows} vs ${cli.rows}`);
+  return { file, compiled, ms };
+}
+const paths = [await transcode("data-200000.parquet"), await transcode("data-200000-zstd.parquet")];
+const rows = cli.rows;
 
 const QUERIES = [
   "select count(*), count(capacity), count(distinct country) from t",
@@ -52,11 +59,11 @@ function cells(r) {
   return out;
 }
 
-for (const sql of QUERIES) {
+for (const { file, compiled } of paths) for (const sql of QUERIES) {
   const a = cells(engine.query(cli.handle, sql));
   const b = cells(engine.query(compiled.handle, sql));
   if (a.length !== b.length || a.some((v, i) => v !== b[i])) {
-    console.error("MISMATCH on:", sql);
+    console.error(`MISMATCH (${file}) on:`, sql);
     console.error("cli:     ", a.slice(0, 12).join(" | "));
     console.error("compiled:", b.slice(0, 12).join(" | "));
     process.exit(1);
@@ -64,5 +71,5 @@ for (const sql of QUERIES) {
 }
 console.log(
   `parquet-path differential: OK — ${QUERIES.length} queries agree cell-for-cell ` +
-  `(${rows} rows, transcode ${transcodeMs.toFixed(0)} ms in node)`,
+  `(${rows} rows; transcode in node ${paths.map((p) => `${p.file} ${p.ms.toFixed(0)} ms`).join(", ")})`,
 );
