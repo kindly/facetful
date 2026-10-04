@@ -11,6 +11,7 @@ pub mod mask_cache;
 #[cfg(feature = "search")]
 pub mod search_index;
 pub mod join;
+pub mod load;
 pub mod materialize;
 pub mod text;
 pub mod udf;
@@ -100,9 +101,15 @@ pub struct FacetResult {
 impl<S: ReadAt> Table<S> {
     pub fn open(src: S) -> Result<Self, FormatError> {
         let cat = read::open(&src)?;
+        Ok(Self::from_catalog(src, cat))
+    }
+
+    /// A table over `src` described by `cat` (from `read::open`, or a
+    /// catalog still growing while the image arrives: see `load`).
+    fn from_catalog(src: S, cat: Catalog) -> Self {
         let dict_cache = cat.schema.columns.iter().map(|_| None).collect();
         let dict_rc_cache = cat.schema.columns.iter().map(|_| None).collect();
-        Ok(Self {
+        Self {
             src,
             cat,
             cache: HashMap::new(),
@@ -122,7 +129,7 @@ impl<S: ReadAt> Table<S> {
             search_index: None,
             #[cfg(feature = "search")]
             search_builder: None,
-        })
+        }
     }
 
     /// Build the word index over `cols` (text columns) and keep it: search()

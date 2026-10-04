@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 const here = new URL(".", import.meta.url);
 const spike = new URL("../../spikes/facet-spike/", import.meta.url);
 
-// the worker's globals: `self`, `postMessage`, and a fetch that reads files
+// the worker's globals: `self`, `postMessage`, and a fetch that reads files,
+// handing the body out in 64 KB chunks like a network would
 const pending = new Map();
 globalThis.self = globalThis;
 globalThis.postMessage = (msg) => {
@@ -16,7 +17,18 @@ globalThis.postMessage = (msg) => {
   pending.delete(msg.id);
   done(msg);
 };
-globalThis.fetch = async (url) => new Response(fs.readFileSync(fileURLToPath(url)));
+globalThis.fetch = async (url) => {
+  const bytes = fs.readFileSync(fileURLToPath(url));
+  let at = 0;
+  const body = new ReadableStream({
+    pull(c) {
+      if (at >= bytes.length) return c.close();
+      c.enqueue(new Uint8Array(bytes.subarray(at, at + 65536)));
+      at += 65536;
+    },
+  });
+  return new Response(body, { headers: { "content-length": String(bytes.length) } });
+};
 
 await import("./worker.js");
 
@@ -72,6 +84,21 @@ if (before === 0 || mid.result.columns[0].values[0] !== before || after !== befo
   throw new Error(`search counts before/during/after the build: ${before}/${mid.result.columns[0].values[0]}/${after}`);
 }
 if (!(built.bytes > 0) || typeof built.elapsedMs !== "number") throw new Error(`buildSearchIndex reply ${JSON.stringify(built)}`);
+// an image streamed in and indexed as it arrives: the index is ready with
+// the table and answers like the one built after loading
+const streamed = await ok({ cmd: "loadUrl", name: "s", url: new URL("data-200000.facetful", spike).href, searchColumns: ["country", "owner"] });
+if (streamed.rows !== 200000 || !(streamed.indexedWhileLoading > 0) || streamed.persisted || typeof streamed.searchReady !== "boolean") {
+  throw new Error(`loadUrl reply ${JSON.stringify(streamed)}`);
+}
+await ok({ cmd: "searchReady", table: "s" });
+const sqs = sq.replace("from t", "from s");
+const viaStream = (await ok({ cmd: "query", table: "s", sql: sqs })).result.columns[0].values[0];
+if (viaStream !== after) throw new Error(`search over the streamed table: ${viaStream} against ${after}`);
+const sgs = (await ok({ cmd: "searchSuggest", table: "s", q: "countr", columns: ["country", "owner"] })).suggestions;
+if (!sgs.indexed) throw new Error("the streamed table's index is not in use");
+const missing = await send({ cmd: "loadUrl", name: "x", url: new URL("data-200000.facetful", spike).href, searchColumns: ["nope"] });
+if (missing.ok) throw new Error("loadUrl indexed a column that is not there");
+
 // suggestions through the worker: completions of the word being typed,
 // counted on the rows the filter leaves
 const sg = (await ok({ cmd: "searchSuggest", table: "t", q: "countr", columns: ["country", "owner"], where: "status = 'status_0'", limit: 5, didYouMean: true })).suggestions;
@@ -124,7 +151,7 @@ if (be.ok || !be.isQueryError || !/statement 1: .*unknown column 'contry'/s.test
 // memoryStats: the worker's wasm high-water and table count
 {
   const m = await ok({ cmd: "memoryStats" });
-  if (!(m.wasmBytes > 1 << 20) || m.tables !== 3) throw new Error(`memoryStats ${JSON.stringify(m)}`);
+  if (!(m.wasmBytes > 1 << 20) || m.tables !== 4) throw new Error(`memoryStats ${JSON.stringify(m)}`);
 }
 
 // errors come back as replies, with the query flag set for SQL errors

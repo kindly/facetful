@@ -805,6 +805,12 @@ impl IndexBuilder {
         // arrive in ascending order, so `from_pairs` only drops repeats
         let IndexBuilder { vocab, pairs, buf, masks, .. } = self;
         pairs.clear();
+        // a build that starts before the groups are known (an image still
+        // arriving) sizes the buffer here, with room to spare, not by doubling
+        let text: usize = self.plain.iter().map(|&c| table.catalog().groups[g].cols[c].seg_lens[1] as usize).sum();
+        if pairs.capacity() < text / 7 {
+            pairs.reserve_exact(text / 7 * 5 / 4);
+        }
         let fields = self.plain.len().max(1) as u64;
         each_row_word(table, g, &self.plain, buf, masks, |r, field, k| {
             pairs.push((vocab.key_id(k) as u64 * fields + field as u64) << 16 | r as u64)

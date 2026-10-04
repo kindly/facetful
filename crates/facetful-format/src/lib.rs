@@ -178,7 +178,7 @@ pub fn seg_count(col: &ColumnDef) -> usize {
 }
 
 /// Location of one dictionary's payloads in the file-level dictionary block.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DictLoc {
     pub offsets_off: u64,
     pub offsets_len: u32,

@@ -147,6 +147,23 @@ export declare class Facetful {
   load(name: string, buffer: ArrayBuffer): Promise<LoadResult>;
 
   /**
+   * Fetch a .facetful image and open it as it arrives. With `searchColumns`
+   * the search index is built a row group at a time during the download and
+   * is ready with the table, or finishes in the background when the download
+   * outruns indexing (`searchReady: false`; see `searchReady()`). `persist` (an OPFS path) writes the image there
+   * as it arrives, for `loadOpfs` on a later visit. `expectedBytes` sizes the
+   * buffer once when the server compresses the response.
+   */
+  loadUrl(
+    name: string,
+    url: string | URL,
+    options?: { searchColumns?: string[]; persist?: string; expectedBytes?: number },
+  ): Promise<{ name: string; rows: number; indexedWhileLoading: number; searchReady: boolean; persisted: boolean; elapsedMs: number }>;
+
+  /** Resolves when the table's search index, from `loadUrl`, is in use. */
+  searchReady(options?: { table?: string }): Promise<void>;
+
+  /**
    * Open a Parquet file (ArrayBuffer, transferred). The compiled image is
    * cached in OPFS keyed by content hash + format version: repeat visits
    * reopen in ~tens of ms with no transcode. Requires hyparquet (see

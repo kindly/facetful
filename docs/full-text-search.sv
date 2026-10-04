@@ -226,7 +226,22 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
    - grantnav, wasm, every keystroke, top 20 by rank then amount (`spikes/fts-bench/rank-bench.mjs`): median 15 to 30 ms against 9 to 13 ordering by amount alone, worst 85 ms (the first letter). Natively 10 to 23 ms against 8 to 12 for a cheap expression key (`examples/rank_time.rs`). The first version took 526 ms: it loaded the five text columns per group (the long descriptions), looked forms up per group and ranked every row.
    - Size, unoptimized: full 356.1 KB gz (lite unchanged, 291.9 KB).
    - A misspelling that is itself in the data ranks as exact: `comunity project` leads with *Barley Croft Comunity Counselling Project*.
-7. **Streaming load with the build integrated** (load-time work): the worker reads the response stream front to back, tokenizes dictionary columns as soon as they arrive, indexes each row group as its bytes complete (step 2's interface), writes to OPFS as it goes, and finishes the index when the footer arrives, so search is ready with the table. The app names the columns to index when it starts the load.
+7. ~~Streaming load with the build integrated~~ (done 4 October). `db.loadUrl(name, url, { searchColumns, persist, expectedBytes })` (worker), `openStream(chunks, opts)` (core), `facetful_engine::load::TableLoad` (Rust).
+   - **Reading front to back:** `read::open_prefix` gives the catalog once the header and dictionaries are in; `read::next_group` reads each row group as its bytes complete. The footer has no marker, so a group header is accepted only if every segment has the length its column's type gives for that row count (only text bytes vary) and validity exactly when there are NULLs; `finish` checks the streamed groups against the footer and starts the index over if they ever disagree. The table is the same object throughout: groups join its catalog as they arrive, and at the end it takes the footer's catalog (statistics, layout flags). No copy, no second parse.
+   - **Indexing:** dictionary columns are tokenized as soon as the dictionaries arrive; a row group is indexed when the reader has had to wait on the network since the last one (it is level with the download, so indexing costs nothing). When chunks are already waiting the download is ahead, and the table opens at the last byte anyway: the groups left are indexed in the background, search() scans meanwhile, `db.searchReady()` resolves when the index is in use.
+   - **OPFS:** with `persist` the bytes are written as they arrive; a file cut short does not open (no footer), so `loadOpfs` refuses it.
+   - grantnav, wasm in Node, the download simulated at a brotli image's rate (`spikes/fts-bench/stream-bench.mjs`):
+
+     | wire | download | before: table / search ready | streamed: table / search ready |
+     |---|---|---|---|
+     | 20 Mbps | 23.2 s | 23.40 / 25.80 s | 23.22 / **23.34 s** |
+     | 100 Mbps | 4.6 s | 5.33 / 7.64 s | 4.79 / **4.93 s** |
+     | 200 Mbps | 2.3 s | 2.64 / 4.98 s | 2.52 / **2.65 s** |
+     | 400 Mbps | 1.2 s | 1.48 / 3.79 s | 1.76 / **2.31 s** |
+
+     Search is ready 0.1 to 0.15 s after the last byte while indexing keeps up (to about 200 Mbps; indexing is 2.3 s). Faster than that the table opens up to 0.3 s later than before (a group being indexed when the last byte lands), and search 1.5 s sooner.
+   - **Open: the image's size.** With `Content-Encoding` the response's length is the compressed size, so the buffer grows by doubling: 1,105 MB of wasm memory for grantnav against 533 MB when the size is known (`expectedBytes`). Writing the image's length into the header would fix it for every server; that is a format change (the writer patches it at the end, as the CLI writes a file).
+   - **Not done:** feeding the hook from the Parquet converter (needs the per-column decisions made incrementally), and a built-in "fetch once, keep in OPFS" in front of `loadUrl` (the first-interaction benchmark's image lanes do it by hand: `loadOpfs` when the file is there).
 8. **Split images with attach,** each image's columns indexed as it streams, merged into one index at attach (same row groups; combine the two sorted vocabularies).
 9. **OPFS cache of the whole index,** read back in full on later visits.
 10. **Accent folding** and keeping apostrophes inside words (tokenizer changes; any time).

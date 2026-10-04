@@ -188,6 +188,64 @@ export class Engine {
     return { handle, rows: this.w.table_total_rows(handle) };
   }
 
+  /**
+   * Open a .facetful image while it arrives. `chunks` is an async iterable of
+   * Uint8Array (a fetch body). With `searchColumns`, the word index is built
+   * a row group at a time as groups complete, so it is ready with the table
+   * instead of being built after. `expectedBytes` (the image's size, when
+   * known) allocates the buffer once; `onChunk(bytes)` sees each chunk after
+   * it is taken (to write it to OPFS, say). Returns { handle, rows,
+   * indexedWhileLoading, indexLeft }: row groups indexed before the last
+   * byte, and those still to index (when the download outran indexing;
+   * `stepSearchIndex` finishes them, search() scans until then).
+   */
+  async openStream(chunks, { expectedBytes = 0, searchColumns, onChunk } = {}) {
+    if (searchColumns && !this.w.load_index_columns) throw new Error("this facetful build has no search index (lite build)");
+    const h = this.w.load_begin(expectedBytes);
+    let indexed = 0;
+    try {
+      if (searchColumns) {
+        const names = this.enc.encode(searchColumns.join("\0"));
+        const p = u32(this.w.alloc(names.byteLength));
+        new Uint8Array(this.mem(), p, names.byteLength).set(names);
+        const rc = this.w.load_index_columns(h, p, names.byteLength);
+        this.w.dealloc(p, names.byteLength);
+        if (rc < 0) throw new Error("search index: a column to index is not in the image");
+      }
+      // time spent waiting on the source since the last group was indexed
+      let waited = 0;
+      let t = performance.now();
+      for await (const chunk of chunks) {
+        waited += performance.now() - t;
+        if (!chunk.byteLength) continue;
+        const p = u32(this.w.alloc(chunk.byteLength));
+        new Uint8Array(this.mem(), p, chunk.byteLength).set(chunk);
+        const rc = this.w.load_push(h, p, chunk.byteLength);
+        this.w.dealloc(p, chunk.byteLength);
+        if (rc < 0) throw new Error("not a valid .facetful image, or a column to index is not in it");
+        if (onChunk) await onChunk(chunk);
+        // index a group when the source has kept us waiting (we are level
+        // with the download, so indexing costs nothing); chunks that are
+        // already there mean the download is ahead, and the table should not
+        // wait for the index: what is left is indexed once it is open
+        if (searchColumns && waited >= 1 && this.w.load_groups_ready(h) > indexed) {
+          indexed = this.w.load_index_step(h, 1);
+          if (indexed < 0) throw new Error("search index: could not read the image");
+          waited = 0;
+        }
+        t = performance.now();
+      }
+    } catch (e) {
+      this.w.load_free(h);
+      throw e;
+    }
+    const handle = this.w.load_finish(h);
+    if (!handle) throw new Error("not a complete .facetful image");
+    // with every group indexed this finishes the index (renumbering)
+    const indexLeft = searchColumns ? this.stepSearchIndex(handle, 0) : 0;
+    return { handle, rows: this.w.table_total_rows(handle), indexedWhileLoading: indexed, indexLeft };
+  }
+
   /** Open a table backed by a registered OPFS file (reads go through opfs_read). */
   openOpfsTable(fileId, fileLen, cacheBytes) {
     const handle = this.w.table_open_opfs(fileId, fileLen, cacheBytes ?? 0);

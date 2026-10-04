@@ -38,6 +38,11 @@ const DESCS: [&str; 8] = [
 
 /// title plain text (every 13th row NULL), org dict, descr plain text; groups of 64
 fn table() -> Table<Vec<u8>> {
+    Table::open(image()).unwrap()
+}
+
+/// `table()`'s image bytes.
+fn image() -> Vec<u8> {
     let schema = Schema {
         columns: vec![
             ColumnDef { name: "title".into(), ty: ColumnType::Utf8, flags: 0 },
@@ -81,7 +86,7 @@ fn table() -> Table<Vec<u8>> {
             ColumnChunk { data: SegmentData::Utf8 { offsets: &doffs, bytes: &dbytes }, validity: None, null_count: 0 },
         ]);
     }
-    Table::open(w.finish()).unwrap()
+    w.finish()
 }
 
 fn count(t: &mut Table<Vec<u8>>, sql: &str) -> i64 {
@@ -753,3 +758,77 @@ fn rank_bind_errors() {
         assert!(run_query(&mut t, sql).is_err(), "{sql} should not bind");
     }
 }
+
+/// The table and its word index from an image read as it arrives, in chunks
+/// of any size, indexed between chunks or only at the end: the same table,
+/// index and answers as opening the whole image and building the index.
+#[test]
+fn index_built_while_the_image_arrives() {
+    use facetful_engine::load::TableLoad;
+    let img = image();
+    let mut want = table();
+    let want_stats = want.build_search_index(&[0, 1, 2]).unwrap();
+    let groups = ROWS.div_ceil(64);
+    let sql = |q: &str| format!("select count(*) from t where search('{q}', {COLS})");
+    for chunk in [1usize, 7, 300, 4096, img.len()] {
+        for (step, late) in [(false, false), (true, false), (true, true)] {
+            let mut load = TableLoad::<Vec<u8>>::new(if chunk == 7 { img.len() } else { 0 });
+            if !late {
+                load.index_columns(&["descr", "title", "org"]).unwrap();
+            }
+            let (mut ready, mut indexed) = (0, 0);
+            for (i, c) in img.chunks(chunk).enumerate() {
+                load.push(c).unwrap();
+                assert!(load.groups_ready() >= ready, "groups only join");
+                ready = load.groups_ready();
+                // columns named once the schema is known
+                if late && load.header_ready() && i % 2 == 0 && indexed == 0 {
+                    load.index_columns(&["descr", "title", "org"]).unwrap();
+                }
+                if step {
+                    indexed = load.index_step(1).unwrap();
+                }
+            }
+            assert_eq!(load.groups_ready(), groups, "chunk {chunk}");
+            assert_eq!(load.bytes(), img.len());
+            if step && chunk < img.len() {
+                assert!(indexed >= groups - 1, "chunk {chunk}: the index kept up ({indexed} of {groups})");
+            }
+            let mut t = load.finish().unwrap();
+            // the streamed build carries on where it was, not from the start
+            assert_eq!(t.search_index_step(0).unwrap(), groups - if step { indexed } else { 0 });
+            assert_eq!(t.search_index_step(usize::MAX).unwrap(), 0);
+            assert_eq!(t.catalog().total_rows, ROWS as u64);
+            let got = t.search_index().expect("index built").stats();
+            assert_eq!(
+                (got.words, got.pairs, got.value_pairs, got.bitmap_entries),
+                (want_stats.words, want_stats.pairs, want_stats.value_pairs, want_stats.bitmap_entries),
+                "chunk {chunk} step {step} late {late}"
+            );
+            for q in QUERIES {
+                assert_eq!(count(&mut t, &sql(q)), count(&mut want, &sql(q)), "chunk {chunk}: '{q}'");
+            }
+            assert_eq!(
+                count(&mut t, "select count(*) from t where org = 'Mind' and descr like '%health%'"),
+                count(&mut want, "select count(*) from t where org = 'Mind' and descr like '%health%'")
+            );
+        }
+    }
+    // without columns to index: just the table
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    for c in img.chunks(100) {
+        load.push(c).unwrap();
+    }
+    let mut t = load.finish().unwrap();
+    assert!(t.search_index().is_none());
+    assert_eq!(count(&mut t, "select count(*) from t"), ROWS as i64);
+    // an image cut short does not open
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    load.push(&img[..img.len() - 3]).unwrap();
+    assert!(load.finish().is_err());
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    load.push(&img[..40]).unwrap();
+    assert!(!load.header_ready());
+    assert!(load.finish().is_err());
+}
+

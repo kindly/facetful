@@ -25,11 +25,19 @@ pub trait ReadAt {
     {
         None
     }
+    /// The bytes of an in-memory source, to append to while an image is
+    /// still arriving (see `open_prefix`). Positional sources keep `None`.
+    fn memory_mut(&mut self) -> Option<&mut Vec<u8>> {
+        None
+    }
 }
 
 impl ReadAt for Vec<u8> {
     fn from_memory(bytes: Vec<u8>) -> Option<Self> {
         Some(bytes)
+    }
+    fn memory_mut(&mut self) -> Option<&mut Vec<u8>> {
+        Some(self)
     }
     fn len(&self) -> u64 {
         Vec::len(self) as u64
@@ -163,34 +171,9 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
     // Dictionary block (immediately after the header): lens table then payloads.
     let (schema, sorted_by, version, row_group_target, hlen) =
         (schema, sorted_by, version, row_group_target, _hlen);
-    let ndict = schema.columns.iter().filter(|c| c.is_dict()).count();
-    let mut dicts: Vec<Option<DictLoc>> = vec![None; schema.columns.len()];
-    if ndict > 0 {
-        let table_len = crate::align_up(ndict * 8);
-        let mut tbuf = vec![0u8; table_len];
-        src.read_at(hlen as u64, &mut tbuf)?;
-        let mut lens = Vec::with_capacity(ndict);
-        for i in 0..ndict {
-            let o = u32::from_le_bytes(tbuf[i * 8..i * 8 + 4].try_into().unwrap());
-            let b = u32::from_le_bytes(tbuf[i * 8 + 4..i * 8 + 8].try_into().unwrap());
-            lens.push((o, b));
-        }
-        let mut off = hlen as u64 + table_len as u64;
-        let mut di = 0;
-        for (ci, c) in schema.columns.iter().enumerate() {
-            if c.is_dict() {
-                let (ol, bl) = lens[di];
-                dicts[ci] = Some(DictLoc {
-                    offsets_off: off,
-                    offsets_len: ol,
-                    bytes_off: off + ol as u64,
-                    bytes_len: bl,
-                });
-                off += ol as u64 + bl as u64;
-                di += 1;
-            }
-        }
-    }
+    let mut tbuf = vec![0u8; dict_table_len(&schema)];
+    src.read_at(hlen as u64, &mut tbuf)?;
+    let (dicts, _) = dict_locs(&schema, hlen as u64, &tbuf);
 
     let mut c = Cursor::new(&fbuf);
     let total_rows = c.u64()?;
@@ -242,6 +225,134 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
         total_rows,
         groups,
     })
+}
+
+/// Bytes of the dictionary lens table that follows the header (0 without
+/// dictionary columns).
+fn dict_table_len(schema: &Schema) -> usize {
+    let ndict = schema.columns.iter().filter(|c| c.is_dict()).count();
+    if ndict == 0 { 0 } else { crate::align_up(ndict * 8) }
+}
+
+/// Where each dictionary's payload lies, from the lens table at `hlen`, and
+/// where the dictionary block ends (the first row group starts there).
+fn dict_locs(schema: &Schema, hlen: u64, table: &[u8]) -> (Vec<Option<DictLoc>>, u64) {
+    let mut dicts: Vec<Option<DictLoc>> = vec![None; schema.columns.len()];
+    let mut off = hlen + table.len() as u64;
+    let mut di = 0;
+    for (ci, c) in schema.columns.iter().enumerate() {
+        if c.is_dict() {
+            let ol = u32::from_le_bytes(table[di * 8..di * 8 + 4].try_into().unwrap());
+            let bl = u32::from_le_bytes(table[di * 8 + 4..di * 8 + 8].try_into().unwrap());
+            dicts[ci] = Some(DictLoc { offsets_off: off, offsets_len: ol, bytes_off: off + ol as u64, bytes_len: bl });
+            off += ol as u64 + bl as u64;
+            di += 1;
+        }
+    }
+    (dicts, off)
+}
+
+/// Reading an image front to back while it arrives: the catalog of its
+/// beginning (header and dictionaries, no row groups yet, `total_rows` 0) and
+/// the offset of the first row group, once `bytes` (the image's first bytes)
+/// hold all of that; `None` until then.
+pub fn open_prefix(bytes: &[u8]) -> Result<Option<(Catalog, u64)>, FormatError> {
+    if bytes.len() < 8 {
+        return Ok(None);
+    }
+    let hlen = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if bytes[..4] != MAGIC {
+        return Err(FormatError::BadMagic);
+    }
+    if bytes.len() < hlen {
+        return Ok(None);
+    }
+    let (schema, sorted_by, version, row_group_target, hlen) = parse_header(&bytes[..hlen])?;
+    let table_end = hlen as usize + dict_table_len(&schema);
+    if bytes.len() < table_end {
+        return Ok(None);
+    }
+    let (dicts, end) = dict_locs(&schema, hlen as u64, &bytes[hlen as usize..table_end]);
+    if (bytes.len() as u64) < end {
+        return Ok(None);
+    }
+    let ncols = schema.columns.len();
+    let cat = Catalog {
+        clustered: vec![false; ncols],
+        version,
+        row_group_target,
+        schema,
+        sorted_by,
+        dicts,
+        total_rows: 0,
+        groups: Vec::new(),
+    };
+    Ok(Some((cat, end)))
+}
+
+/// What follows a row group (or the dictionary block) in an arriving image.
+#[derive(Debug)]
+pub enum NextGroup {
+    /// a whole row group: its metadata (no statistics; those are in the
+    /// footer) and where the next one would start
+    Ready(GroupMeta, u64),
+    /// more bytes are needed to tell
+    NeedBytes,
+    /// not a row group: the groups are over and this is the footer
+    End,
+}
+
+/// The row group starting at `at`, read from `bytes` (the image's first
+/// bytes). The footer has no marker, so a group header is accepted only if
+/// it fits the schema: a row count up to the row-group target, every
+/// segment the length its column's type gives for that many rows (only text
+/// bytes vary), validity exactly when there are NULLs. The footer's start
+/// fails that; a reader should still check the groups against the footer.
+pub fn next_group(cat: &Catalog, bytes: &[u8], at: u64) -> NextGroup {
+    let ncols = cat.schema.columns.len();
+    let header_len = align_up(4 + ncols * (4 + 4 * MAX_SEGS));
+    let at = at as usize;
+    if bytes.len() < at + header_len {
+        return NextGroup::NeedBytes;
+    }
+    let mut c = Cursor::new(&bytes[at..at + header_len]);
+    let rows = c.u32().unwrap();
+    if rows == 0 || rows > cat.row_group_target {
+        return NextGroup::End;
+    }
+    let n = rows as usize;
+    let mut cols = Vec::with_capacity(ncols);
+    let mut len = header_len;
+    for def in &cat.schema.columns {
+        let null_count = c.u32().unwrap();
+        let mut seg_lens = [0u32; MAX_SEGS];
+        for l in seg_lens.iter_mut() {
+            *l = c.u32().unwrap();
+        }
+        let bits = align_up(n.div_ceil(8)) as u32;
+        let expect = |l: usize| Some(align_up(l) as u32);
+        let (first, second) = match (def.ty, def.is_dict()) {
+            (ColumnType::Utf8, true) => (expect(n * def.code_width()), Some(0)),
+            (ColumnType::Utf8, false) => (expect((n + 1) * 4), None), // text bytes: any padded length
+            (ColumnType::Bool, _) => (Some(bits), Some(0)),
+            (ty, _) => (ty.fixed_width().and_then(|w| expect(n * w)), Some(0)),
+        };
+        let validity = if null_count > 0 { bits } else { 0 };
+        let fits = null_count <= rows
+            && first == Some(seg_lens[0])
+            && second.is_none_or(|l| l == seg_lens[1])
+            && seg_lens[1] as usize % ALIGN == 0
+            && seg_lens[2] == validity;
+        if !fits {
+            return NextGroup::End;
+        }
+        len += seg_lens.iter().map(|&l| l as usize).sum::<usize>();
+        cols.push(ColMeta { null_count, seg_lens, stats: Stats::None });
+    }
+    if bytes.len() < at + len {
+        return NextGroup::NeedBytes;
+    }
+    NextGroup::Ready(GroupMeta { offset: at as u64, row_count: rows, cols }, (at + len) as u64)
 }
 
 /// Absolute file offset of segment `seg` of column `col` within group `g`.
@@ -440,6 +551,86 @@ mod tests {
         let (schema2, _, _, _, hlen) = parse_header(&file[..file.len().min(1024)]).unwrap();
         assert_eq!(schema2.columns[4].name, "note");
         assert!(hlen as usize % ALIGN == 0);
+    }
+
+    /// Every prefix of an image, read front to back, gives the footer's
+    /// groups in order and then stops at the footer.
+    fn stream_matches_footer(file: &[u8]) {
+        let src: &[u8] = file;
+        let full = open(&src).unwrap();
+        let mut found: Vec<GroupMeta> = Vec::new();
+        let (mut cat, mut at, mut ended) = (None::<Catalog>, 0u64, false);
+        for n in 0..=file.len() {
+            let bytes = &file[..n];
+            if cat.is_none() {
+                if let Some((c, first)) = open_prefix(bytes).unwrap() {
+                    assert_eq!(c.schema.columns.len(), full.schema.columns.len());
+                    assert_eq!(c.dicts, full.dicts);
+                    cat = Some(c);
+                    at = first;
+                }
+            }
+            let Some(c) = &cat else { continue };
+            while !ended {
+                match next_group(c, bytes, at) {
+                    NextGroup::Ready(g, next) => {
+                        found.push(g);
+                        at = next;
+                    }
+                    NextGroup::NeedBytes => break,
+                    NextGroup::End => ended = true,
+                }
+            }
+        }
+        assert!(ended, "the footer ends the groups");
+        assert_eq!(found.len(), full.groups.len());
+        for (a, b) in found.iter().zip(&full.groups) {
+            assert_eq!((a.offset, a.row_count), (b.offset, b.row_count));
+            for (x, y) in a.cols.iter().zip(&b.cols) {
+                assert_eq!((x.null_count, x.seg_lens), (y.null_count, y.seg_lens));
+            }
+        }
+    }
+
+    #[test]
+    fn reads_front_to_back() {
+        // nulls, every column kind, a group shorter than the target last
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "id".into(), ty: ColumnType::Int64, flags: 0 },
+                ColumnDef { name: "ok".into(), ty: ColumnType::Bool, flags: 0 },
+                ColumnDef { name: "s".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY | flags::CODES_U8 },
+                ColumnDef { name: "t".into(), ty: ColumnType::Utf8, flags: 0 },
+            ],
+        };
+        let (soff, sbytes) = utf8_offsets(&["a", "b"]);
+        let dicts = vec![None, None, Some(DictData { offsets: soff, bytes: sbytes }), None];
+        for (groups, last) in [(1usize, 3u32), (3, 5), (2, 1)] {
+            let mut w = Writer::new(schema.clone(), vec![], 5, &dicts);
+            for g in 0..groups {
+                let n = if g + 1 == groups { last } else { 5 };
+                let ids: Vec<u8> = (0..n as i64).flat_map(|i| i.to_le_bytes()).collect();
+                let bits = vec![0b10101u8];
+                let codes: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+                let texts: Vec<&str> = (0..n).map(|i| if i % 2 == 0 { "word" } else { "" }).collect();
+                let (toff, tbytes) = utf8_offsets(&texts);
+                let validity = vec![0b11110u8 & ((1u8 << n) - 1)];
+                w.write_group(
+                    n,
+                    &[
+                        ColumnChunk { data: SegmentData::Fixed(&ids), validity: None, null_count: 0 },
+                        ColumnChunk { data: SegmentData::Bool(&bits), validity: None, null_count: 0 },
+                        ColumnChunk { data: SegmentData::Codes8(&codes), validity: None, null_count: 0 },
+                        ColumnChunk {
+                            data: SegmentData::Utf8 { offsets: &toff, bytes: &tbytes },
+                            validity: Some(&validity),
+                            null_count: n - validity[0].count_ones(),
+                        },
+                    ],
+                );
+            }
+            stream_matches_footer(&w.finish());
+        }
     }
 
     #[test]

@@ -55,6 +55,35 @@ export class Facetful {
   }
 
   /**
+   * Fetch a .facetful image and open it as it arrives. With `searchColumns`
+   * the search index is built a row group at a time during the download and
+   * is ready with the table (`indexedWhileLoading` row groups were done
+   * before the last byte). When the download outruns indexing the table
+   * opens anyway (`searchReady: false`): the rest is indexed in the
+   * background, search() scans meanwhile, and `searchReady()` resolves when
+   * the index is in use. `persist` (an OPFS path) writes the image there
+   * as it arrives, for `loadOpfs` on a later visit; without OPFS it is
+   * skipped (`persisted: false`). `expectedBytes` sizes the buffer once when
+   * the server compresses the response (otherwise Content-Length does).
+   */
+  async loadUrl(name, url, { searchColumns, persist, expectedBytes } = {}) {
+    const { rows, indexedWhileLoading, searchReady, persisted, elapsedMs } = await this._call({
+      cmd: "loadUrl",
+      name,
+      url: String(new URL(url, globalThis.location?.href)),
+      searchColumns,
+      persist,
+      expectedBytes,
+    });
+    return { name, rows, indexedWhileLoading, searchReady, persisted, elapsedMs };
+  }
+
+  /** Resolves when the table's search index, from `loadUrl`, is in use. */
+  async searchReady({ table } = {}) {
+    await this._call({ cmd: "searchReady", table });
+  }
+
+  /**
    * Open a Parquet file (ArrayBuffer) — the headline path. The image compiled
    * from it is cached in OPFS keyed by content hash + format version, so a
    * repeat visit with the same file reopens zero-decode without transcoding.

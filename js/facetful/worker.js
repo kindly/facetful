@@ -57,6 +57,47 @@ async function opfsWrite(path, bytes) {
   }
 }
 
+/** Search index builds finishing in the background, by table handle. */
+const searchBuilds = new Map();
+
+/** A fetch body as an async iterable (not every browser iterates streams). */
+async function* bodyChunks(body) {
+  const reader = body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    yield value;
+  }
+}
+
+/** An OPFS file written chunk by chunk as an image arrives, or null when
+ *  OPFS is unavailable. A file cut short does not open (no footer). */
+async function opfsAppender(path) {
+  try {
+    closeHandlesFor(path);
+    const { dir, file } = await opfsDir(path, true);
+    const h = await (await dir.getFileHandle(file, { create: true })).createSyncAccessHandle();
+    h.truncate(0);
+    let at = 0;
+    return {
+      write(bytes) {
+        h.write(bytes, { at });
+        at += bytes.byteLength;
+      },
+      close() {
+        h.flush();
+        h.close();
+      },
+      async abort() {
+        try { h.close(); } catch { /* closed */ }
+        try { await dir.removeEntry(file); } catch { /* gone */ }
+      },
+    };
+  } catch {
+    return null; // non-secure context, no OPFS, or quota: load without persisting
+  }
+}
+
 /** Open an OPFS-backed table lazily (metadata now, segments on demand). */
 async function opfsOpenTable(name, path, cacheBytes) {
   // sync access handles are exclusive — reuse ours if this path is already
@@ -141,6 +182,53 @@ self.onmessage = async (e) => {
       setTable(e.data.name, handle);
       lastTable = handle;
       reply({ ok: true, rows });
+    } else if (cmd === "loadUrl") {
+      // stream an image in: the table opens as it arrives, its word index is
+      // built a row group at a time meanwhile, and with `persist` the bytes
+      // go to OPFS as they come
+      const t0 = performance.now();
+      const r = await fetch(e.data.url);
+      if (!r.ok || !r.body) throw new Error(`fetch ${e.data.url}: HTTP ${r.status}`);
+      // Content-Length is the image's size only when the response is not
+      // compressed in transit
+      const expectedBytes =
+        e.data.expectedBytes ?? (r.headers.get("content-encoding") ? 0 : Number(r.headers.get("content-length")) || 0);
+      const out = e.data.persist ? await opfsAppender(e.data.persist) : null;
+      let loaded;
+      try {
+        loaded = await engine.openStream(bodyChunks(r.body), {
+          expectedBytes,
+          searchColumns: e.data.searchColumns,
+          onChunk: out ? (c) => out.write(c) : undefined,
+        });
+      } catch (err) {
+        await out?.abort();
+        throw err;
+      }
+      out?.close();
+      setTable(e.data.name, loaded.handle);
+      lastTable = loaded.handle;
+      reply({
+        ok: true,
+        rows: loaded.rows,
+        indexedWhileLoading: loaded.indexedWhileLoading,
+        searchReady: loaded.indexLeft === 0,
+        persisted: !!out,
+        elapsedMs: performance.now() - t0,
+      });
+      // groups the download outran: indexed now, yielding between groups so
+      // queries run meanwhile (search() scans until the index is finished)
+      if (loaded.indexLeft > 0) {
+        searchBuilds.set(loaded.handle, (async () => {
+          while (engine.stepSearchIndex(loaded.handle, 1) > 0) await new Promise((r) => setTimeout(r, 0));
+          searchBuilds.delete(loaded.handle);
+        })());
+      }
+    } else if (cmd === "searchReady") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error("no table loaded");
+      await searchBuilds.get(handle);
+      reply({ ok: true });
     } else if (cmd === "loadParquet") {
       // transcode-only path: parquet buffer -> in-memory table
       const t0 = performance.now();

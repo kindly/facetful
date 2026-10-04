@@ -52,6 +52,18 @@ window.__smoke = (async () => {
     eq((await db.query("select count(*) as n from o where capacity > 100", { table: "o" })).column("n")[0],
        (await db.query("select count(*) as n from t where capacity > 100", { table: "t" })).column("n")[0], "opfs table agrees");
     await step("removeOpfs", () => db.removeOpfs("smoke/t.facetful"));
+    // streamed in, indexed as it arrives, written to OPFS as it comes: the
+    // persisted copy reopens, and its index built afterwards answers alike
+    const cols = ["country", "owner"];
+    const st = await step("loadUrl(index, persist)", () => db.loadUrl("u", "/spikes/facet-spike/data-200000.facetful", { searchColumns: cols, persist: "smoke/u.facetful" }));
+    eq(st.rows, 200000, "loadUrl rows");
+    eq(st.persisted, true, "loadUrl wrote OPFS");
+    eq((await step("loadOpfs(streamed)", () => db.loadOpfs("v", "smoke/u.facetful"))).rows, 200000, "persisted copy opens");
+    await db.buildSearchIndex(cols, { table: "v" });
+    const sq = (t) => "select count(*) as n from " + t + " where search('countr owner_1', country, owner)";
+    const viaStream = (await db.query(sq("u"), { table: "u" })).column("n")[0];
+    if (!(viaStream > 0)) throw new Error("search on the streamed table found nothing");
+    eq(viaStream, (await db.query(sq("v"), { table: "v" })).column("n")[0], "streamed index agrees");
     await step("registerFunction", () => db.registerFunction("twice", { params: ["int"], returns: "int", perRow: true }, (x) => x * 2));
     eq((await db.query("select twice(count(*)) as n from t", { table: "t" })).column("n")[0], 400000, "registered function");
     const batch = await step("query batch", () => db.query([
@@ -67,10 +79,11 @@ window.__smoke = (async () => {
     eq(info.rows, 200000, "describe rows");
     eq(info.columns.find((c) => c.name === "country").dict, 200, "describe dictionary size");
     const mem = await step("memoryStats", () => db.memoryStats());
-    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 4) throw new Error("memoryStats: " + JSON.stringify(mem));
+    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 6) throw new Error("memoryStats: " + JSON.stringify(mem));
     let msg = "";
     try { await db.query("select contry from t", { table: "t" }); } catch (e) { msg = String(e.message); }
     if (!/unknown column 'contry'/.test(msg)) throw new Error("error path: " + msg);
+    await db.removeOpfs("smoke/u.facetful");
     db.close();
     return { ok: true, log };
   } catch (e) {

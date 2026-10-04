@@ -185,6 +185,12 @@ impl ReadAt for Src {
     fn from_memory(bytes: Vec<u8>) -> Option<Self> {
         Some(Src::Mem(bytes))
     }
+    fn memory_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            Src::Mem(v) => Some(v),
+            Src::Opfs { .. } => None,
+        }
+    }
     fn len(&self) -> u64 {
         match self {
             Src::Mem(v) => v.len() as u64,
@@ -268,6 +274,69 @@ pub extern "C" fn table_open_opfs(file_id: u32, file_len: f64, cache_budget: f64
         }
         Err(_) => 0,
     }
+}
+
+/// Open an image while it downloads (`facetful_engine::load`): bytes are
+/// pushed as they arrive, the word index can be built a row group at a time
+/// meanwhile, `load_finish` turns it into a table. `expected_len` (0 when
+/// unknown) sizes the buffer once.
+#[no_mangle]
+pub extern "C" fn load_begin(expected_len: f64) -> usize {
+    Box::into_raw(Box::new(facetful_engine::load::TableLoad::<Src>::new(expected_len as usize))) as usize
+}
+
+/// Append bytes. 0 ok, -1 not a .facetful image.
+#[no_mangle]
+pub extern "C" fn load_push(h: usize, ptr: *const u8, len: usize) -> i32 {
+    let l = unsafe { &mut *(h as *mut facetful_engine::load::TableLoad<Src>) };
+    let chunk = unsafe { core::slice::from_raw_parts(ptr, len) };
+    if l.push(chunk).is_ok() { 0 } else { -1 }
+}
+
+/// Row groups whose bytes are complete; -1 until the header and
+/// dictionaries are in.
+#[no_mangle]
+pub extern "C" fn load_groups_ready(h: usize) -> i32 {
+    let l = unsafe { &*(h as *const facetful_engine::load::TableLoad<Src>) };
+    if l.header_ready() { l.groups_ready() as i32 } else { -1 }
+}
+
+/// Index these columns (names separated by NUL bytes) while the image
+/// arrives. 0 ok, -1 a name is not a column (once the header is in).
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn load_index_columns(h: usize, ptr: *const u8, len: usize) -> i32 {
+    let l = unsafe { &mut *(h as *mut facetful_engine::load::TableLoad<Src>) };
+    let s = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(ptr, len) }).into_owned();
+    let names: Vec<&str> = s.split('\0').collect();
+    if l.index_columns(&names).is_ok() { 0 } else { -1 }
+}
+
+/// Index up to `groups` arrived row groups; returns the groups indexed so
+/// far, -1 on a read error.
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn load_index_step(h: usize, groups: u32) -> f64 {
+    let l = unsafe { &mut *(h as *mut facetful_engine::load::TableLoad<Src>) };
+    l.index_step(groups as usize).map(|n| n as f64).unwrap_or(-1.0)
+}
+
+/// The whole image is in: the table handle (0 if it is not a complete
+/// image). Consumes the load. An index under way finishes through
+/// `table_search_index_step`.
+#[no_mangle]
+pub extern "C" fn load_finish(h: usize) -> usize {
+    let l = unsafe { Box::from_raw(h as *mut facetful_engine::load::TableLoad<Src>) };
+    match l.finish() {
+        Ok(t) => Box::into_raw(Box::new(t)) as usize,
+        Err(_) => 0,
+    }
+}
+
+/// Abandon a load.
+#[no_mangle]
+pub extern "C" fn load_free(h: usize) {
+    drop(unsafe { Box::from_raw(h as *mut facetful_engine::load::TableLoad<Src>) });
 }
 
 /// Pre-touch a column's segments (background warming). Returns bytes read.
