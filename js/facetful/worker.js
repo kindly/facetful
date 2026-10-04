@@ -131,6 +131,37 @@ function finishIndexLater(handle) {
   })());
 }
 
+/** Use the search index kept in OPFS at `path` when there is one and it
+ *  fits (this build, this table, these columns, whole); true when in use.
+ *  It is read straight into wasm memory. */
+async function loadSavedIndex(handle, columns, path) {
+  let h;
+  try {
+    closeHandlesFor(path);
+    const { dir, file } = await opfsDir(path, false);
+    h = await (await dir.getFileHandle(file)).createSyncAccessHandle();
+  } catch {
+    return false; // none kept, or no OPFS
+  }
+  try {
+    const n = h.getSize();
+    return n > 0 && engine.loadSearchIndex(handle, columns, n, (view) => h.read(view, { at: 0 }));
+  } finally {
+    h.close();
+  }
+}
+
+/** Keep the table's search index in OPFS at `path`, written straight from
+ *  wasm memory; returns the bytes written (0 without an index or OPFS). */
+async function saveIndex(handle, path) {
+  await searchBuilds.get(handle); // a build finishing in the background
+  const out = await opfsAppender(path);
+  if (!out) return 0;
+  const n = engine.withSavedSearchIndex(handle, (view) => (out.write(view), view.byteLength));
+  out.close();
+  return n ?? 0;
+}
+
 /** Open an OPFS-backed table lazily (metadata now, segments on demand). */
 async function opfsOpenTable(name, path, cacheBytes) {
   const { handle, rows, fileLen } = await opfsOpenHandle(path, cacheBytes);
@@ -363,13 +394,24 @@ self.onmessage = async (e) => {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
       const t0 = performance.now();
+      // a kept index read back instead of building, when it fits
+      if (e.data.cache && (await loadSavedIndex(handle, e.data.columns, e.data.cache))) {
+        reply({ ok: true, ...engine.searchIndexStats(handle), cached: true, elapsedMs: performance.now() - t0 });
+        return;
+      }
       engine.beginSearchIndex(handle, e.data.columns);
       // a row group at a time, yielding between groups so queued queries run
       // meanwhile (scanning, until the index is finished)
       while (engine.stepSearchIndex(handle, 1) > 0) {
         await new Promise((r) => setTimeout(r, 0));
       }
-      reply({ ok: true, ...engine.searchIndexStats(handle), elapsedMs: performance.now() - t0 });
+      const elapsedMs = performance.now() - t0;
+      const savedBytes = e.data.cache ? await saveIndex(handle, e.data.cache) : 0;
+      reply({ ok: true, ...engine.searchIndexStats(handle), cached: false, savedBytes, elapsedMs });
+    } else if (cmd === "saveSearchIndex") {
+      const handle = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!handle) throw new Error("no table loaded");
+      reply({ ok: true, bytes: await saveIndex(handle, e.data.path) });
     } else if (cmd === "searchSuggest") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");

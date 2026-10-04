@@ -242,12 +242,18 @@ export declare class Facetful {
    * Build the word index search() uses over these text columns, in the
    * background: a row group at a time, with queries answered in between
    * (search() scans until the index is finished). Resolves when it is in use.
-   * Not in the lite build.
+   * Not in the lite build. With `cache` (an OPFS path) an index kept there is
+   * read back instead when it fits this table and these columns (`cached`);
+   * otherwise it is built and kept there. Key the path by the data's version.
    */
   buildSearchIndex(
     columns: string[],
-    options?: { table?: string },
-  ): Promise<{ pairs: number; bytes: number; elapsedMs: number }>;
+    options?: { table?: string; cache?: string },
+  ): Promise<{ pairs: number; bytes: number; elapsedMs: number; cached: boolean; savedBytes: number }>;
+
+  /** Keep the table's search index in OPFS at `path` (after `loadUrl` or
+   *  `attach` built it), for `buildSearchIndex(columns, { cache: path })`. */
+  saveSearchIndex(path: string, options?: { table?: string }): Promise<{ bytes: number }>;
 
   /**
    * What to offer for a search query typed so far over these columns:

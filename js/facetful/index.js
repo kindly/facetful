@@ -200,13 +200,26 @@ export class Facetful {
    * Build the word index search() uses over these text columns, in the
    * background: a row group at a time, with queries answered in between
    * (search() scans until the index is finished). Resolves when it is in
-   * use. Needs a build with search (not the lite build).
+   * use. Needs a build with search (not the lite build). With `cache` (an
+   * OPFS path) an index kept there is read back instead when it fits this
+   * table and these columns (`cached: true`); otherwise the index is built
+   * and kept there for next time. Key the path by the data's version.
    */
-  async buildSearchIndex(columns, { table } = {}) {
-    const { pairs, bytes, elapsedMs } = await this._call({ cmd: "buildSearchIndex", columns, table });
-    return { pairs, bytes, elapsedMs };
+  async buildSearchIndex(columns, { table, cache } = {}) {
+    const { pairs, bytes, elapsedMs, cached, savedBytes } = await this._call({ cmd: "buildSearchIndex", columns, table, cache });
+    return { pairs, bytes, elapsedMs, cached: !!cached, savedBytes: savedBytes ?? 0 };
   }
 
+  /**
+   * Keep the table's search index in OPFS at `path` (after `loadUrl` or
+   * `attach` built it), for `buildSearchIndex(columns, { cache: path })` to
+   * read back on a later visit. Resolves with the bytes written (0 without
+   * an index, or without OPFS).
+   */
+  async saveSearchIndex(path, { table } = {}) {
+    const { bytes } = await this._call({ cmd: "saveSearchIndex", path, table });
+    return { bytes };
+  }
 
   /**
    * What to offer for a search query typed so far over these columns:

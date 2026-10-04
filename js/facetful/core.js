@@ -246,6 +246,45 @@ export class Engine {
     return { handle, rows: this.w.table_total_rows(handle), indexedWhileLoading: indexed, indexLeft };
   }
 
+  /** The table's search index as bytes, to keep (in OPFS) and give back to
+   *  `loadSearchIndex` on a later visit: `use(view)` sees them, a view into
+   *  wasm memory valid only during the call (write it out there, without a
+   *  copy). Returns `use`'s result, or null when there is no index. */
+  withSavedSearchIndex(tableHandle, use) {
+    if (!this.w.table_search_index_save) throw new Error("this facetful build has no search index (lite build)");
+    const h = this.w.table_search_index_save(tableHandle);
+    if (!h) return null;
+    try {
+      return use(new Uint8Array(this.mem(), u32(this.w.image_ptr(h)), u32(this.w.image_len(h))));
+    } finally {
+      this.w.image_free(h);
+    }
+  }
+
+  /** Use a search index over `columns` saved through
+   *  `withSavedSearchIndex`: `fill(view)` writes its `len` bytes into wasm
+   *  memory (an OPFS read, say). Returns false when it does not fit (saved
+   *  by another version, for another table or other columns, or damaged):
+   *  build the index instead. */
+  loadSearchIndex(tableHandle, columns, len, fill) {
+    if (!this.w.table_search_index_load) throw new Error("this facetful build has no search index (lite build)");
+    const idx = columns.map((c) => {
+      const i = this.colByName(tableHandle, c);
+      if (i < 0) throw new Error(`search index: no column ${JSON.stringify(c)}`);
+      return i;
+    });
+    const p = u32(this.w.alloc(len));
+    const cp = u32(this.w.alloc(idx.length * 4));
+    try {
+      new Uint32Array(this.mem(), cp, idx.length).set(idx);
+      fill(new Uint8Array(this.mem(), p, len));
+      return this.w.table_search_index_load(tableHandle, p, len, cp, idx.length) === 0;
+    } finally {
+      this.w.dealloc(cp, idx.length * 4);
+      this.w.dealloc(p, len);
+    }
+  }
+
   /** Append the columns of `otherHandle`, the other part of the table's
    *  split image (`facetful split`), to the table. `otherHandle` is used up
    *  either way. Search indexes on either part become one over both. */

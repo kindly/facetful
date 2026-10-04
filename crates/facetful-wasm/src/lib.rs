@@ -339,6 +339,28 @@ pub extern "C" fn load_free(h: usize) {
     drop(unsafe { Box::from_raw(h as *mut facetful_engine::load::TableLoad<Src>) });
 }
 
+/// The table's word index as bytes (`Table::save_search_index`): a handle
+/// read with `image_ptr` / `image_len` and freed with `image_free`, or 0
+/// when there is no index.
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn table_search_index_save(t: usize) -> usize {
+    let t = unsafe { &*(t as *const T) };
+    t.save_search_index().map_or(0, |b| Box::into_raw(Box::new(b)) as usize)
+}
+
+/// Use a saved word index over these columns (`Table::load_search_index`).
+/// 0 in use, -1 refused (another build, table or columns, or damaged):
+/// build it instead.
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn table_search_index_load(t: usize, ptr: *const u8, len: usize, cols: *const u32, n: usize) -> i32 {
+    let t = unsafe { &mut *(t as *mut T) };
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let cols: Vec<usize> = unsafe { core::slice::from_raw_parts(cols, n) }.iter().map(|&c| c as usize).collect();
+    if t.load_search_index(bytes, &cols).is_ok() { 0 } else { -1 }
+}
+
 /// Attach table `other`, the other part of `t`'s split image, to `t`
 /// (`Table::attach`); `other` is consumed either way. 0 ok, -1 not the
 /// other part (split id or row groups differ, or a column name repeats).

@@ -254,7 +254,10 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
 
      The app works at under half the wait, and search over every column is ready 0.1 to 0.2 s after the whole image would have been. Putting Description Common in the second part too (24.1 + 34.1 MB) gives the first part at 9.72 s, but then search before the second part sees no description at all.
    - Attaching an OPFS part to an in-memory table caches its segments without a budget (the table's own has none); a page that keeps parts in OPFS should open both from OPFS.
-9. **OPFS cache of the whole index,** read back in full on later visits.
+9. ~~OPFS cache of the whole index~~ (done 5 October). `db.buildSearchIndex(columns, { cache: path })` reads the index kept at `path` when it fits and otherwise builds it and keeps it there; `db.saveSearchIndex(path)` keeps one built while streaming (`loadUrl`, `attach`). Rust: `SearchIndex::to_bytes` / `from_bytes`, `Table::save_search_index` / `load_search_index`.
+   - **What is kept:** the index's arrays one after another (vocabulary, counts, per group the list ids, entries, rows and bitmaps, the dictionary tables), after a version (`SAVED_VERSION`, bumped with the tokenizer or layout) and the table's fingerprint (`Table::fingerprint`: schema, every row group's layout and statistics, image length, split id, attached parts). It is written straight from wasm memory and read straight into it.
+   - **Refused, then rebuilt:** another version, another table, other columns, or a damaged file. Every list, row, word id and dictionary code is checked to lie in range before use; a test loads every truncation and 400 single-bit flips without a panic (5,000 once). The fingerprint describes the layout, not every byte, so the cache path should carry the data's version.
+   - grantnav, wasm in Node: kept index 75.4 MB, saved in 108 ms; read back in 117 to 146 ms against 2,258 ms to build, wasm peak 542 MB against 626 MB (the OPFS read itself is not included: step 11).
 10. **Accent folding** and keeping apostrophes inside words (tokenizer changes; any time).
 11. **Measurements in Chrome, Firefox, Safari and a phone;** build peak memory if phones need it (groups in halves, 6-byte pairs).
 </sv-prose>

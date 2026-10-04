@@ -918,3 +918,89 @@ fn split_parts_merge_their_indexes() {
     }
 }
 
+/// A saved index (`save_search_index`) loads back into the same table, from
+/// however it was opened, and is refused anywhere else, damaged or not.
+#[test]
+fn saved_index_loads_back_only_where_it_belongs() {
+    use facetful_engine::format::split::split;
+    use facetful_engine::load::TableLoad;
+    let sql = |q: &str| format!("select count(*) from t where search('{q}', {COLS})");
+    let mut built = table();
+    let want = built.build_search_index(&[0, 1, 2]).unwrap();
+    let saved = built.save_search_index().unwrap();
+    let same = |t: &mut Table<Vec<u8>>, built: &mut Table<Vec<u8>>, how: &str| {
+        let got = t.search_index().expect("loaded").stats();
+        assert_eq!((got.words, got.pairs, got.value_pairs, got.bitmap_entries), (want.words, want.pairs, want.value_pairs, want.bitmap_entries), "{how}");
+        for q in QUERIES {
+            assert_eq!(count(t, &sql(q)), count(built, &sql(q)), "{how}: '{q}'");
+        }
+    };
+    // into the same image, opened again or streamed in
+    let mut t = table();
+    t.load_search_index(&saved, &[0, 1, 2]).unwrap();
+    same(&mut t, &mut built, "reopened");
+    let img = image();
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    for c in img.chunks(300) {
+        load.push(c).unwrap();
+    }
+    let mut t = load.finish().unwrap();
+    t.load_search_index(&saved, &[0, 1, 2]).unwrap();
+    same(&mut t, &mut built, "streamed");
+    // and one saved from a streamed build loads into the image opened whole
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    load.index_columns(&["title", "org", "descr"]).unwrap();
+    for c in img.chunks(300) {
+        load.push(c).unwrap();
+        load.index_step(1).unwrap();
+    }
+    let mut s = load.finish().unwrap();
+    s.search_index_step(usize::MAX).unwrap();
+    let mut t = table();
+    t.load_search_index(&s.save_search_index().unwrap(), &[0, 1, 2]).unwrap();
+    same(&mut t, &mut built, "saved from a stream");
+    // other columns, another table, another version: refused, the table unchanged
+    let mut t = table();
+    assert!(t.load_search_index(&saved, &[0, 2]).is_err());
+    assert!(t.search_index().is_none());
+    t.load_search_index(&saved, &[2, 1, 0, 0]).unwrap();
+    let mut other = word_table(&["mental health", "youth sport"]);
+    assert!(other.load_search_index(&saved, &[0, 1, 2]).is_err());
+    assert!(other.search_index().is_none());
+    let mut v = saved.clone();
+    v[4] ^= 1;
+    assert!(table().load_search_index(&v, &[0, 1, 2]).is_err());
+    // cut short anywhere: refused
+    let mut t = table();
+    for n in (0..saved.len()).step_by(saved.len() / 997 + 1) {
+        assert!(t.load_search_index(&saved[..n], &[0, 1, 2]).is_err(), "cut at {n}");
+    }
+    assert!(t.search_index().is_none());
+    // a flipped byte anywhere: refused, or loaded and answering without a panic
+    let mut x = 12345u64;
+    for _ in 0..400 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut d = saved.clone();
+        let at = 16 + (x >> 33) as usize % (d.len() - 16);
+        d[at] ^= 1 << (x % 8);
+        let mut t = table();
+        if t.load_search_index(&d, &[0, 1, 2]).is_ok() {
+            for q in ["mental health", "sport", "helth "] {
+                let _ = count(&mut t, &sql(q));
+            }
+        }
+    }
+    // a split table: saved after attach, it loads only into both parts attached
+    let src: &[u8] = &img;
+    let (a, b) = split(&src, &[2], 9).unwrap();
+    let mut p = Table::open(a.clone()).unwrap();
+    p.attach(Table::open(b.clone()).unwrap()).unwrap();
+    p.build_search_index(&[0, 1, 2]).unwrap();
+    let saved_parts = p.save_search_index().unwrap();
+    let mut q = Table::open(a.clone()).unwrap();
+    assert!(q.load_search_index(&saved_parts, &[0, 1, 2]).is_err(), "the first part alone");
+    q.attach(Table::open(b).unwrap()).unwrap();
+    q.load_search_index(&saved_parts, &[0, 1, 2]).unwrap();
+    same(&mut q, &mut built, "split, attached");
+    assert!(table().load_search_index(&saved_parts, &[0, 1, 2]).is_err(), "the unsplit image");
+}

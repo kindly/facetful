@@ -254,6 +254,83 @@ impl<S: ReadAt> Table<S> {
         Ok(left)
     }
 
+    /// The word index as bytes, to keep (in OPFS, say) and give back to
+    /// `load_search_index` on a later visit instead of building it again.
+    #[cfg(feature = "search")]
+    pub fn save_search_index(&self) -> Option<Vec<u8>> {
+        self.search_index.as_ref().map(|i| i.to_bytes(self.fingerprint()))
+    }
+
+    /// Use a word index over `cols` saved by `save_search_index`. Refused
+    /// (and nothing changes) unless it was saved by this build for this very
+    /// table over these columns, and is whole: then build it instead.
+    #[cfg(feature = "search")]
+    pub fn load_search_index(&mut self, bytes: &[u8], cols: &[usize]) -> Result<(), &'static str> {
+        let rows: Vec<usize> = self.cat.groups.iter().map(|g| g.row_count as usize).collect();
+        let mut dict_len = vec![None; self.cat.schema.columns.len()];
+        for (c, len) in dict_len.iter_mut().enumerate() {
+            let def = &self.cat.schema.columns[c];
+            if def.ty == ColumnType::Utf8 && def.is_dict() {
+                *len = Some(self.dictionary_rc(c).map_err(|_| "could not read a dictionary")?.len());
+            }
+        }
+        let kind = |c: usize| match (self.cat.schema.columns.get(c), dict_len.get(c)) {
+            (Some(def), Some(None)) if def.ty == ColumnType::Utf8 => search_index::ColKind::Plain,
+            (Some(_), Some(Some(n))) => search_index::ColKind::Dict(*n),
+            _ => search_index::ColKind::Other,
+        };
+        let idx = search_index::SearchIndex::from_bytes(bytes, self.fingerprint(), &rows, kind)?;
+        let mut want = cols.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        if idx.cols != want {
+            return Err("saved over other columns");
+        }
+        self.search_builder = None;
+        self.search_index = Some(std::rc::Rc::new(idx));
+        Ok(())
+    }
+
+    /// Identifies the table's contents for caches kept outside it (a saved
+    /// word index): a hash of its schema and of every row group's layout and
+    /// statistics, the image length and split id, attached parts included.
+    /// Images that differ only where no length or statistic changes would
+    /// share one, so a cache should also be keyed by the data's version.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let cats = std::iter::once(&self.cat).chain(self.attached.iter().map(|a| &a.cat));
+        for cat in cats {
+            eat(&cat.row_group_target.to_le_bytes());
+            eat(&cat.total_rows.to_le_bytes());
+            eat(&cat.image_len.unwrap_or(0).to_le_bytes());
+            eat(&cat.split_id.unwrap_or(0).to_le_bytes());
+            for c in &cat.schema.columns {
+                eat(c.name.as_bytes());
+                eat(&[c.ty as u8]);
+                eat(&c.flags.to_le_bytes());
+            }
+            for g in &cat.groups {
+                eat(&g.offset.to_le_bytes());
+                eat(&g.row_count.to_le_bytes());
+                for c in &g.cols {
+                    eat(&c.null_count.to_le_bytes());
+                    c.seg_lens.iter().for_each(|l| eat(&l.to_le_bytes()));
+                    match c.stats {
+                        format::Stats::None => eat(&[0]),
+                        format::Stats::Int { min, max } => eat(&[&[1u8][..], &min.to_le_bytes(), &max.to_le_bytes()].concat()),
+                        format::Stats::Float { min, max } => eat(&[&[2u8][..], &min.to_bits().to_le_bytes(), &max.to_bits().to_le_bytes()].concat()),
+                    }
+                }
+            }
+        }
+        h
+    }
+
     /// Drop the word index; search() scans again.
     #[cfg(feature = "search")]
     pub fn drop_search_index(&mut self) {

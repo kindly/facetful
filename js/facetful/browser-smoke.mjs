@@ -77,6 +77,22 @@ window.__smoke = (async () => {
     const wholeRes = await res("t");
     eq(await res("p1"), wholeRes, "streamed parts agree with the whole image");
     eq(await res("q1"), wholeRes, "OPFS parts agree with the whole image");
+    // the search index kept in OPFS: built and saved on a first visit, read
+    // back on the next (no rebuild), rebuilt when the columns change; one
+    // built while streaming in is saved explicitly
+    const sCols = ["country", "owner"];
+    const first = await step("buildSearchIndex(cache)", () => db.buildSearchIndex(sCols, { table: "t", cache: "smoke/o.index" }));
+    eq(first.cached, false, "first build");
+    if (!(first.savedBytes > 0)) throw new Error("the index was not kept: " + JSON.stringify(first));
+    eq((await db.loadUrl("o3", "/spikes/facet-spike/data-200000.facetful")).rows, 200000, "a fresh copy");
+    const again = await step("buildSearchIndex(cached)", () => db.buildSearchIndex(sCols, { table: "o3", cache: "smoke/o.index" }));
+    eq(again.cached, true, "read back, not rebuilt");
+    const sq2 = (t) => "select count(*) as n from " + t + " where search('countr owner_1', country, owner)";
+    eq((await db.query(sq2("o3"), { table: "o3" })).column("n")[0], (await db.query(sq2("t"), { table: "t" })).column("n")[0], "the kept index answers alike");
+    eq((await db.buildSearchIndex(["country"], { table: "o3", cache: "smoke/o.index" })).cached, false, "other columns rebuild");
+    if (!((await db.saveSearchIndex("smoke/u.index", { table: "u" })).bytes > 0)) throw new Error("saving the streamed table's index");
+    await db.removeOpfs("smoke/o.index");
+    await db.removeOpfs("smoke/u.index");
     await step("registerFunction", () => db.registerFunction("twice", { params: ["int"], returns: "int", perRow: true }, (x) => x * 2));
     eq((await db.query("select twice(count(*)) as n from t", { table: "t" })).column("n")[0], 400000, "registered function");
     const batch = await step("query batch", () => db.query([
@@ -92,7 +108,7 @@ window.__smoke = (async () => {
     eq(info.rows, 200000, "describe rows");
     eq(info.columns.find((c) => c.name === "country").dict, 200, "describe dictionary size");
     const mem = await step("memoryStats", () => db.memoryStats());
-    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 8) throw new Error("memoryStats: " + JSON.stringify(mem));
+    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 9) throw new Error("memoryStats: " + JSON.stringify(mem));
     let msg = "";
     try { await db.query("select contry from t", { table: "t" }); } catch (e) { msg = String(e.message); }
     if (!/unknown column 'contry'/.test(msg)) throw new Error("error path: " + msg);

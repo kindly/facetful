@@ -292,4 +292,26 @@ try {
   console.log(`batch: OK (3 fused + 1 ordinary; fused ${tb.toFixed(2)} ms vs one by one ${ts.toFixed(2)} ms)`);
 }
 
+// a search index saved and read back: no rebuild, the same answers; refused
+// for other columns, another table, or when damaged
+{
+  const cols = ["country", "owner"];
+  const img = readFileSync(new URL("spikes/facet-spike/data-200000.facetful", root));
+  const a = engine.openTable(img).handle;
+  engine.buildSearchIndex(a, cols);
+  const saved = engine.withSavedSearchIndex(a, (v) => v.slice());
+  if (!(saved?.byteLength > 1000)) throw new Error("saving the search index");
+  const b = engine.openTable(img).handle;
+  const load = (h, c, bytes) => engine.loadSearchIndex(h, c, bytes.byteLength, (v) => v.set(bytes));
+  if (load(b, ["country"], saved)) throw new Error("a saved index loaded for other columns");
+  const cut = saved.slice(0, saved.byteLength - 9);
+  if (load(b, cols, cut)) throw new Error("a saved index cut short loaded");
+  if (!load(b, cols, saved)) throw new Error("the saved index was refused");
+  const q = "select count(*) as n from t where search('countr owner_1', country, owner)";
+  if (engine.query(b, q).columns[0].values[0] !== engine.query(a, q).columns[0].values[0]) throw new Error("the loaded index answers differently");
+  const other = engine.openTable(readFileSync(new URL("spikes/facet-spike/data-200000.part1.facetful", root))).handle;
+  if (load(other, ["country"], saved)) throw new Error("a saved index loaded into another table");
+  if (engine.withSavedSearchIndex(other, () => 1) !== null) throw new Error("saving with no index");
+}
+
 console.log("js protocol smoke: OK");

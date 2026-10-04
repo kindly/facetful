@@ -1149,7 +1149,223 @@ impl Forms {
     }
 }
 
+/// Version of a saved index (`SearchIndex::to_bytes`): bump it whenever the
+/// tokenizer, the word rules or the layout change, so an index saved by
+/// another build is rebuilt instead of misread.
+pub const SAVED_VERSION: u32 = 1;
+const SAVED_MAGIC: &[u8; 4] = b"FCTX";
+
+/// What a column is, for checking a saved index against a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColKind {
+    /// plain text: in the row lists
+    Plain,
+    /// dictionary text with this many values
+    Dict(usize),
+    /// not text, or not a column
+    Other,
+}
+
+/// Little-endian writer for `to_bytes`: arrays as a u64 length, then items.
+struct Out(Vec<u8>);
+impl Out {
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn len(&mut self, n: usize) {
+        self.u64(n as u64);
+    }
+    fn u8s(&mut self, v: &[u8]) {
+        self.len(v.len());
+        self.0.extend_from_slice(v);
+    }
+    fn u16s(&mut self, v: &[u16]) {
+        self.len(v.len());
+        v.iter().for_each(|x| self.0.extend_from_slice(&x.to_le_bytes()));
+    }
+    fn u32s(&mut self, v: &[u32]) {
+        self.len(v.len());
+        v.iter().for_each(|x| self.0.extend_from_slice(&x.to_le_bytes()));
+    }
+    fn u64s(&mut self, v: &[u64]) {
+        self.len(v.len());
+        v.iter().for_each(|x| self.0.extend_from_slice(&x.to_le_bytes()));
+    }
+}
+
+/// Reader for `from_bytes`: every read is bounds-checked.
+struct In<'a>(&'a [u8]);
+impl<'a> In<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
+        if n > self.0.len() {
+            return Err("saved index cut short");
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+    fn u32(&mut self) -> Result<u32, &'static str> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, &'static str> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn len(&mut self, width: usize) -> Result<usize, &'static str> {
+        let n = self.u64()? as usize;
+        if n.checked_mul(width).is_none_or(|b| b > self.0.len()) {
+            return Err("saved index cut short");
+        }
+        Ok(n)
+    }
+    fn u8s(&mut self) -> Result<Vec<u8>, &'static str> {
+        let n = self.len(1)?;
+        Ok(self.take(n)?.to_vec())
+    }
+    fn u16s(&mut self) -> Result<Vec<u16>, &'static str> {
+        let n = self.len(2)?;
+        Ok(self.take(n * 2)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    }
+    fn u32s(&mut self) -> Result<Vec<u32>, &'static str> {
+        let n = self.len(4)?;
+        Ok(self.take(n * 4)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+    fn u64s(&mut self) -> Result<Vec<u64>, &'static str> {
+        let n = self.len(8)?;
+        Ok(self.take(n * 8)?.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+    fn usizes(&mut self) -> Result<Vec<usize>, &'static str> {
+        Ok(self.u32s()?.into_iter().map(|c| c as usize).collect())
+    }
+}
+
 impl SearchIndex {
+    /// The index as bytes, to keep (OPFS) and read back with `from_bytes`
+    /// instead of building it again. `fingerprint` identifies the table it
+    /// was built over (`Table::fingerprint`).
+    pub fn to_bytes(&self, fingerprint: u64) -> Vec<u8> {
+        let mut o = Out(Vec::with_capacity(self.stats().list_bytes + self.stats().vocab_bytes + 1024));
+        o.0.extend_from_slice(SAVED_MAGIC);
+        o.u32(SAVED_VERSION);
+        o.u64(fingerprint);
+        o.u32s(&self.cols.iter().map(|&c| c as u32).collect::<Vec<_>>());
+        o.u32s(&self.plain.iter().map(|&c| c as u32).collect::<Vec<_>>());
+        o.u32(self.fields);
+        o.u8s(&self.words.bytes);
+        o.u32s(&self.words.ends);
+        o.u32s(&self.counts);
+        o.len(self.groups.len());
+        for g in &self.groups {
+            o.u32s(&g.ids);
+            o.u32s(&g.entries.iter().flat_map(|e| [e.start, e.len]).collect::<Vec<_>>());
+            o.u16s(&g.rows);
+            o.u64s(&g.bitmaps);
+        }
+        o.len(self.dicts.len());
+        for d in &self.dicts {
+            o.u64(d.col as u64);
+            o.u64(d.values as u64);
+            o.u32s(&d.offsets);
+            o.u32s(&d.codes);
+        }
+        o.0
+    }
+
+    /// An index saved by `to_bytes`, if it was saved by this build
+    /// (`SAVED_VERSION`) for this table and is whole: `fingerprint` and
+    /// `group_rows` (rows per row group) describe the table, `kind` its
+    /// columns. Every list, row, word and code is checked to lie in range,
+    /// so a damaged file is refused, never trusted.
+    pub fn from_bytes(bytes: &[u8], fingerprint: u64, group_rows: &[usize], kind: impl Fn(usize) -> ColKind) -> Result<SearchIndex, &'static str> {
+        let groups = group_rows.len();
+        let mut r = In(bytes);
+        if r.take(4)? != SAVED_MAGIC {
+            return Err("not a saved index");
+        }
+        if r.u32()? != SAVED_VERSION {
+            return Err("saved by another version");
+        }
+        if r.u64()? != fingerprint {
+            return Err("saved for another table");
+        }
+        let cols = r.usizes()?;
+        let plain = r.usizes()?;
+        let fields = r.u32()?;
+        let words = Words { bytes: r.u8s()?, ends: r.u32s()? };
+        let counts = r.u32s()?;
+        let nwords = words.ends.len();
+        let ok = cols.iter().all(|&c| kind(c) != ColKind::Other)
+            && plain.iter().all(|&c| cols.contains(&c) && kind(c) == ColKind::Plain)
+            && fields == (plain.len() as u32).max(1)
+            && counts.len() == nwords
+            && words.ends.windows(2).all(|w| w[0] <= w[1])
+            && words.ends.last().is_none_or(|&e| e as usize == words.bytes.len());
+        if !ok {
+            return Err("saved index damaged");
+        }
+        if r.len(1)? != groups {
+            return Err("saved for another table");
+        }
+        let lists = nwords as u64 * fields as u64;
+        let mut gs = Vec::with_capacity(groups);
+        for &n in group_rows {
+            let ids = r.u32s()?;
+            let flat = r.u32s()?;
+            let rows = r.u16s()?;
+            let bitmaps = r.u64s()?;
+            let entries: Vec<Entry> = flat.chunks_exact(2).map(|p| Entry { start: p[0], len: p[1] }).collect();
+            let maps = bitmaps.len() / BITMAP_WORDS;
+            let ok = flat.len() == ids.len() * 2
+                && bitmaps.len() % BITMAP_WORDS == 0
+                && ids.windows(2).all(|w| w[0] < w[1])
+                && ids.last().is_none_or(|&l| (l as u64) < lists)
+                && entries.iter().all(|e| {
+                    if e.len == BITMAP {
+                        (e.start as usize) < maps
+                    } else {
+                        e.start as usize + e.len as usize <= rows.len()
+                    }
+                })
+                && rows.iter().all(|&r| (r as usize) < n)
+                && bitmaps.chunks(BITMAP_WORDS).all(|b| {
+                    // no row at or past the group's end
+                    b.iter().enumerate().all(|(w, &bits)| match n.saturating_sub(w * 64) {
+                        0 => bits == 0,
+                        k if k < 64 => bits >> k == 0,
+                        _ => true,
+                    })
+                });
+            if !ok {
+                return Err("saved index damaged");
+            }
+            gs.push(GroupIndex { ids, entries, rows, bitmaps });
+        }
+        let ndicts = r.len(1)?;
+        let mut dicts = Vec::with_capacity(ndicts);
+        for _ in 0..ndicts {
+            let col = r.u64()? as usize;
+            let values = r.u64()? as usize;
+            let offsets = r.u32s()?;
+            let codes = r.u32s()?;
+            let ok = cols.contains(&col)
+                && kind(col) == ColKind::Dict(values)
+                && offsets.len() == nwords + 1
+                && offsets.windows(2).all(|w| w[0] <= w[1])
+                && offsets.last().is_some_and(|&e| e as usize == codes.len())
+                && codes.iter().all(|&c| (c as usize) < values);
+            if !ok {
+                return Err("saved index damaged");
+            }
+            dicts.push(DictIndex { col, values, offsets, codes });
+        }
+        if !r.0.is_empty() {
+            return Err("saved index damaged");
+        }
+        Ok(SearchIndex { cols, plain, fields, words, counts, groups: gs, dicts, phases: [0.0; 4], mem: [0; 4] })
+    }
+
     /// An index of no columns over `groups` row groups (what a table without
     /// an index brings to `merge`).
     pub fn empty(groups: usize) -> SearchIndex {
