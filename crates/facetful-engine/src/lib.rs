@@ -37,6 +37,20 @@ pub(crate) fn sort_small<T: Ord>(v: &mut [T]) {
     }
 }
 
+#[cfg(any(feature = "search", feature = "write"))]
+thread_local! {
+    /// Bumped whenever a table's word index comes or goes (`search_generation`).
+    static SEARCH_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Changes whenever any table's word index is installed, replaced or
+/// removed: part of the key of anything cached from query results, so a
+/// result search() gave before is not served after.
+#[cfg(feature = "write")]
+pub(crate) fn search_generation() -> u64 {
+    SEARCH_GENERATION.with(|g| g.get())
+}
+
 /// One opened `.facetful` table over a synchronous byte source.
 ///
 /// Segments load through a cache on first touch. With a `cache_budget` set
@@ -212,7 +226,7 @@ impl<S: ReadAt> Table<S> {
         self.attached.push(Attached { src, cat, first });
         #[cfg(feature = "search")]
         {
-            self.search_index = index;
+            self.set_search_index(index);
         }
         Ok(())
     }
@@ -240,7 +254,9 @@ impl<S: ReadAt> Table<S> {
     /// build in progress. The dictionary columns are read here.
     #[cfg(feature = "search")]
     pub fn begin_search_index(&mut self, cols: &[usize]) -> Result<(), FormatError> {
-        self.search_index = None; // its memory back before the new one is built
+        // a request that cannot be built leaves the index there is alone
+        search_index::check_table(&self.cat, cols)?;
+        self.set_search_index(None); // its memory back before the new one is built
         self.search_builder = None;
         self.search_builder = Some(search_index::IndexBuilder::new(self, cols)?);
         Ok(())
@@ -262,7 +278,7 @@ impl<S: ReadAt> Table<S> {
         }
         let left = total - b.groups_done();
         if left == 0 {
-            self.search_index = Some(std::rc::Rc::new(b.finish()));
+            self.set_search_index(Some(std::rc::Rc::new(b.finish())));
         } else {
             self.search_builder = Some(b);
         }
@@ -302,7 +318,7 @@ impl<S: ReadAt> Table<S> {
             return Err("saved over other columns");
         }
         self.search_builder = None;
-        self.search_index = Some(std::rc::Rc::new(idx));
+        self.set_search_index(Some(std::rc::Rc::new(idx)));
         Ok(())
     }
 
@@ -349,8 +365,24 @@ impl<S: ReadAt> Table<S> {
     /// Drop the word index; search() scans again.
     #[cfg(feature = "search")]
     pub fn drop_search_index(&mut self) {
-        self.search_index = None;
+        self.set_search_index(None);
         self.search_builder = None;
+    }
+
+    /// Install (or remove) the word index. search() answers differently with
+    /// and without it (corrections, inflections), so anything cached from a
+    /// search() result goes: this table's derived tables now, and every
+    /// table's derived tables through the generation in their keys (one may
+    /// hold a result read from this table).
+    #[cfg(feature = "search")]
+    fn set_search_index(&mut self, idx: Option<std::rc::Rc<search_index::SearchIndex>>) {
+        if self.search_index.is_none() && idx.is_none() {
+            return;
+        }
+        self.search_index = idx;
+        self.derived.clear();
+        self.derived_bytes = 0;
+        SEARCH_GENERATION.with(|g| g.set(g.get() + 1));
     }
 
     #[cfg(feature = "search")]

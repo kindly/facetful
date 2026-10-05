@@ -245,15 +245,6 @@ impl GroupIndex {
         }
     }
 
-    /// Rows of this group the row lists give `ids` (for the NULL correction
-    /// of a nullable dictionary column, a rare path).
-    fn plain_hits(&self, ids: &[std::ops::Range<u32>], rows: usize) -> Vec<u8> {
-        let mut m = vec![0u8; rows];
-        for r in ids {
-            self.mark_range(r.clone(), &mut m);
-        }
-        m
-    }
 
     /// (word, row) pairs held.
     fn pairs(&self) -> usize {
@@ -736,6 +727,7 @@ impl IndexBuilder {
         let mut cols = cols.to_vec();
         cols.sort_unstable();
         cols.dedup();
+        check_table(table.catalog(), &cols)?;
         let t = now();
         let mut vocab = Vocab::default();
         let mut buf = Vec::new();
@@ -791,6 +783,9 @@ impl IndexBuilder {
     pub fn add_group<S: ReadAt>(&mut self, table: &mut Table<S>) -> Result<(), FormatError> {
         let g = self.groups.len();
         let t = now();
+        if table.catalog().groups[g].row_count > MAX_GROUP_ROWS {
+            return Err(TOO_BIG); // a group that arrived after the build began
+        }
         let rows = table.catalog().groups[g].row_count as usize;
         for (&c, (_, value_rows)) in self.dict_words.iter_mut() {
             // rows per value, for the words' row counts
@@ -1754,14 +1749,20 @@ impl SearchIndex {
         if !prefix && own_rows == 0 && spelling_variants(w).iter().any(|v| self.word_id(v).is_some()) {
             return forms;
         }
+        // a finished word is corrected only while it is rare: settled before
+        // looking for neighbours, which for a non-ASCII word means measuring
+        // against the whole vocabulary
+        if !prefix && own_rows >= TYPO_MAX_ROWS {
+            return forms;
+        }
         let mut cands = self.neighbors(w, prefix);
         // a word's own singular or plural is not a correction of it
         cands.retain(|c| prefix || !plural_pair(&c.0, w));
         let best = cands.iter().map(|c| c.2).max().unwrap_or(0);
         // a word, or the word being typed, is corrected when it is missing or a
         // neighbour has TYPO_RATIO times its rows (`comun…`, 322 rows, beside
-        // `commun…`); a finished word only while it is rare
-        if best == 0 || (own_rows > 0 && (own_rows * TYPO_RATIO > best || (!prefix && own_rows >= TYPO_MAX_ROWS))) {
+        // `commun…`)
+        if best == 0 || (own_rows > 0 && own_rows * TYPO_RATIO > best) {
             return forms;
         }
         cands.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
@@ -1811,42 +1812,55 @@ impl SearchIndex {
             self.groups[g].mark_range(r.start * self.fields..r.end * self.fields, out);
         }
         let rows = out.len();
+        // each dictionary column ORs in its own hits, its NULL rows left out
+        // (a NULL row carries some code, and a hit there is not a hit)
         for (c, t) in &values.0 {
             let Some(t) = t else { continue };
             let done = table.with_code_segments(g, *c, |codes, width, valid| {
                 if width == 1 {
-                    for (o, &code) in out.iter_mut().zip(&codes[..rows]) {
-                        *o |= t[code as usize];
-                    }
+                    or_value_hits(out, t, codes[..rows].iter().map(|&c| c as usize), valid);
                 } else {
-                    for (o, c) in out.iter_mut().zip(codes[..rows * 2].chunks_exact(2)) {
-                        *o |= t[u16::from_le_bytes([c[0], c[1]]) as usize];
-                    }
+                    let wide = codes[..rows * 2].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as usize);
+                    or_value_hits(out, t, wide, valid);
                 }
-                valid.map(|v| v.to_vec())
             })?;
-            let valid = match done {
-                Some(v) => v,
-                None => {
-                    let codes = table.codes(g, *c, rows)?;
-                    for (o, &code) in out.iter_mut().zip(&codes) {
-                        *o |= t[code as usize];
-                    }
-                    table.validity(g, *c)?
-                }
-            };
-            // NULL rows carry some code; a hit there is not a hit
-            if let Some(v) = valid {
-                let lists: Vec<Ids> = ids.iter().map(|r| r.start * self.fields..r.end * self.fields).collect();
-                let plain = self.groups[g].plain_hits(&lists, rows);
-                for (r, o) in out.iter_mut().enumerate() {
-                    if v[r / 8] >> (r % 8) & 1 == 0 && plain[r] == 0 {
-                        *o = 0;
-                    }
-                }
+            if done.is_none() {
+                let codes = table.codes(g, *c, rows)?;
+                let valid = table.validity(g, *c)?;
+                or_value_hits(out, t, codes.iter().map(|&c| c as usize), valid.as_deref());
             }
         }
         Ok(())
+    }
+}
+
+/// Rows a row group may have to be indexed: rows are 16-bit in the lists
+/// and bitmaps. facetful's writers make groups of 65,536; the format
+/// allows more, and such a table is refused rather than misread.
+pub const MAX_GROUP_ROWS: u32 = 1 << 16;
+
+const TOO_BIG: FormatError = FormatError::Corrupt("search index: row groups of more than 65,536 rows cannot be indexed");
+
+/// What a word index can cover: text columns of the table (at least one;
+/// anything else would be read as text offsets), in row groups of at most
+/// `MAX_GROUP_ROWS` (those known so far, for a table still arriving).
+pub fn check_table(cat: &crate::format::Catalog, cols: &[usize]) -> Result<(), FormatError> {
+    let text = |c: usize| cat.schema.columns.get(c).is_some_and(|d| d.ty == crate::format::ColumnType::Utf8);
+    if cols.is_empty() || !cols.iter().all(|&c| text(c)) {
+        return Err(FormatError::Corrupt("search index: every column must be a text column of the table"));
+    }
+    if cat.groups.iter().any(|g| g.row_count > MAX_GROUP_ROWS) {
+        return Err(TOO_BIG);
+    }
+    Ok(())
+}
+
+/// OR into `out` the rows whose code `t` admits, leaving out NULL rows
+/// (bit clear in `valid`).
+fn or_value_hits(out: &mut [u8], t: &[u8], codes: impl Iterator<Item = usize>, valid: Option<&[u8]>) {
+    match valid {
+        None => out.iter_mut().zip(codes).for_each(|(o, c)| *o |= t[c]),
+        Some(v) => out.iter_mut().zip(codes).enumerate().for_each(|(i, (o, c))| *o |= t[c] & (v[i / 8] >> (i % 8) & 1)),
     }
 }
 

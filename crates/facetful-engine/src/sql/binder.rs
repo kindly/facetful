@@ -540,7 +540,9 @@ impl<'a> Binder<'a> {
             }
         }
         // search_rank('q', col[, weight], …): a literal query, then text
-        // columns, each optionally followed by a whole-number weight
+        // columns, each optionally followed by a whole-number weight from 0
+        // to 999 (a word found in no column counts 1000, so it must rank
+        // below a word found in any)
         if func.name == "search_rank" {
             if !matches!(bound_args[0], Bound::Str(_)) {
                 return Err(Diagnostic::new("search_rank() query must be a text literal", args[0].span()));
@@ -549,10 +551,10 @@ impl<'a> Binder<'a> {
             for (i, b) in bound_args.iter().enumerate().skip(1) {
                 match b {
                     Bound::Column { ty: Ty::Text, .. } => after_column = true,
-                    Bound::Number(n, _) if after_column && *n >= 0.0 && n.fract() == 0.0 => after_column = false,
+                    Bound::Number(n, _) if after_column && (0.0..1000.0).contains(n) && n.fract() == 0.0 => after_column = false,
                     _ => {
                         return Err(Diagnostic::new(
-                            "search_rank() takes text columns, each optionally followed by a whole-number weight",
+                            "search_rank() takes text columns, each optionally followed by a whole-number weight from 0 to 999",
                             args[i].span(),
                         ))
                     }

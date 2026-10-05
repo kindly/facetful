@@ -222,7 +222,7 @@ export class Engine {
         new Uint8Array(this.mem(), p, chunk.byteLength).set(chunk);
         const rc = this.w.load_push(h, p, chunk.byteLength);
         this.w.dealloc(p, chunk.byteLength);
-        if (rc < 0) throw new Error("not a valid .facetful image, or a column to index is not in it");
+        if (rc < 0) throw new Error("not a valid .facetful image, or a column to index is not a text column in it");
         if (onChunk) await onChunk(chunk);
         // index a group when the source has kept us waiting (we are level
         // with the download, so indexing costs nothing); chunks that are
@@ -336,7 +336,7 @@ export class Engine {
     new Uint32Array(this.mem(), p, idx.length).set(idx);
     const rc = this.w.table_search_index_begin(tableHandle, p, idx.length);
     this.w.dealloc(p, idx.length * 4);
-    if (rc < 0) throw new Error("search index: could not read the table's dictionaries");
+    if (rc < 0) throw new Error("search index: every column must be a text column (or the table could not be read)");
   }
 
   /** Index up to `groups` more row groups; returns the row groups left (0:

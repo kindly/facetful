@@ -115,6 +115,27 @@ if (!(await ok({ cmd: "searchSuggest", table: "p", q: "countr", columns: ["count
 }
 const wrong = await send({ cmd: "attach", table: "s", url: part(2) });
 if (wrong.ok) throw new Error("attached a part to a table that is not its split");
+// two builds of one table's index at once: the later one wins, and the
+// earlier says it was superseded instead of claiming the later's index
+// (review, 5 October: both replied ok, with the index for the second)
+{
+  const first = send({ cmd: "buildSearchIndex", table: "t", columns: ["country"] });
+  const second = send({ cmd: "buildSearchIndex", table: "t", columns: ["owner"] });
+  const [r1, r2] = await Promise.all([first, second]);
+  if (r1.ok || !/superseded/.test(r1.error) || !r2.ok) throw new Error(`overlapping builds: ${JSON.stringify([r1, r2])}`);
+  const used = async (columns) => (await ok({ cmd: "searchSuggest", table: "t", q: "o", columns })).suggestions.indexed;
+  if (!(await used(["owner"])) || (await used(["country"]))) throw new Error("the index in use is not the later request's");
+  // a request the engine refuses takes nothing over: the build under way finishes
+  const building = send({ cmd: "buildSearchIndex", table: "t", columns: ["country", "owner"] });
+  const refused = await send({ cmd: "buildSearchIndex", table: "t", columns: ["capacity"] });
+  const built = await building;
+  if (refused.ok || !built.ok || !(await used(["country", "owner"]))) throw new Error(`a refused request stopped a build: ${JSON.stringify([refused, built])}`);
+}
+
+// a column that is not text cannot be indexed: an error reply, the worker fine
+const notText = await send({ cmd: "buildSearchIndex", table: "t", columns: ["capacity"] });
+if (notText.ok || !/text column/.test(notText.error)) throw new Error(`indexing a number column: ${JSON.stringify(notText)}`);
+if ((await ok({ cmd: "query", table: "t", sql: "select count(*) as n from t" })).result.columns[0].values[0] !== 200000) throw new Error("the worker after a refused index");
 const missing = await send({ cmd: "loadUrl", name: "x", url: new URL("data-200000.facetful", spike).href, searchColumns: ["nope"] });
 if (missing.ok) throw new Error("loadUrl indexed a column that is not there");
 

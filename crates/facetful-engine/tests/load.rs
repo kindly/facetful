@@ -94,3 +94,34 @@ fn split_parts_attach_into_one_table() {
     let (a5, _) = split(&src, &second, 44).unwrap();
     assert!(Table::open(a4).unwrap().attach(Table::open(a5).unwrap()).is_err());
 }
+
+/// Indexing a column that is not text is an error, never a panic, on every
+/// way in (review, 5 October: an integer column reached the text reader).
+#[cfg(feature = "search")]
+#[test]
+fn indexing_a_column_that_is_not_text_is_an_error() {
+    let bytes = fixture("data-200000.facetful");
+    let mut t = Table::open(bytes.clone()).unwrap();
+    let (cap, id, country) = (t.column_index("capacity").unwrap(), t.column_index("id").unwrap(), t.column_index("country").unwrap());
+    assert!(t.build_search_index(&[cap]).is_err(), "a float column");
+    assert!(t.begin_search_index(&[country, id]).is_err(), "an integer column among text ones");
+    assert!(t.build_search_index(&[99]).is_err(), "no such column");
+    assert!(t.build_search_index(&[]).is_err(), "no columns");
+    assert!(t.search_index().is_none());
+    assert_eq!(rows_of(&mut t, "select count(*) from t"), vec!["[Int(200000)]".to_string()], "the table still answers");
+    t.build_search_index(&[country]).unwrap();
+    // and a refused request leaves the index there is in place
+    assert!(t.build_search_index(&[cap]).is_err());
+    assert_eq!(t.search_index().expect("still indexed").cols, vec![country]);
+    // streamed in: the error comes as soon as the header names the columns
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    load.index_columns(&["country", "capacity"]).unwrap();
+    let mut failed = false;
+    for c in bytes.chunks(4096) {
+        if load.push(c).is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "a non-text column to index fails the load");
+}

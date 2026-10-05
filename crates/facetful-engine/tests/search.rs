@@ -754,9 +754,15 @@ fn rank_bind_errors() {
         "select search_rank('x', 3) from t",
         "select search_rank('x', title, 1, 2) from t",
         "select search_rank('x', title, -1) from t",
+        // weights stop at 999: a word found nowhere counts 1000 (review,
+        // 5 October: 65536 wrapped to 0 on the indexed path)
+        "select search_rank('x', title, 1000) from t",
+        "select search_rank('x', title, 65536) from t",
+        "select search_rank('x', title, 1.5) from t",
     ] {
         assert!(run_query(&mut t, sql).is_err(), "{sql} should not bind");
     }
+    run_query(&mut t, "select search_rank('x', title, 0, org, 999) from t").unwrap();
 }
 
 /// The table and its word index from an image read as it arrives, in chunks
@@ -1003,4 +1009,95 @@ fn saved_index_loads_back_only_where_it_belongs() {
     q.load_search_index(&saved_parts, &[0, 1, 2]).unwrap();
     same(&mut q, &mut built, "split, attached");
     assert!(table().load_search_index(&saved_parts, &[0, 1, 2]).is_err(), "the unsplit image");
+}
+
+/// A NULL in one dictionary column leaves the other columns' matches alone
+/// (review, 5 October: the index lost (other, health) behind (health, NULL)).
+#[test]
+fn a_null_in_one_column_keeps_another_columns_match() {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef { name: "a".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY | flags::CODES_U8 },
+            ColumnDef { name: "b".into(), ty: ColumnType::Utf8, flags: flags::DICTIONARY | flags::CODES_U8 },
+            ColumnDef { name: "c".into(), ty: ColumnType::Utf8, flags: 0 },
+        ],
+    };
+    let dict = |vals: &[&str]| {
+        let mut offsets = vec![0u32];
+        let mut bytes = Vec::new();
+        for v in vals {
+            bytes.extend_from_slice(v.as_bytes());
+            offsets.push(bytes.len() as u32);
+        }
+        DictData { offsets, bytes }
+    };
+    let mut w = Writer::new(schema, vec![], 64, &[Some(dict(&["health", "other"])), Some(dict(&["health", "x"])), None]);
+    // rows: (health, NULL, ""), (other, health, ""), (NULL, x, "health"), (other, x, ""), (NULL, NULL, NULL)
+    let (offs, bytes) = (vec![0u32, 0, 0, 6, 6, 6], b"health".to_vec());
+    w.write_group(5, &[
+        ColumnChunk { data: SegmentData::Codes8(&[0, 1, 0, 1, 0]), validity: Some(&[0b01011]), null_count: 2 },
+        ColumnChunk { data: SegmentData::Codes8(&[0, 0, 1, 1, 0]), validity: Some(&[0b01110]), null_count: 2 },
+        ColumnChunk { data: SegmentData::Utf8 { offsets: &offs, bytes: &bytes }, validity: Some(&[0b01111]), null_count: 1 },
+    ]);
+    let mut t = Table::open(w.finish()).unwrap();
+    t.masks().set_budget(0);
+    let sql = "select count(*) from t where search('health', a, b, c)";
+    assert_eq!(count(&mut t, sql), 3, "scanning");
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    assert_eq!(count(&mut t, sql), 3, "with the index");
+    t.build_search_index(&[0, 1]).unwrap();
+    assert_eq!(count(&mut t, "select count(*) from t where search('health', a, b)"), 2, "dictionary columns only");
+}
+
+/// A derived table (CTE, subquery) holding search() results is not reused
+/// once a word index changes what search() answers (review, 5 October: a
+/// cached `helth` subquery kept 0 rows after indexing found the corrections).
+#[test]
+fn derived_search_results_follow_the_index() {
+    let mut t = table();
+    let direct = format!("select count(*) from t where search('helth ', {COLS})");
+    let via_cte = format!("with s as (select title from t where search('helth ', {COLS})) select count(*) from s");
+    let via_in = format!("select count(*) from t where title in (select title from t where search('helth ', {COLS}))");
+    assert_eq!(count(&mut t, &direct), 0, "scanning: no corrections");
+    assert_eq!(count(&mut t, &via_cte), 0);
+    let in_before = count(&mut t, &via_in);
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    let found = count(&mut t, &direct);
+    assert!(found > 0, "the index corrects helth");
+    assert_eq!(count(&mut t, &via_cte), found, "the CTE follows the index");
+    assert!(count(&mut t, &via_in) > in_before, "the IN subquery follows the index");
+    t.drop_search_index();
+    assert_eq!(count(&mut t, &via_cte), 0, "and the scan again once it is dropped");
+}
+
+/// Row groups over 65,536 rows (valid in the format, but rows are 16-bit in
+/// the index) are refused cleanly: search() scans them as before (review,
+/// 5 October: a 70,000-row group panicked while finishing the index).
+#[test]
+fn row_groups_too_big_to_index_are_refused() {
+    use facetful_engine::load::TableLoad;
+    let schema = Schema { columns: vec![ColumnDef { name: "t".into(), ty: ColumnType::Utf8, flags: 0 }] };
+    let n = 70_000usize;
+    let mut w = Writer::new(schema, vec![], n as u32, &[None]);
+    let mut offs = vec![0u32];
+    let mut bytes = Vec::new();
+    for i in 0..n {
+        bytes.extend_from_slice(if i % 7 == 0 { b"mental health".as_slice() } else { b"youth sport".as_slice() });
+        offs.push(bytes.len() as u32);
+    }
+    w.write_group(n as u32, &[ColumnChunk { data: SegmentData::Utf8 { offsets: &offs, bytes: &bytes }, validity: None, null_count: 0 }]);
+    let img = w.finish();
+    let mut t = Table::open(img.clone()).unwrap();
+    let sql = "select count(*) from t where search('health', t)";
+    assert_eq!(count(&mut t, sql), n.div_ceil(7) as i64, "scanning");
+    assert!(t.build_search_index(&[0]).is_err());
+    assert!(t.search_index().is_none());
+    assert_eq!(count(&mut t, sql), n.div_ceil(7) as i64, "still scanning");
+    // streamed: the group is refused when it comes to be indexed
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    load.index_columns(&["t"]).unwrap();
+    for c in img.chunks(1 << 16) {
+        load.push(c).unwrap();
+    }
+    assert!(load.index_step(1).is_err());
 }

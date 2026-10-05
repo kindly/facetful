@@ -57,8 +57,43 @@ async function opfsWrite(path, bytes) {
   }
 }
 
-/** Search index builds finishing in the background, by table handle. */
-const searchBuilds = new Map();
+/** Search index builds, one controller per table: each request to build,
+ *  load or drop a table's index takes a new generation, and a build steps
+ *  only while its generation is the table's latest. A request a newer one
+ *  superseded replies with an error, never with the newer index's stats,
+ *  and never saves. `done` resolves when the table's latest build settles. */
+const builds = new Map(); // handle -> { gen, done }
+let buildGen = 0;
+const supersede = (handle) => {
+  const gen = ++buildGen;
+  builds.set(handle, { gen, done: null });
+  return gen;
+};
+const isLatest = (handle, gen) => builds.get(handle)?.gen === gen;
+const SUPERSEDED = "search index: superseded by a later request for this table";
+
+/** Index the build under way on `handle` to the end, a row group at a
+ *  time, yielding between groups so queries run meanwhile (search() scans
+ *  until the index is in use). Resolves false when a newer request took
+ *  over the table's index first. */
+function stepToEnd(handle, gen) {
+  const done = (async () => {
+    while (isLatest(handle, gen) && engine.stepSearchIndex(handle, 1) > 0) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    return isLatest(handle, gen);
+  })();
+  if (isLatest(handle, gen)) builds.get(handle).done = done;
+  return done;
+}
+
+/** Wait until the table's builds have settled (the latest one finished). */
+async function settled(handle) {
+  for (let b = builds.get(handle); b?.done; b = builds.get(handle)) {
+    await b.done;
+    if (builds.get(handle) === b) return;
+  }
+}
 
 /** A fetch body as an async iterable (not every browser iterates streams). */
 async function* bodyChunks(body) {
@@ -122,19 +157,15 @@ async function streamImage({ url, searchColumns, persist, expectedBytes }) {
   return { ...loaded, persisted: !!out };
 }
 
-/** Index the groups a download outran, in the background: a group at a
- *  time, yielding so queries run meanwhile (search() scans until done). */
+/** Index the groups a download outran, in the background. */
 function finishIndexLater(handle) {
-  searchBuilds.set(handle, (async () => {
-    while (engine.stepSearchIndex(handle, 1) > 0) await new Promise((r) => setTimeout(r, 0));
-    searchBuilds.delete(handle);
-  })());
+  stepToEnd(handle, supersede(handle));
 }
 
 /** Use the search index kept in OPFS at `path` when there is one and it
  *  fits (this build, this table, these columns, whole); true when in use.
  *  It is read straight into wasm memory. */
-async function loadSavedIndex(handle, columns, path) {
+async function loadSavedIndex(handle, columns, path, latest = () => true) {
   let h;
   try {
     closeHandlesFor(path);
@@ -145,7 +176,8 @@ async function loadSavedIndex(handle, columns, path) {
   }
   try {
     const n = h.getSize();
-    return n > 0 && engine.loadSearchIndex(handle, columns, n, (view) => h.read(view, { at: 0 }));
+    // a newer request may have come while the file opened: it wins
+    return n > 0 && latest() && engine.loadSearchIndex(handle, columns, n, (view) => h.read(view, { at: 0 }));
   } finally {
     h.close();
   }
@@ -153,10 +185,14 @@ async function loadSavedIndex(handle, columns, path) {
 
 /** Keep the table's search index in OPFS at `path`, written straight from
  *  wasm memory; returns the bytes written (0 without an index or OPFS). */
-async function saveIndex(handle, path) {
-  await searchBuilds.get(handle); // a build finishing in the background
+async function saveIndex(handle, path, latest = () => true) {
+  await settled(handle);
   const out = await opfsAppender(path);
   if (!out) return 0;
+  if (!latest()) {
+    await out.abort(); // superseded while the file opened: not this index
+    return 0;
+  }
   const n = engine.withSavedSearchIndex(handle, (view) => (out.write(view), view.byteLength));
   out.close();
   return n ?? 0;
@@ -287,7 +323,7 @@ self.onmessage = async (e) => {
     } else if (cmd === "searchReady") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
-      await searchBuilds.get(handle);
+      await settled(handle);
       reply({ ok: true });
     } else if (cmd === "loadParquet") {
       // transcode-only path: parquet buffer -> in-memory table
@@ -394,19 +430,25 @@ self.onmessage = async (e) => {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
       const t0 = performance.now();
-      // a kept index read back instead of building, when it fits
-      if (e.data.cache && (await loadSavedIndex(handle, e.data.columns, e.data.cache))) {
-        reply({ ok: true, ...engine.searchIndexStats(handle), cached: true, elapsedMs: performance.now() - t0 });
-        return;
+      let gen = 0;
+      const latest = () => isLatest(handle, gen);
+      // a kept index read back instead of building, when it fits (this
+      // request takes over the table's index before waiting on the file)
+      if (e.data.cache) {
+        gen = supersede(handle);
+        if (await loadSavedIndex(handle, e.data.columns, e.data.cache, latest)) {
+          reply({ ok: true, ...engine.searchIndexStats(handle), cached: true, elapsedMs: performance.now() - t0 });
+          return;
+        }
+        if (!latest()) throw new Error(SUPERSEDED);
       }
+      // a request the engine refuses (a column that is not text) changes
+      // nothing: it takes over only once its build has begun
       engine.beginSearchIndex(handle, e.data.columns);
-      // a row group at a time, yielding between groups so queued queries run
-      // meanwhile (scanning, until the index is finished)
-      while (engine.stepSearchIndex(handle, 1) > 0) {
-        await new Promise((r) => setTimeout(r, 0));
-      }
+      gen = supersede(handle);
+      if (!(await stepToEnd(handle, gen))) throw new Error(SUPERSEDED);
       const elapsedMs = performance.now() - t0;
-      const savedBytes = e.data.cache ? await saveIndex(handle, e.data.cache) : 0;
+      const savedBytes = e.data.cache ? await saveIndex(handle, e.data.cache, latest) : 0;
       reply({ ok: true, ...engine.searchIndexStats(handle), cached: false, savedBytes, elapsedMs });
     } else if (cmd === "saveSearchIndex") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
@@ -420,6 +462,7 @@ self.onmessage = async (e) => {
     } else if (cmd === "dropSearchIndex") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
+      supersede(handle); // a build under way stops, and says so
       engine.dropSearchIndex(handle);
       reply({ ok: true });
     } else if (cmd === "setMaskBudget") {

@@ -1165,7 +1165,9 @@ fn derive<S: ReadAt>(
             .join(" "),
         Err(_) => body_text.to_string(),
     };
-    let key = format!("{parent}\u{1}{text}");
+    // the search generation: a derived table holding search() results is
+    // not reused once a word index changes what search() answers
+    let key = format!("{}\u{2}{parent}\u{1}{text}", crate::search_generation());
     if table.derived_get(&key).is_some() {
         return Ok(key);
     }
