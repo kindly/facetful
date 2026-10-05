@@ -278,6 +278,7 @@ pub(super) fn where_mask<S: ReadAt>(
     conjuncts: &[Conjunct],
     dicts: &Dicts,
     cols: &mut Cols,
+    search: &SearchCtx,
 ) -> Result<Option<Vec<u8>>, FormatError> {
     if conjuncts.is_empty() {
         return Ok(None);
@@ -448,7 +449,7 @@ pub(super) fn where_mask<S: ReadAt>(
         full_cols.dedup();
         load_columns(table, g, dicts, cols, &full_cols, usize::MAX)?;
         for c in full {
-            let fctx = GroupCtx { cols: core::mem::take(cols), rows };
+            let fctx = GroupCtx { cols: core::mem::take(cols), rows, search: search.in_group(g, None) };
             let v = eval_vec(&c.expr, &fctx);
             *cols = fctx.cols;
             let m: Vec<u8> = (0..rows).map(|i| (v.bool3_at(i) == Some(true)) as u8).collect();

@@ -142,7 +142,7 @@ impl VV {
 /// One group's lanes restricted to `rows` (in that order): the context in
 /// which select expressions evaluate for the rows that survived the window,
 /// not for every row the scan kept. Only the chosen rows' bytes are copied.
-pub(super) fn gather_ctx(cols: &Cols, rows: &[u32]) -> GroupCtx {
+pub(super) fn gather_ctx(cols: &Cols, rows: &[u32], search: &SearchCtx) -> GroupCtx {
     let cols = cols
         .iter()
         .map(|(&k, (c, valid))| {
@@ -166,7 +166,7 @@ pub(super) fn gather_ctx(cols: &Cols, rows: &[u32]) -> GroupCtx {
             (k, (sub, gather_valid(valid, rows)))
         })
         .collect();
-    GroupCtx { cols, rows: rows.len() }
+    GroupCtx { cols, rows: rows.len(), search: search.clone() }
 }
 
 /// intersect validities (arithmetic null propagation)
@@ -205,6 +205,27 @@ pub(super) enum GroupCol {
 pub(super) struct GroupCtx {
     pub(super) cols: HashMap<usize, (GroupCol, Option<Rc<Vec<u8>>>)>,
     pub(super) rows: usize,
+    /// what search() and search_rank() see of the statement
+    #[cfg_attr(not(feature = "search"), allow(dead_code))]
+    pub(super) search: SearchCtx,
+}
+
+#[cfg(feature = "search")]
+pub(super) use super::search::SearchCtx;
+
+/// Without search(), nothing to carry.
+#[cfg(not(feature = "search"))]
+#[derive(Clone, Default)]
+pub(super) struct SearchCtx;
+
+#[cfg(not(feature = "search"))]
+impl SearchCtx {
+    pub(super) fn for_table<S: ReadAt>(_: &Table<S>) -> SearchCtx {
+        SearchCtx
+    }
+    pub(super) fn in_group(&self, _: usize, _: Option<&[u8]>) -> SearchCtx {
+        SearchCtx
+    }
 }
 
 impl GroupCtx {

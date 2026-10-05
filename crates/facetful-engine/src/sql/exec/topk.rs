@@ -152,7 +152,7 @@ impl TopK {
                 let cap = rows_g.iter().map(|&r| r as usize + 1).max().unwrap();
                 let mut cols: Cols = HashMap::default();
                 sh.load(table, g, &mut cols, &lane_cols, cap)?;
-                let ctx = gather_ctx(&cols, &rows_g);
+                let ctx = gather_ctx(&cols, &rows_g, &sh.search);
                 let sel_vvs: Vec<Option<VV>> = q
                     .select
                     .iter()

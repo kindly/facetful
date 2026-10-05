@@ -1101,3 +1101,68 @@ fn row_groups_too_big_to_index_are_refused() {
     }
     assert!(load.index_step(1).is_err());
 }
+
+/// Scanning and the index agree on text that is not ASCII, whichever ran
+/// first (review, 5 October: `kelp` missed `Kelp` written with the Kelvin
+/// sign when scanning, and the index then reused that word mask).
+#[test]
+fn unicode_text_matches_alike_scanning_or_indexed() {
+    let texts = ["\u{212A}elp forest", "kelp food", "\u{e9}kelp", "Kelp", "k\u{e9}lp"];
+    let queries = ["kelp", "kelp ", "kel", "\"kelp\""];
+    let n = |t: &mut Table<Vec<u8>>, q: &str| count(t, &format!("select count(*) from t where search('{q}', t)"));
+    // the oracle: each text's words, split and lowercased with Unicode rules
+    for q in queries {
+        let word = q.trim_matches(|c| c == '"' || c == ' ');
+        let prefix = !q.ends_with(' ') && !q.starts_with('"');
+        let want = texts
+            .iter()
+            .filter(|t| words_of(t).iter().any(|w| if prefix { w.starts_with(word.as_bytes()) } else { w == word.as_bytes() }))
+            .count() as i64
+            * 5;
+        let mut scanned = word_table(&texts);
+        assert_eq!(n(&mut scanned, q), want, "scanning '{q}'");
+        scanned.build_search_index(&[0]).unwrap(); // after the scan cached its masks
+        assert_eq!(n(&mut scanned, q), want, "indexed after scanning '{q}'");
+        let mut fresh = word_table(&texts);
+        fresh.build_search_index(&[0]).unwrap();
+        assert_eq!(n(&mut fresh, q), want, "indexed fresh '{q}'");
+    }
+}
+
+/// search() and search_rank() mean the same in a WHERE conjunct, under OR or
+/// NOT, and as a SELECT item, and rank alike projected or sorted on (review,
+/// 5 October: with an index, `helth` found 1 row as a conjunct and 0 under
+/// OR, as words outside a conjunct matched as typed).
+#[test]
+fn search_means_the_same_everywhere() {
+    let ranked = "title, 1, org, 3, descr, 5";
+    for indexed in [false, true] {
+        let mut t = table();
+        if indexed {
+            t.build_search_index(&[0, 1, 2]).unwrap();
+        }
+        for q in ["helth ", "mental health", "youth spor", "sports", "\"mental health\" fund", "climte chnage ", "funding "] {
+            let s = format!("search('{q}', {COLS})");
+            let n = count(&mut t, &format!("select count(*) from t where {s}"));
+            let how = format!("'{q}', indexed {indexed}");
+            assert_eq!(count(&mut t, &format!("select count(*) from t where {s} or title = 'absent'")), n, "under OR: {how}");
+            assert_eq!(count(&mut t, &format!("select count(*) from t where not {s}")), ROWS as i64 - n, "under NOT: {how}");
+            let mut r = run_query(&mut t, &format!("select {s} from t")).unwrap();
+            r.ensure_rows();
+            let selected = r.rows.iter().filter(|row| matches!(row[0], Val::Bool(true))).count() as i64;
+            assert_eq!(selected, n, "as a SELECT item: {how}");
+            // the rank: every row's key in a plain projection (the scan's
+            // rows), and the top 20 by it (keys read for the gathered rows)
+            let keys = |t: &mut Table<Vec<u8>>, sql: &str| {
+                let mut r = run_query(t, sql).unwrap_or_else(|d| panic!("{}", d.render(sql)));
+                r.ensure_rows();
+                r.rows.iter().map(|row| match row[0] { Val::Int(k) => k, ref v => panic!("{v:?}") }).collect::<Vec<i64>>()
+            };
+            let rank = format!("search_rank('{q}', {ranked})");
+            let mut all = keys(&mut t, &format!("select {rank} from t where {s}"));
+            all.sort();
+            all.truncate(20);
+            assert_eq!(keys(&mut t, &format!("select {rank} as r from t where {s} order by r limit 20")), all, "rank projected and sorted: {how}");
+        }
+    }
+}

@@ -302,7 +302,8 @@ impl Aggregate {
                 }
             }
         }
-        let gctx = GroupCtx { cols: gcols, rows: n_groups };
+        // one row per output group: nothing lines up with the index
+        let gctx = GroupCtx { cols: gcols, rows: n_groups, search: sh.search.clone() };
         let rewrite = |b: &Bound| substitute_grouped(b, &q.group_by, &self.calls, base, key_base);
 
         // ORDER BY over every group; numeric keys pack to u64 and sort as

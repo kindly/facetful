@@ -247,7 +247,7 @@ fn keep_words<S: ReadAt>(
         }
     }
     if !hit {
-        let bytes = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, cols)?.expect("conjuncts present");
+        let bytes = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, cols, &sh.search)?.expect("conjuncts present");
         words = vec![0u64; nw];
         for (i, &b) in bytes.iter().enumerate() {
             if b != 0 {

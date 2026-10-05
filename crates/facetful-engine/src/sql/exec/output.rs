@@ -249,6 +249,7 @@ pub(super) fn project<S: ReadAt>(
     groups: &[usize],
     ctxs: Option<&[Cols]>,
 ) -> Result<Vec<OutCol>, FormatError> {
+    let search = SearchCtx::for_table(table);
     let deferred: Vec<usize> = srcs
         .iter()
         .enumerate()
@@ -269,7 +270,7 @@ pub(super) fn project<S: ReadAt>(
         for (g, rows) in rows_of.iter().enumerate() {
             if !rows.is_empty() {
                 sub_of[g] = subs.len() as u32;
-                subs.push(gather_ctx(&ctxs[g], rows));
+                subs.push(gather_ctx(&ctxs[g], rows, &search));
             }
         }
         let mut next: Vec<u32> = vec![0; ctxs.len()];

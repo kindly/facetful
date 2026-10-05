@@ -302,6 +302,8 @@ fn load_columns<S: ReadAt>(
 /// how they type, the dictionaries, and the WHERE as cacheable conjuncts.
 struct Shared<'q> {
     q: &'q BoundQuery,
+    /// what search() and search_rank() see of the statement (the word index)
+    search: vector::SearchCtx,
     columns: Vec<String>,
     dicts: Dicts,
     constraints: Vec<Range>,
@@ -379,6 +381,7 @@ impl<'q> Shared<'q> {
         }
         Ok(Shared {
             q,
+            search: vector::SearchCtx::for_table(table),
             columns: q.select.iter().map(|s| s.name.clone()).collect(),
             dicts,
             constraints: q.filter.as_ref().map(collect_ranges).unwrap_or_default(),
@@ -515,7 +518,7 @@ pub fn filter_rows<S: ReadAt>(table: &mut Table<S>, q: &BoundQuery) -> Result<Ve
             continue;
         }
         let mut cols: Cols = HashMap::default();
-        let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols)?;
+        let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols, &sh.search)?;
         // an empty mask means "nothing kept" (see where_mask)
         out.push(keep.map(|k| if k.is_empty() { vec![0u8; rows] } else { k }));
     }
@@ -545,8 +548,6 @@ pub fn execute<S: ReadAt>(
     let folded = fold_query(q, table.catalog());
     let mut sh = Shared::new(table, folded.as_ref())?;
     let mut strategy = Strategy::plan(table, &sh)?;
-    #[cfg(feature = "search")]
-    let _rank_scope = search::RankScope::new();
 
     for g in 0..table.group_count() {
         if group_prunable(table, g, &sh.constraints) {
@@ -555,27 +556,17 @@ pub fn execute<S: ReadAt>(
         sh.scanned_groups += 1;
         let rows = table.group_rows(g);
         let mut cols: Cols = HashMap::default();
-        let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols)?;
+        let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols, &sh.search)?;
         // fully filtered out: nothing else to load or evaluate for this group
         if keep.as_ref().is_some_and(|k| k.iter().all(|&b| b == 0)) {
             continue;
         }
         let (which, cap, eval_rows) = strategy.load_plan(&sh, keep.as_deref(), rows);
         sh.load(table, g, &mut cols, which, cap)?;
-        let ctx = GroupCtx { cols, rows: eval_rows };
-        // search_rank reads the word index row by row, so only where an
-        // ORDER BY is evaluated over this group's own rows: the two sorts
-        #[cfg(feature = "search")]
-        let sorting = matches!(strategy, Strategy::TopK(_) | Strategy::FullSort(_));
-        #[cfg(feature = "search")]
-        if sorting {
-            search::set_rank_group(table.search_index(), g, rows, keep.as_deref());
-        }
+        // the context's rows are this group's from its first: search()
+        // and search_rank() read the index's row lists for them
+        let ctx = GroupCtx { cols, rows: eval_rows, search: sh.search.in_group(g, keep.as_deref()) };
         let flow = strategy.scan_group(&sh, g, &ctx, keep.as_deref());
-        #[cfg(feature = "search")]
-        if sorting {
-            search::set_rank_group(None, 0, 0, None);
-        }
         if let Flow::Stop = flow {
             break;
         }
