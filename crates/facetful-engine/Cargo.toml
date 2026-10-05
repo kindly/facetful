@@ -9,7 +9,18 @@ description = "facetful vectorized executor (parser + planner later); pure, no I
 facetful-format = { path = "../facetful-format" }
 
 [features]
-default = ["search"]
+default = ["search", "write"]
+# Writing images: derived tables (joins, CTEs, subqueries) and materialize.
+# Off for the lite build, which runs single-table queries over images.
+write = []
 # search('q', col, …): word search over text columns (docs/full-text-search.sv).
 # Off for the lite build: cargo build -p facetful-wasm --no-default-features
 search = []
+
+[[example]]
+name = "index_build"
+required-features = ["search"]
+
+[[example]]
+name = "rank_time"
+required-features = ["search"]

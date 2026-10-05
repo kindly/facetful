@@ -215,6 +215,7 @@ enum Target {
     Catalog(String),
 }
 
+#[cfg(feature = "write")]
 /// A target's identity for cache keys.
 fn target_key<S: ReadAt>(t: &Target, cat: &mut dyn Catalog<S>) -> String {
     match t {
@@ -303,6 +304,7 @@ fn resolve_name<S: ReadAt>(name: &str, scope: &Scope, cat: &mut dyn Catalog<S>) 
     Target::Base
 }
 
+#[cfg(feature = "write")]
 fn schema_names<S: ReadAt>(
     table: &mut Table<S>,
     t: &Target,
@@ -316,6 +318,7 @@ fn schema_names<S: ReadAt>(
     }
 }
 
+#[cfg(feature = "write")]
 /// Apply the joins left to right, each a cached materialization onto the
 /// running table, carrying only the right-side columns the query touches;
 /// then rewrite the query onto the joined table: qualified names resolve
@@ -416,7 +419,7 @@ fn resolve_joins<S: ReadAt>(
                 }
             }
         }
-        carried.sort();
+        crate::sort_small(&mut carried);
         // left columns the query touches, plus this join's left keys; `*` = all
         let left_carried: Option<Vec<String>> = if star {
             None
@@ -429,7 +432,7 @@ fn resolve_joins<S: ReadAt>(
                     }
                 }
             }
-            v.sort();
+            crate::sort_small(&mut v);
             Some(v)
         };
         let renames: Vec<(String, String)> = carried
@@ -520,6 +523,7 @@ fn resolve_joins<S: ReadAt>(
     Ok((left, rq))
 }
 
+#[cfg(feature = "write")]
 /// A cached join under `prefix` whose left and right column sets contain
 /// `left_need` (None = all) and `right_need`: its key, its left column set,
 /// and the renames of the right columns we need as that table stores them
@@ -569,6 +573,7 @@ fn superset_join<S: ReadAt>(
     best.map(|(k, lc, rn, _)| (k, lc, rn))
 }
 
+#[cfg(feature = "write")]
 /// Run the join with both sides borrowed at once: a derived side is taken
 /// out of the cache for the duration.
 fn join_targets<S: ReadAt>(
@@ -651,6 +656,13 @@ fn expand_in_subqueries<S: ReadAt>(
     if !has_in(filter) {
         return Ok(None);
     }
+    #[cfg(not(feature = "write"))]
+    {
+        let _ = (table, src, scope, cat);
+        return Err(not_in_lite(q.span));
+    }
+    #[cfg(feature = "write")]
+    {
     let mut rq = q.clone();
     let mut n = 0usize;
     let mut filter = rq.filter.take().expect("checked above");
@@ -658,8 +670,42 @@ fn expand_in_subqueries<S: ReadAt>(
     expand_in_expr(table, &mut filter, src, scope, cat, &mut rq.joins, &mut n, false, &outer)?;
     rq.filter = Some(filter);
     Ok(Some(rq))
+    }
 }
 
+/// Without the `write` feature (the lite build) a query reads one table:
+/// joins, CTEs and subqueries all go through derived tables, which are
+/// images written on the fly.
+#[cfg(not(feature = "write"))]
+fn not_in_lite(span: span::Span) -> Diagnostic {
+    Diagnostic::new("joins, CTEs and subqueries are not in this build (lite): use the full build".to_string(), span)
+}
+
+#[cfg(not(feature = "write"))]
+fn derive<S: ReadAt>(
+    _table: &mut Table<S>,
+    _q: &ast::Query,
+    body: span::Span,
+    _src: &str,
+    _scope: &Scope,
+    _cat: &mut dyn Catalog<S>,
+) -> Result<String, Diagnostic> {
+    Err(not_in_lite(body))
+}
+
+#[cfg(not(feature = "write"))]
+fn resolve_joins<S: ReadAt>(
+    _table: &mut Table<S>,
+    q: &ast::Query,
+    _src: &str,
+    _scope: &Scope,
+    _cat: &mut dyn Catalog<S>,
+    _from: Target,
+) -> Result<(Target, ast::Query), Diagnostic> {
+    Err(not_in_lite(q.span))
+}
+
+#[cfg(feature = "write")]
 /// Split an EXISTS subquery into its correlation keys and the rest of its
 /// WHERE: top-level AND conjuncts of the form `inner.k = outer.k` (either
 /// order) become (outer column, inner column) pairs; other conjuncts stay;
@@ -745,6 +791,7 @@ fn correlate(
     Ok((pairs, rest))
 }
 
+#[cfg(feature = "write")]
 fn expand_in_expr<S: ReadAt>(
     table: &mut Table<S>,
     e: &mut ast::Expr,
@@ -908,6 +955,7 @@ fn expand_in_expr<S: ReadAt>(
     }
 }
 
+#[cfg(feature = "write")]
 /// The members of a derived table's only column, as a value set; None for a
 /// column kind a set does not hold (bool), which keeps the join path.
 fn key_set_of<S: ReadAt>(table: &mut Table<S>, key: &str, span: span::Span) -> Result<Option<keyset::KeySet>, Diagnostic> {
@@ -1002,6 +1050,7 @@ fn split_qualified(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+#[cfg(feature = "write")]
 /// A column reference's name and span, or an error for anything else.
 fn column_name(e: &ast::Expr) -> Result<(String, span::Span), Diagnostic> {
     match e {
@@ -1010,6 +1059,7 @@ fn column_name(e: &ast::Expr) -> Result<(String, span::Span), Diagnostic> {
     }
 }
 
+#[cfg(feature = "write")]
 /// Resolve a plain or qualified name against the running joined table.
 fn lookup(aliases: &[(String, Vec<(String, String)>)], cur_names: &[String], name: &str) -> Option<String> {
     let (alias, col) = split_qualified(name);
@@ -1047,6 +1097,7 @@ fn collect_names(e: &ast::Expr, out: &mut Vec<String>) {
     }
 }
 
+#[cfg(feature = "write")]
 fn rewrite_names(
     e: &mut ast::Expr,
     aliases: &[(String, Vec<(String, String)>)],
@@ -1078,6 +1129,7 @@ fn rewrite_names(
     }
 }
 
+#[cfg(feature = "write")]
 /// Materialize `q` (a CTE body or FROM subquery) into the derived cache
 /// unless an identical one is already there; returns its cache key. The key
 /// is the body's token stream plus the key of the table it reads from, so

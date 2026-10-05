@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Size-budget gate: the wasm engine must stay within BUDGET_GZ bytes gzipped,
-# and the lite build (no default features: no search()) within LITE_BUDGET_GZ.
+# and the lite build (no default features: no search(), and nothing that writes
+# an image: no joins, CTEs, subqueries, materialize, Parquet compiling or CSV
+# conversion) within LITE_BUDGET_GZ.
 # Runs wasm-opt -O3 when available (CI installs it; locally it degrades gracefully).
 # The full build runs last, so it is the artifact left for build-package.sh.
 set -euo pipefail

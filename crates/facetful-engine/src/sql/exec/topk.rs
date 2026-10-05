@@ -96,7 +96,7 @@ impl TopK {
         let mut direct_text: Vec<Option<usize>> =
             q.select.iter().map(|s| is_direct_text(&s.expr)).collect();
         // gathered[sel_idx][winner_idx]
-        let mut gathered: HashMap<usize, Vec<Val>> = HashMap::new();
+        let mut gathered: HashMap<usize, Vec<Val>> = HashMap::default();
         for (si, ci) in direct_text.clone().into_iter().enumerate() {
             let Some(ci) = ci else { continue };
             let mut vals = vec![Val::Null; winners.len()];
@@ -137,20 +137,20 @@ impl TopK {
                 collect_columns(&s.expr, &mut lane_cols);
             }
         }
-        lane_cols.sort_unstable();
+        crate::sort_small(&mut lane_cols);
         lane_cols.dedup();
 
         // per group: lanes as deep as its deepest winner, then gathered at the
         // winners' rows so expressions evaluate over those rows only (a page
         // of 50 spread over 40 groups is 50 evaluations, not 40 groups' worth)
-        let mut sel_cache: HashMap<u32, (HashMap<u32, u32>, Vec<Option<VV>>)> = HashMap::new();
+        let mut sel_cache: HashMap<u32, (HashMap<u32, u32>, Vec<Option<VV>>)> = HashMap::default();
         let mut rows: Vec<Vec<Val>> = Vec::with_capacity(winners.len());
         for (wi, &(cg, crow)) in winners.iter().enumerate() {
             if !sel_cache.contains_key(&cg) {
                 let g = cg as usize;
                 let rows_g: Vec<u32> = winners.iter().filter(|w| w.0 == cg).map(|w| w.1).collect();
                 let cap = rows_g.iter().map(|&r| r as usize + 1).max().unwrap();
-                let mut cols: Cols = HashMap::new();
+                let mut cols: Cols = HashMap::default();
                 sh.load(table, g, &mut cols, &lane_cols, cap)?;
                 let ctx = gather_ctx(&cols, &rows_g);
                 let sel_vvs: Vec<Option<VV>> = q

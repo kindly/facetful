@@ -27,8 +27,7 @@
 //! search) would cover search without SQL `IN` at all.
 
 use super::binder::Ty;
-use std::collections::HashSet;
-use std::hash::{BuildHasher, Hasher};
+use crate::format::fxhash::HashSet;
 
 /// Members as a bitmap when every one is an integer and the range is at most
 /// this many bits, or 64 per member (a dense id domain: 505K activity ids
@@ -40,12 +39,12 @@ pub struct KeySet {
     ty: Ty,
     has_null: bool,
     /// numeric members as f64 bits (bools as 0 / 1)
-    nums: HashSet<u64, Mix>,
+    nums: HashSet<u64>,
     /// the numeric members as bits over `lo..`, when they are all integers
     /// in a compact range
     dense: Option<(i64, Vec<u64>)>,
     range: Option<(f64, f64)>,
-    texts: HashSet<Box<[u8]>, Mix>,
+    texts: HashSet<Box<[u8]>>,
     len: usize,
     digest: (u64, u64),
 }
@@ -191,40 +190,6 @@ impl Digest {
         h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
         h ^= h >> 33;
         h
-    }
-}
-
-/// Multiply-fold hashing for the member lookups: SipHash's quality buys
-/// nothing here and costs more than the probe.
-#[derive(Default, Clone, Copy)]
-struct Mix;
-
-#[derive(Default)]
-struct MixHasher(u64);
-
-impl Hasher for MixHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for c in bytes.chunks(8) {
-            let mut w = [0u8; 8];
-            w[..c.len()].copy_from_slice(c);
-            self.write_u64(u64::from_le_bytes(w));
-        }
-    }
-    #[inline]
-    fn write_u64(&mut self, w: u64) {
-        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517C_C1B7_2722_0A95);
-    }
-    #[inline]
-    fn finish(&self) -> u64 {
-        let h = self.0 ^ (self.0 >> 32);
-        h.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ (h >> 29)
-    }
-}
-
-impl BuildHasher for Mix {
-    type Hasher = MixHasher;
-    fn build_hasher(&self) -> MixHasher {
-        MixHasher::default()
     }
 }
 

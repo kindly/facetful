@@ -16,7 +16,7 @@
 use crate::compile::{narrowest_int, utf8_offsets, validity_bitmap};
 use crate::write::{ColumnChunk, DictData, SegmentData, Writer};
 use crate::{flags, ColumnDef, ColumnType, Schema};
-use std::collections::HashMap;
+use crate::fxhash::HashMap;
 
 /// Dictionary cardinality cap: u16 codes, one value reserved (see compile).
 const DICT_CAP: usize = u16::MAX as usize;
@@ -138,7 +138,7 @@ impl ColState {
             rows: 0,
             min: i64::MAX,
             max: i64::MIN,
-            distinct: Some((HashMap::new(), Vec::new())),
+            distinct: Some((HashMap::default(), Vec::new())),
         }
     }
     fn see(&mut self, v: &str) {

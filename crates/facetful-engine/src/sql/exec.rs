@@ -13,7 +13,7 @@ use crate::format::read::ReadAt;
 use crate::format::{ColumnType, FormatError};
 use crate::mask_cache::LikeKey;
 use crate::Table;
-use std::collections::HashMap;
+use crate::format::fxhash::HashMap;
 use std::rc::Rc;
 
 
@@ -71,7 +71,9 @@ pub fn execute_batch<S: ReadAt>(
     Ok(out)
 }
 pub(crate) use output::sort_keyed2;
-pub(crate) use grouping::{hash_bytes, int_range, GroupMap, TextGroups, DENSE_LANES};
+pub(crate) use grouping::{hash_bytes, TextGroups};
+#[cfg(feature = "write")]
+pub(crate) use grouping::{int_range, GroupMap, DENSE_LANES};
 pub(crate) use distinct::mix64;
 
 fn collect_aggs(b: &Bound, out: &mut Vec<Bound>) {
@@ -112,7 +114,7 @@ fn collect_ranked(b: &Bound, index_cols: &[usize], ranked: &mut Vec<usize>, othe
         if func.name == "search_rank" {
             let mut cols = Vec::new();
             args.iter().for_each(|a| collect_columns(a, &mut cols));
-            cols.sort_unstable();
+            crate::sort_small(&mut cols);
             cols.dedup();
             if cols == index_cols {
                 ranked.extend(cols);
@@ -323,7 +325,7 @@ impl<'q> Shared<'q> {
         let cols_of = |exprs: &[&Bound]| -> Vec<usize> {
             let mut v = Vec::new();
             exprs.iter().for_each(|e| collect_columns(e, &mut v));
-            v.sort_unstable();
+            crate::sort_small(&mut v);
             v.dedup();
             v
         };
@@ -369,7 +371,7 @@ impl<'q> Shared<'q> {
         if let Some(f) = &q.filter {
             collect_columns(f, &mut needed);
         }
-        let mut dicts: Dicts = HashMap::new();
+        let mut dicts: Dicts = HashMap::default();
         for &c in &needed {
             if table.catalog().schema.columns[c].is_dict() && !dicts.contains_key(&c) {
                 dicts.insert(c, table.dictionary_rc(c)?);
@@ -512,7 +514,7 @@ pub fn filter_rows<S: ReadAt>(table: &mut Table<S>, q: &BoundQuery) -> Result<Ve
             out.push(Some(vec![0u8; rows]));
             continue;
         }
-        let mut cols: Cols = HashMap::new();
+        let mut cols: Cols = HashMap::default();
         let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols)?;
         // an empty mask means "nothing kept" (see where_mask)
         out.push(keep.map(|k| if k.is_empty() { vec![0u8; rows] } else { k }));
@@ -552,7 +554,7 @@ pub fn execute<S: ReadAt>(
         }
         sh.scanned_groups += 1;
         let rows = table.group_rows(g);
-        let mut cols: Cols = HashMap::new();
+        let mut cols: Cols = HashMap::default();
         let keep = where_mask(table, g, rows, &sh.conjuncts, &sh.dicts, &mut cols)?;
         // fully filtered out: nothing else to load or evaluate for this group
         if keep.as_ref().is_some_and(|k| k.iter().all(|&b| b == 0)) {

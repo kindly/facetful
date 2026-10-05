@@ -1,6 +1,7 @@
 //! JOIN syntax: cached materialization onto the derived cache, qualified
 //! names, clash renames, USING, INNER, chained joins, joins to CTEs, and
 //! the errors — against the same fixtures as the one-shot join.
+#![cfg(feature = "write")]
 
 use facetful_engine::format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_engine::format::{flags, ColumnDef, ColumnType, Schema};

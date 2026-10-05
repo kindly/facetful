@@ -175,7 +175,7 @@ pub(super) fn conjuncts_of<S: ReadAt>(table: &Table<S>, filter: Option<&Bound>) 
         .map(|expr| {
             let mut cols = Vec::new();
             collect_columns(&expr, &mut cols);
-            cols.sort_unstable();
+            crate::sort_small(&mut cols);
             cols.dedup();
             // contains-LIKE over a plain text column: narrowable through a
             // cached superset (dict columns are already ~free per row)
@@ -444,7 +444,7 @@ pub(super) fn where_mask<S: ReadAt>(
     }
     if !full.is_empty() {
         let mut full_cols: Vec<usize> = full.iter().flat_map(|c| c.cols.iter().copied()).collect();
-        full_cols.sort_unstable();
+        crate::sort_small(&mut full_cols);
         full_cols.dedup();
         load_columns(table, g, dicts, cols, &full_cols, usize::MAX)?;
         for c in full {

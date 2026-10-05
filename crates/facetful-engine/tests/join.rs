@@ -1,6 +1,7 @@
 //! The one-shot hash join: dictionary keys with different code orders, dense
 //! int keys, plain-text keys, composite keys, LEFT vs INNER, NULL keys,
 //! and the errors — checked against hand-derived expectations.
+#![cfg(feature = "write")]
 
 use facetful_engine::format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_engine::format::{flags, ColumnDef, ColumnType, Schema};

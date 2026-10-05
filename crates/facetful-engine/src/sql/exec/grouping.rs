@@ -48,9 +48,11 @@ impl GroupMap {
     pub(super) fn new() -> GroupMap {
         GroupMap { slots: Vec::new(), mask: 0, shift: 0, used: 0 }
     }
+    #[cfg(feature = "write")]
     pub(crate) fn new_map() -> GroupMap {
         GroupMap::new()
     }
+    #[cfg(feature = "write")]
     /// The gid of `key`, if present.
     pub(crate) fn get(&self, key: u64) -> Option<u32> {
         if self.slots.is_empty() {
@@ -163,6 +165,7 @@ impl TextGroups {
     pub(super) fn n_text(&self) -> usize {
         self.dims.iter().filter(|d| matches!(d, TextDim::Text(_))).count()
     }
+    #[cfg(feature = "write")]
     /// A plan with no dense dims and `n_text` text dims, for callers that
     /// hash arbitrary byte tuples (the join's text keys).
     pub(crate) fn text_only(n_text: usize) -> TextGroups {
@@ -180,6 +183,7 @@ impl TextGroups {
             arena: Vec::new(),
         }
     }
+    #[cfg(feature = "write")]
     /// The gid of the key `(composite, texts)` whose hash is `hash`, if present.
     pub(crate) fn get(&self, hash: u64, composite: u64, texts: &[Option<&[u8]>]) -> Option<u32> {
         if self.slots.is_empty() {

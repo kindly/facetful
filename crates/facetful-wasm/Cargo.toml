@@ -12,5 +12,8 @@ crate-type = ["cdylib", "rlib"]
 facetful-engine = { path = "../facetful-engine", default-features = false }
 
 [features]
-default = ["search"]
+default = ["search", "write"]
 search = ["facetful-engine/search"]
+# joins, CTEs and subqueries, materialize, compileTable (Parquet) and CSV
+# conversion: everything that writes an image. Off in the lite build.
+write = ["facetful-engine/write"]

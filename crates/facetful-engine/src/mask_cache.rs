@@ -23,7 +23,7 @@
 //! column, the executor verifies only the rows set in the cached mask instead
 //! of scanning the blob — search-as-you-type costs a fraction per keystroke.
 
-use std::collections::HashMap;
+use crate::format::fxhash::HashMap;
 use std::rc::Rc;
 
 /// Default byte budget: ~25 whole-table masks at 5M rows, hundreds at 200K.
@@ -66,7 +66,7 @@ impl Default for MaskCache {
 impl MaskCache {
     pub fn new(budget: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::default(),
             bytes: 0,
             budget,
             tick: 0,

@@ -56,7 +56,7 @@ impl Aggregate {
         } else if let Some(tg) = text_plan(table, &q.group_by) {
             Grouping::Text(tg)
         } else {
-            Grouping::Expr { map: HashMap::new(), keys: Vec::new() }
+            Grouping::Expr { map: HashMap::default(), keys: Vec::new() }
         };
         Ok(Aggregate { calls, accs, grouping, n_groups: 0, count_only })
     }
@@ -245,7 +245,7 @@ impl Aggregate {
         }
         let n_groups = self.n_groups;
         let base = table.catalog().schema.columns.len();
-        let mut gcols: Cols = HashMap::new();
+        let mut gcols: Cols = HashMap::default();
         for (i, (acc, call)) in self.accs.iter().zip(&self.calls).enumerate() {
             let vv = acc.finish_lane(n_groups, call.ty());
             gcols.insert(base + i, (GroupCol::Ready(vv), None));

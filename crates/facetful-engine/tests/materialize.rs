@@ -1,5 +1,6 @@
 //! materialize: a query's result becomes a table that answers the same
 //! questions, with types, nulls and sort metadata intact.
+#![cfg(feature = "write")]
 
 use facetful_engine::format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_engine::format::{flags, ColumnDef, ColumnType, Schema};

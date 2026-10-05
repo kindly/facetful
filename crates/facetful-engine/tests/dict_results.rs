@@ -4,6 +4,7 @@
 
 use facetful_engine::format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_engine::format::{flags, ColumnDef, ColumnType, Schema};
+#[cfg(feature = "write")]
 use facetful_engine::materialize::materialize;
 use facetful_engine::sql::exec::{compact_dict, OutCol, Val};
 use facetful_engine::sql::run_query;
@@ -109,6 +110,7 @@ fn compact_drops_unused_entries_and_ignores_null_codes() {
     assert_eq!(codes, [1, 0, 1, 0, 0], "NULL rows read as code 0");
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn materialize_feeds_codes_to_the_compiler() {
     let mut t = table();

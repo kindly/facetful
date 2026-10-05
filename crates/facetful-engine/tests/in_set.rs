@@ -95,6 +95,7 @@ fn q(t: &mut Table<Vec<u8>>, cat: &mut TableSet<Vec<u8>>, sql: &str) -> Vec<Vec<
     rows(run_query_with(t, sql, cat).unwrap_or_else(|d| panic!("{}", d.render(sql))))
 }
 
+#[cfg(all(feature = "write", feature = "search"))]
 #[test]
 fn a_search_conjunct_fuses_and_its_mask_is_shared() {
     let mut t = facts();
@@ -119,6 +120,7 @@ fn a_search_conjunct_fuses_and_its_mask_is_shared() {
     assert_eq!(t.masks().misses, misses, "no conjunct recomputed");
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn the_mask_is_keyed_by_the_members() {
     let mut t = facts();
@@ -134,6 +136,7 @@ fn the_mask_is_keyed_by_the_members() {
     assert!(t.masks().misses > misses);
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn text_keys_and_exists_on_one_key() {
     let mut t = facts();

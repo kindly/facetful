@@ -511,6 +511,7 @@ fn text_key_grouping_matches_reference() {
 /// WITH and FROM (subquery) materialize into the table's derived cache: the
 /// results equal the unfolded query, chained CTEs see earlier ones, an
 /// identical body is a cache hit, and a CTE may shadow the table's name.
+#[cfg(feature = "write")]
 #[test]
 fn ctes_and_subqueries_materialize_and_cache() {
     let mut t = table();

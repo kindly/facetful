@@ -1,6 +1,7 @@
 //! IN (select …), row values, NOT IN with NULLs, EXISTS / NOT EXISTS,
 //! literal tuple lists — exact SQL three-valued semantics, over the join
 //! fixtures; and superset reuse of the cached semi-join tables.
+#![cfg(feature = "write")]
 
 use facetful_engine::format::write::{ColumnChunk, DictData, SegmentData, Writer};
 use facetful_engine::format::{flags, ColumnDef, ColumnType, Schema};

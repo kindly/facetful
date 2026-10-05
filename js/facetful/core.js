@@ -432,6 +432,7 @@ export class Engine {
    * to imageBytes() (copy out, e.g. for OPFS) and/or openImage() (consumes).
    */
   compileTable(rows, columns, { groupTarget = 65536 } = {}) {
+    this._needsWrite("compiling a table (Parquet)");
     const put = (src) => {
       const p = u32(this.w.alloc(src.byteLength));
       new Uint8Array(this.mem(), p, src.byteLength).set(
@@ -471,6 +472,7 @@ export class Engine {
    * throws QueryError with the engine's diagnostic.
    */
   materialize(tableHandle, sql, { groupTarget = 65536 } = {}) {
+    this._needsWrite("materialize");
     const sqlBytes = this.enc.encode(sql);
     const sqlPtr = u32(this.w.alloc(sqlBytes.byteLength));
     new Uint8Array(this.mem(), sqlPtr, sqlBytes.byteLength).set(sqlBytes);
@@ -496,6 +498,7 @@ export class Engine {
 
   /** Open a table over a compiled image; consumes the image handle (no copy). */
   openImage(img) {
+    this._needsWrite("opening a compiled image");
     const handle = this.w.image_open_table(img);
     if (!handle) throw new Error("compiled image failed to open");
     return { handle, rows: this.w.table_total_rows(handle) };
@@ -509,6 +512,7 @@ export class Engine {
    * { bytes, rows, schema: [{ name, kind }] }.
    */
   async convertCsv(chunks, { groupTarget = 65536 } = {}) {
+    this._needsWrite("CSV conversion");
     const h = this.w.convert_begin(groupTarget);
     const fail = () => {
       const n = this.w.convert_error(h, this.scratch, 4096);
@@ -555,6 +559,12 @@ export class Engine {
     // the header went out first: its image-length field is filled in now
     new DataView(bytes.buffer).setBigUint64(lenAt, BigInt(total), true);
     return { bytes, rows, schema };
+  }
+
+  /** The lite build writes no images: no compiling (Parquet), CSV
+   *  conversion, materialize, joins, CTEs or subqueries. */
+  _needsWrite(what) {
+    if (!this.w.compile_begin) throw new Error(`${what} needs the full facetful build (this one is lite)`);
   }
 
   /** Make `handle` reachable by `name` from other tables' queries (FROM / JOIN). */

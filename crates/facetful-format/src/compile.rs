@@ -10,7 +10,7 @@
 
 use crate::write::{ColumnChunk, DictData, SegmentData, Writer};
 use crate::{flags, ColumnDef, ColumnType, Schema, SortKey};
-use std::collections::HashMap;
+use crate::fxhash::HashMap;
 
 /// One input column. `valid` is per-row (true = present); None = no nulls.
 pub enum InCol {
@@ -96,7 +96,7 @@ fn plan(col: InCol) -> Planned {
         InCol::Date { v, valid } => Planned::Date { v, valid },
         InCol::Timestamp { v, valid } => Planned::Timestamp { v, valid },
         InCol::Text { v, valid } => {
-            let mut index: HashMap<String, u16> = HashMap::new();
+            let mut index: HashMap<String, u16> = HashMap::default();
             let mut dict: Vec<String> = Vec::new();
             let mut codes: Vec<u16> = Vec::with_capacity(v.len());
             for s in &v {

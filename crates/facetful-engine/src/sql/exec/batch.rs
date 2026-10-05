@@ -274,7 +274,7 @@ pub(super) fn execute_family<S: ReadAt>(
     for g in 0..table.group_count() {
         let rows = table.group_rows(g);
         // lanes and masks shared by every statement of the family for this group
-        let mut cols: Cols = HashMap::new();
+        let mut cols: Cols = HashMap::default();
         let ones = vec![0xFFu8; rows.div_ceil(8)];
         for (i, sh) in shs.iter().enumerate() {
             if group_prunable(table, g, &sh.constraints) {
@@ -296,7 +296,7 @@ pub(super) fn execute_family<S: ReadAt>(
                     Item::CountCol(c) | Item::CountDistinct(c) | Item::CountRuns(c) | Item::SumInt(c) | Item::MinInt(c) | Item::MaxInt(c) | Item::SumFloat(c) | Item::MinFloat(c) | Item::MaxFloat(c) => need.push(*c),
                 }
             }
-            need.sort_unstable();
+            crate::sort_small(&mut need);
             need.dedup();
             sh.load(table, g, &mut cols, &need, rows)?;
 

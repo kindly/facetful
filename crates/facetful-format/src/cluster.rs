@@ -10,7 +10,7 @@
 //! rows a query keeps are a subsequence of the file, so they stay clustered.
 
 use crate::*;
-use std::collections::HashSet;
+use crate::fxhash::HashSet;
 
 /// Run heads kept to prove an unsorted integer column clustered. Past this
 /// many runs the set is dropped and only a sorted column (non-decreasing or
@@ -42,7 +42,7 @@ impl Cluster {
         }
         match def.ty {
             ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::Int64 | ColumnType::Date | ColumnType::Timestamp => {
-                Cluster::Ints { last: None, asc: true, desc: true, ended: Some(HashSet::new()) }
+                Cluster::Ints { last: None, asc: true, desc: true, ended: Some(HashSet::default()) }
             }
             _ => Cluster::Off,
         }

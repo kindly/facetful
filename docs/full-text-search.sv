@@ -12,7 +12,7 @@
 - Words match at **word starts**, after spell checking against the data's own vocabulary and expansion to variants and inflections. Every word must match. Ranking is rule-based tiers, Algolia and Meilisearch style, not Lucene-style relevance.
 - **Load time** is the main bottleneck. The plan is to split the image into two aligned files (descriptions and identifiers second) that the engine scans as one table, to stream the load, and to let each app ship its own pre-aggregates for the first screen.
 
-**Budget.** facetful's limit goes from 300 KB to 500 KB gz. `scripts/size-check.sh` gates the full build at 500 KB and the lite build (`--no-default-features`, no search) at 300 KB.
+**Budget.** facetful's limit goes from 300 KB to 500 KB gz. `scripts/size-check.sh` gates the full build at 500 KB and the lite build (`--no-default-features`: no search, and since 5 October nothing that writes images, so no joins, CTEs or subqueries; 231 KB gz) at 300 KB.
 
 **Next job:** prototype the index build and measure build time and memory on grantnav (see *Next steps*).
 </sv-prose>

@@ -255,7 +255,7 @@ pub(super) fn project<S: ReadAt>(
         .filter(|(_, s)| matches!(s, Some(SelSrc::Deferred)))
         .map(|(i, _)| i)
         .collect();
-    let mut late: HashMap<usize, OutCol> = HashMap::new();
+    let mut late: HashMap<usize, OutCol> = HashMap::default();
     if !deferred.is_empty() {
         let ctxs = ctxs.expect("deferred select sources need the groups' lanes");
         // the surviving rows of each group, in ref order; a ref becomes

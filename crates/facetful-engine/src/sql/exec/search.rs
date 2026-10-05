@@ -607,7 +607,7 @@ pub(super) fn suggest<S: ReadAt>(
     let idx = table.search_index().filter(|i| i.cols == cols);
     let mut out = Suggestions { indexed: idx.is_some(), ..Default::default() };
     let Some(idx) = idx else { return Ok(out) };
-    let mut dicts: Dicts = HashMap::new();
+    let mut dicts: Dicts = HashMap::default();
     for &c in &cols {
         if table.catalog().schema.columns[c].is_dict() {
             dicts.insert(c, table.dictionary_rc(c)?);
@@ -750,7 +750,7 @@ struct RankForms {
 thread_local! {
     /// search_rank's words for the statement being run, by (word, prefix,
     /// literal): looked up once, not once per row group.
-    static RANK_FORMS: std::cell::RefCell<HashMap<(String, bool, bool), Rc<RankForms>>> = std::cell::RefCell::new(HashMap::new());
+    static RANK_FORMS: std::cell::RefCell<HashMap<(String, bool, bool), Rc<RankForms>>> = std::cell::RefCell::new(HashMap::default());
 }
 
 /// The tag of a word id among a word's forms: reached, exact, not a typo.

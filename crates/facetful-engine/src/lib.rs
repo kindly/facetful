@@ -10,8 +10,10 @@ pub use facetful_format as format;
 pub mod mask_cache;
 #[cfg(feature = "search")]
 pub mod search_index;
+#[cfg(feature = "write")]
 pub mod join;
 pub mod load;
+#[cfg(feature = "write")]
 pub mod materialize;
 pub mod text;
 pub mod udf;
@@ -20,7 +22,20 @@ pub mod sql;
 
 use format::read::{self, ReadAt};
 use format::{Catalog, ColumnType, FormatError};
-use std::collections::HashMap;
+use format::fxhash::HashMap;
+
+/// Sort a short list (column indices, column names) in place. std's sort is
+/// several KB of code per element type and caller crate; an insertion sort
+/// is a few hundred bytes, and as fast at these lengths. Not for data.
+pub(crate) fn sort_small<T: Ord>(v: &mut [T]) {
+    for i in 1..v.len() {
+        let mut j = i;
+        while j > 0 && v[j - 1] > v[j] {
+            v.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
 
 /// One opened `.facetful` table over a synchronous byte source.
 ///
@@ -126,7 +141,7 @@ impl<S: ReadAt> Table<S> {
         Self {
             src,
             cat,
-            cache: HashMap::new(),
+            cache: HashMap::default(),
             cache_bytes: 0,
             cache_budget: None,
             tick: 0,
@@ -281,7 +296,7 @@ impl<S: ReadAt> Table<S> {
         };
         let idx = search_index::SearchIndex::from_bytes(bytes, self.fingerprint(), &rows, kind)?;
         let mut want = cols.to_vec();
-        want.sort_unstable();
+        sort_small(&mut want);
         want.dedup();
         if idx.cols != want {
             return Err("saved over other columns");
