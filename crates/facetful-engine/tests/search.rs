@@ -331,7 +331,7 @@ fn index_rows_and_pairs() {
     let mut t = table();
     let idx = SearchIndex::build(&mut t, &[0, 1, 2]).unwrap();
     for prefix in ["m", "men", "mental", "health", "he", "sport", "s", "são", "münchen", "lon", "zzz", "2", "climate"] {
-        let ids = idx.prefix_ids(prefix.as_bytes());
+        let ids = idx.prefix_ids(&words_of(prefix).concat());
         let mut got = Vec::new();
         for g in 0..t.group_count() {
             let rows = t.catalog().groups[g].row_count as usize;
@@ -346,7 +346,7 @@ fn index_rows_and_pairs() {
     assert_eq!(idx.plain, [0, 2]);
     for (field, text_of) in [(0u32, &(|i: usize| if i % 13 != 0 { TITLES[i % TITLES.len()] } else { "" }) as &dyn Fn(usize) -> &'static str), (1, &|i: usize| DESCS[(i * 3) % DESCS.len()])] {
         for prefix in ["mental", "health", "sport", "s", "climate"] {
-            let ids = idx.prefix_ids(prefix.as_bytes());
+            let ids = idx.prefix_ids(&words_of(prefix).concat());
             let mut got = Vec::new();
             for g in 0..t.group_count() {
                 let mut m = vec![0u8; t.catalog().groups[g].row_count as usize];
@@ -540,7 +540,7 @@ fn suggestions() {
     // completions are the most common words with the prefix that occur in
     // at least one row the other words and the filter leave
     let expected_words = |t: &mut Table<Vec<u8>>, head: &str, prefix: &str, filter: &str| -> Vec<String> {
-        let mut ids: Vec<u32> = idx.prefix_ids(prefix.as_bytes()).collect();
+        let mut ids: Vec<u32> = idx.prefix_ids(&words_of(prefix).concat()).collect();
         ids.sort_by(|&a, &b| idx.rows_of(b).cmp(&idx.rows_of(a)).then(a.cmp(&b)));
         ids.into_iter()
             .map(|id| String::from_utf8(idx.word(id).to_vec()).unwrap())

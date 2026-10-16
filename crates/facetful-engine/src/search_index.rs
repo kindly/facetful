@@ -69,25 +69,75 @@ impl Fx {
 }
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 
-/// Call `emit` with each folded word of `text`: letters and digits, lowercased
-/// (Unicode), split on anything else. ASCII text takes a byte loop.
+/// Call `emit` with each word of `text`, folded: the one tokenizer of the
+/// index, the queries and the scan.
+///
+/// - A word is a run of letters, digits and combining marks (Unicode).
+/// - Lowercased (Unicode), and accents folded: a letter whose canonical
+///   decomposition is a letter plus accents in U+0300-036F becomes that
+///   letter (`café` and `cafe`, `İ` and `i`), and such accents written
+///   separately are dropped. Other marks stay (Devanagari, Thai vowel signs).
+/// - An apostrophe (`'` or `’`) after a letter or digit: a possessive `'s`
+///   ending the word goes (`children's` is `children`, `90's` is `90`);
+///   between two letters or two digits the apostrophe goes and the word runs
+///   on (`o'brien` is `obrien`), as UAX #29 keeps such words whole. Elsewhere
+///   it separates, like every other character (`mental-health`, `U.K.`).
 pub fn for_each_word(text: &[u8], buf: &mut Vec<u8>, mut emit: impl FnMut(&[u8])) {
     buf.clear();
     if text.is_ascii() {
-        for &b in text {
+        let mut i = 0;
+        while i < text.len() {
+            let b = text[i];
             if b.is_ascii_alphanumeric() {
                 buf.push(b.to_ascii_lowercase());
+            } else if b == b'\'' && !buf.is_empty() && text.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric()) {
+                let (prev, next) = (*buf.last().unwrap(), text[i + 1]);
+                if matches!(next, b's' | b'S') && !text.get(i + 2).is_some_and(|c| c.is_ascii_alphanumeric()) {
+                    i += 1; // a possessive 's: the word ends before it
+                    emit(buf);
+                    buf.clear();
+                } else if prev.is_ascii_digit() != next.is_ascii_digit() {
+                    emit(buf); // a letter and a digit: two words
+                    buf.clear();
+                }
             } else if !buf.is_empty() {
                 emit(buf);
                 buf.clear();
             }
+            i += 1;
         }
     } else {
         let mut tmp = [0u8; 4];
-        for c in String::from_utf8_lossy(text).chars() {
-            if c.is_alphanumeric() {
-                for l in c.to_lowercase() {
-                    buf.extend_from_slice(l.encode_utf8(&mut tmp).as_bytes());
+        let s = String::from_utf8_lossy(text);
+        // ASCII characters (most, even here) skip the table lookups
+        let in_word = |c: char| if c.is_ascii() { c.is_ascii_alphanumeric() } else { c.is_alphanumeric() || is_mark(c) };
+        let mut chars = s.chars().peekable();
+        // whether the word's last letter or digit was a digit
+        let mut last_digit = false;
+        while let Some(c) = chars.next() {
+            if (0x300..0x370).contains(&(c as u32)) {
+                continue; // an accent written separately: dropped, the word runs on
+            }
+            if c.is_ascii_alphanumeric() {
+                buf.push(c.to_ascii_lowercase() as u8);
+                last_digit = c.is_ascii_digit();
+            } else if in_word(c) {
+                for l in fold(c).to_lowercase() {
+                    buf.extend_from_slice(fold(l).encode_utf8(&mut tmp).as_bytes());
+                }
+                if c.is_alphanumeric() {
+                    last_digit = c.is_numeric();
+                }
+            } else if (c == '\'' || c == '\u{2019}') && !buf.is_empty() && chars.peek().is_some_and(|&n| n.is_alphanumeric()) {
+                let mut ahead = chars.clone();
+                let next = ahead.next().unwrap();
+                if matches!(next, 's' | 'S') && !ahead.next().is_some_and(in_word) {
+                    chars.next(); // a possessive 's: the word ends before it
+                    emit(buf);
+                    buf.clear();
+                } else if last_digit != next.is_numeric() {
+                    emit(buf); // a letter and a digit: two words
+                    buf.clear();
                 }
             } else if !buf.is_empty() {
                 emit(buf);
@@ -99,6 +149,27 @@ pub fn for_each_word(text: &[u8], buf: &mut Vec<u8>, mut emit: impl FnMut(&[u8])
         emit(buf);
         buf.clear();
     }
+}
+
+/// A letter's base letter when its canonical decomposition is that letter
+/// plus accents in U+0300-036F (`é` is `e`); itself otherwise.
+fn fold(c: char) -> char {
+    if (c as u32) < 0xC0 {
+        return c; // nothing below À folds
+    }
+    let t = &crate::unicode_tables::FOLD;
+    match t.binary_search_by_key(&(c as u32), |&(k, _)| k) {
+        Ok(i) => char::from_u32(t[i].1).unwrap_or(c),
+        Err(_) => c,
+    }
+}
+
+/// A combining mark (general category M): part of the word it follows.
+fn is_mark(c: char) -> bool {
+    let t = &crate::unicode_tables::MARKS;
+    let c = c as u32;
+    let i = t.partition_point(|&(lo, _)| lo <= c);
+    i > 0 && c <= t[i - 1].1
 }
 
 /// One word's rows in one group: `len` rows of the group's array pool from
@@ -618,9 +689,34 @@ fn row_keys(text: &[u8], buf: &mut Vec<u8>, masks: &mut Vec<u64>, mut f: impl Fn
     }
     let n = text.len();
     word_byte_mask(text, masks);
+    let alnum = |j: usize| j < n && text[j].is_ascii_alphanumeric();
     let mut i = next_bit(masks, 0, true, n);
     while i < n {
-        let end = next_bit(masks, i, false, n);
+        let mut end = next_bit(masks, i, false, n);
+        if alnum(end + 1) && text[end] == b'\'' {
+            // the word may run on past an apostrophe, or end in a possessive
+            // 's: read as `for_each_word` reads it
+            buf.clear();
+            buf.extend(text[i..end].iter().map(|b| b.to_ascii_lowercase()));
+            let mut resume = None;
+            while alnum(end + 1) && text[end] == b'\'' {
+                let (prev, next) = (*buf.last().unwrap(), text[end + 1]);
+                if matches!(next, b's' | b'S') && !alnum(end + 2) {
+                    resume = Some(end + 2); // a possessive 's
+                    break;
+                }
+                if prev.is_ascii_digit() != next.is_ascii_digit() {
+                    resume = Some(end + 1); // a letter and a digit: two words
+                    break;
+                }
+                let run = next_bit(masks, end + 1, false, n);
+                buf.extend(text[end + 1..run].iter().map(|b| b.to_ascii_lowercase()));
+                end = run;
+            }
+            f(key_of(buf));
+            i = next_bit(masks, resume.unwrap_or(end), true, n);
+            continue;
+        }
         let len = end - i;
         if len <= 15 {
             let raw = if i + 16 <= n {
@@ -1147,7 +1243,7 @@ impl Forms {
 /// Version of a saved index (`SearchIndex::to_bytes`): bump it whenever the
 /// tokenizer, the word rules or the layout change, so an index saved by
 /// another build is rebuilt instead of misread.
-pub const SAVED_VERSION: u32 = 1;
+pub const SAVED_VERSION: u32 = 2; // 2: accent folding, apostrophes, marks in words
 const SAVED_MAGIC: &[u8; 4] = b"FCTX";
 
 /// What a column is, for checking a saved index against a table.
@@ -1906,11 +2002,58 @@ mod tests {
         assert_eq!((max_edits(3), max_edits(4), max_edits(7), max_edits(8)), (0, 1, 1, 2));
     }
 
+    /// The build's fast path (`row_keys`) reads the same words as
+    /// `for_each_word`, apostrophes and all.
+    #[test]
+    fn fast_path_reads_words_alike() {
+        let bytes = |k: super::Key| match k {
+            super::Key::Short(u) => {
+                let b = u.to_le_bytes();
+                b[..b[15] as usize].to_vec()
+            }
+            super::Key::Long(w) => w.to_vec(),
+        };
+        let alphabet = b"aZs1'' -";
+        let mut x = 7u64;
+        let (mut buf, mut masks) = (Vec::new(), Vec::new());
+        for _ in 0..20000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = (x >> 60) as usize + 1;
+            let text: Vec<u8> = (0..len).map(|k| alphabet[(x >> (4 + 3 * k % 56)) as usize % alphabet.len()]).collect();
+            let mut fast = Vec::new();
+            super::row_keys(&text, &mut buf, &mut masks, |k| fast.push(bytes(k)));
+            let mut slow = Vec::new();
+            for_each_word(&text, &mut Vec::new(), |w| slow.push(w.to_vec()));
+            assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&text));
+        }
+        // words over 15 bytes across an apostrophe
+        let text = b"internationalisation's o'internationalisation ab'cdefghijklmnopqrstuvwxyz";
+        let mut fast = Vec::new();
+        super::row_keys(text, &mut buf, &mut masks, |k| fast.push(bytes(k)));
+        assert_eq!(fast, [b"internationalisation".to_vec(), b"ointernationalisation".to_vec(), b"abcdefghijklmnopqrstuvwxyz".to_vec()]);
+    }
+
     #[test]
     fn folding_and_splitting() {
         assert_eq!(words("Mental-health, LONDON 2024!"), ["mental", "health", "london", "2024"]);
-        assert_eq!(words("São Paulo ÉCOLE"), ["são", "paulo", "école"]);
         assert_eq!(words("  "), Vec::<String>::new());
         assert_eq!(words("a"), ["a"]);
+        // accents fold, precomposed or written separately; a word stays whole
+        assert_eq!(words("São Paulo ÉCOLE"), ["sao", "paulo", "ecole"]);
+        assert_eq!(words("re\u{301}sume\u{301} résumé RÉSUMÉ"), ["resume", "resume", "resume"]);
+        assert_eq!(words("Ǖ ǖ Ångström \u{212B}"), ["u", "u", "angstrom", "a"]);
+        assert_eq!(words("İstanbul \u{212A}elvin"), ["istanbul", "kelvin"], "dotted I, the Kelvin sign");
+        assert_eq!(words("Ελλάδα ΆΘΗΝΑ ёлка"), ["ελλαδα", "αθηνα", "елка"]);
+        // other marks are part of their word, not breaks (Devanagari vowel signs)
+        assert_eq!(words("हिन्दी भाषा"), ["हिन्दी", "भाषा"]);
+        // not accent folding: these stay
+        assert_eq!(words("straße æther ﬁne"), ["straße", "æther", "ﬁne"]);
+        // apostrophes inside a word: a possessive 's goes, otherwise the word runs on
+        assert_eq!(words("children's O'Brien don't rock'n'roll"), ["children", "obrien", "dont", "rocknroll"]);
+        assert_eq!(words("children\u{2019}s O\u{2019}Brien"), ["children", "obrien"], "curly apostrophes");
+        assert_eq!(words("parents' 'quoted' it's 90's '"), ["parents", "quoted", "it", "90"]);
+        assert_eq!(words("a's b'sx 's"), ["a", "bsx", "s"]);
+        assert_eq!(words("a's'b"), ["a", "b"], "a possessive ends the word");
+        assert_eq!(words("a'1 1'a 1'2 10'000"), ["a", "1", "1", "a", "12", "10000"], "letter and digit: two words (UAX #29)");
     }
 }

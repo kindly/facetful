@@ -74,11 +74,15 @@ Measure first. The build may already be hidden behind the download.
 
 **What the index changes:** finding rows for a word or prefix becomes a lookup, not a scan. Typo, variant and inflection expansion becomes a union of word lists. Common words get cheap too: `support` (35% of rows) is about a millisecond to turn into a mask, against 40+ ms of scanning with 530K hits. `search_rank` reads the same row lists, kept per field.
 
-**Tokenizer and folding**, shared by the index build, the scan and the converter:
+**Tokenizer and folding** (`for_each_word`, built 16 October), the one tokenizer of the index build, the queries and the scan:
 
-- Unicode lowercase (already in the build for `lower()` and `LIKE`).
-- Accent folding through a table of the 958 precomposed characters that map to one base letter once U+0300 to U+036F are dropped, about 2 to 3 KB gz. In decomposed text, skip U+0300 to U+036F. **Don't strip every combining mark.** Dropping all `\p{M}` removes Hindi and Thai vowel signs and decomposes Korean syllables. JS's `normalize` and `Intl.Collator` do this too, but calling them per row costs more than the table.
-- Split on non-alphanumerics, but keep apostrophes inside words (`children's`, not `children s`).
+- A word is a run of letters, digits and combining marks (Unicode); everything else separates (`mental-health`, `U.K.`, `3.5`).
+- Lowercased (Unicode), and accents folded: a letter whose canonical decomposition is a letter plus accents in U+0300 to U+036F becomes that letter (`café`, `İ`, the Kelvin sign), and such accents written separately are dropped without splitting the word. Other marks stay part of their word (Devanagari, Thai). Not folded: `ß`, `æ`, ligatures (Lucene's ASCII folding does these; left out).
+- Apostrophes (`'`, `’`): a possessive `'s` after a letter or digit goes (`children's` is `children`); between two letters or two digits the word runs on without it (`o'brien` is `obrien`), as UAX #29 keeps such words whole; elsewhere it separates.
+- Tables generated from Unicode 17.0.0, the version Rust's `char` implements (`scripts/gen-unicode-tables.py`): 1,860 folds (about 1,000 of them CJK compatibility ideographs, canonical twins of the unified ones) and 327 mark ranges. +13.8 KB gz on the full build, none on lite.
+- Tested against outside data (`tests/tokenizer.rs`): Unicode's NormalizationTest, every character precomposed and decomposed giving the same words (5,691 cases; 11,395 left as they are: Hangul, letter pairs and marks outside U+0300 to U+036F, as nothing composes them); WordBreakTest's apostrophe cases; the Big List of Naughty Strings, scanning and indexed alike. The build's fast ASCII path reads apostrophes itself, checked against `for_each_word` on 20,000 random strings.
+- grantnav: build unchanged (1.38 s native, 2.1 to 2.2 s wasm); 269,277 words (from 269,702). `cafe` and `café` find the same 7,410 rows.
+- A saved index from before (`SAVED_VERSION` 1) is refused and rebuilt.
 - `Intl.Segmenter` could split Chinese and Japanese into words later, since the browser ships the dictionary that needs.
 </sv-prose>
 
@@ -259,7 +263,7 @@ Size, unoptimized: lite 291.7 KB gz, full 323.6 KB gz (+32 KB for the scan path 
    - **Refused, then rebuilt:** another version, another table, other columns, or a damaged file. Every list, row, word id and dictionary code is checked to lie in range before use; a test loads every truncation and 400 single-bit flips without a panic (5,000 once). The fingerprint describes the layout, not every byte, so the cache path should carry the data's version.
    - grantnav, wasm in Node: kept index 75.4 MB, saved in 108 ms; read back in 117 to 146 ms against 2,258 ms to build, wasm peak 542 MB against 626 MB (the OPFS read itself is not included: step 11).
    - **Review fixes (5 October):** a NULL in one dictionary column no longer hides another column's match; derived tables (CTEs, subqueries) holding search() results are not reused once an index comes, changes or goes (a search generation in their keys); row groups over 65,536 rows and columns that are not text are refused with an error (a refused request leaves the current index alone); ranking weights are 0 to 999; the scan's ASCII kernel rechecks rows with other text (`K`, the Kelvin sign, is a `k`); overlapping index builds in the worker: the latest wins and earlier requests say they were superseded; a common word skips the typo search. search() and search_rank() share one statement search context (`SearchCtx` in `GroupCtx`) instead of thread-local state.
-10. **Accent folding** and keeping apostrophes inside words (tokenizer changes; any time).
+10. ~~Accent folding and apostrophes~~ (done 16 October): see *Tokenizer and folding*. Suggestions now show words folded (`sao paulo`); keeping each word's most common written form for display is a follow-up.
 11. **Measurements in Chrome, Firefox, Safari and a phone;** build peak memory if phones need it (groups in halves, 6-byte pairs).
 </sv-prose>
 

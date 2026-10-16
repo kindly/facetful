@@ -10,6 +10,8 @@ pub use facetful_format as format;
 pub mod mask_cache;
 #[cfg(feature = "search")]
 pub mod search_index;
+#[cfg(feature = "search")]
+mod unicode_tables;
 #[cfg(feature = "write")]
 pub mod join;
 pub mod load;

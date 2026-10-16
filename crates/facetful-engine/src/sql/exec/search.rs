@@ -137,8 +137,14 @@ pub(super) fn parse(q: &str) -> Vec<Item> {
 }
 
 /// Does `text` hold the word `w` as typed (whole, or as a word prefix)?
+/// Text the byte matchers read as the tokenizer does: ASCII without an
+/// apostrophe (which may join or end a word; see `for_each_word`).
+fn bytes_alone(text: &[u8]) -> bool {
+    text.is_ascii() && !text.contains(&b'\'')
+}
+
 fn has_word(text: &[u8], w: &Word, buf: &mut Vec<u8>) -> bool {
-    if w.text.is_ascii() && text.is_ascii() {
+    if w.text.is_ascii() && bytes_alone(text) {
         return crate::text::word_ci(text, w.text.as_bytes(), !w.prefix);
     }
     let mut hit = false;
@@ -149,7 +155,7 @@ fn has_word(text: &[u8], w: &Word, buf: &mut Vec<u8>) -> bool {
 
 /// Does `text` hold the phrase's words consecutively, in order?
 fn has_phrase(text: &[u8], p: &Phrase, buf: &mut Vec<u8>) -> bool {
-    if text.is_ascii() && p.words.iter().all(|w| w.is_ascii()) {
+    if bytes_alone(text) && p.words.iter().all(|w| w.is_ascii()) {
         return has_phrase_ascii(text, p);
     }
     has_phrase_words(text, p, buf)
@@ -434,12 +440,12 @@ fn word_mask<S: ReadAt>(
                 None if w.text.is_ascii() => {
                     let mut hits = vec![0u8; rows];
                     crate::text::mark_rows_word_ci(blob, off, rows, w.text.as_bytes(), !w.prefix, &mut hits);
-                    // the byte kernel knows ASCII only: a row with other text
-                    // is checked again in full (`K`, the Kelvin sign, folds to
-                    // `k`; an accented letter is a letter, not a word break)
-                    if !blob.is_ascii() {
+                    // the byte kernel knows ASCII words only: a row with other
+                    // text, or an apostrophe, is checked again by the tokenizer
+                    // (`é` folds to `e`, `o'brien` is one word)
+                    if !bytes_alone(blob) {
                         for (i, h) in hits.iter_mut().enumerate() {
-                            if !row(i).is_ascii() {
+                            if !bytes_alone(row(i)) {
                                 *h = has_word(row(i), w, &mut buf) as u8;
                             }
                         }
@@ -1056,7 +1062,7 @@ mod tests {
         assert_eq!(parse("youth-sport, London!"), [w("youth", false), w("sport", false), w("london", false)]);
         assert_eq!(parse("health HEALTH health"), [w("health", false), w("health", true)]);
         assert!(parse(" -- ").is_empty());
-        assert_eq!(parse("SÃO paulo"), [w("são", false), w("paulo", true)]);
+        assert_eq!(parse("SÃO paulo"), [w("sao", false), w("paulo", true)]);
         // quotes: one word is a quoted word, more a phrase; a closing quote finishes
         assert_eq!(parse("\"heath\""), [q("heath", false)]);
         assert_eq!(parse("\"Mental Health\" london"), [p(&["mental", "health"], false), w("london", true)]);
@@ -1080,7 +1086,10 @@ mod tests {
         assert!(!t("mental heal", &ph(&["mental", "hea"], false)));
         // a repeated word does not lose a match that starts inside an earlier attempt
         assert!(t("a a a b", &ph(&["a", "a", "b"], false)));
-        assert!(t("São Paulo youth", &ph(&["são", "paulo"], false)));
+        // phrase words come folded from the query (`parse`)
+        assert!(t("São Paulo youth", &ph(&["sao", "paulo"], false)));
+        assert!(t("children's mental-health", &ph(&["children", "mental", "health"], false)));
+        assert!(t("O'Brien Trust", &ph(&["obrien", "trust"], false)));
     }
 
     #[test]
