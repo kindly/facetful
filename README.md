@@ -128,8 +128,10 @@ search. Designed but deliberately not built (recorded in `docs/design.sv`):
 HTTP-range reads + per-segment compression (one package, awaiting a workload
 that needs it), restricted joins, a stemmed token index, JS UDFs.
 
-Not published to npm yet; the package installs from `dist/` via
-`build-package.sh`.
+Published on npm as [`facetful`](https://www.npmjs.com/package/facetful)
+(`npm install facetful`). Releases go out from a version tag through
+`.github/workflows/release.yml`; `./scripts/build-package.sh` builds and
+checks the same package locally in `dist/`.
 
 ## License
 
