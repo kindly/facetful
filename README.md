@@ -43,7 +43,7 @@ Convert the data once, ahead of time, and host the image next to the page:
 
 ```
 npm install facetful
-npx facetful convert plants.csv plants.facetful   # streaming, bounded memory, type inference
+npx facetful convert plants.csv plants.facetful   # CSV or Parquet in
 npx facetful query plants.facetful                # REPL; or one-shot with a SQL arg
 ```
 
@@ -69,6 +69,11 @@ The npm package lives in [`js/facetful`](js/facetful) — see its README for
 the full API (OPFS persistence, `warm()`, cache budgets, transferable column
 buffers).
 
+`convert` reads CSV (streamed, bounded memory, types inferred) and Parquet
+(needs `npm install hyparquet`). Parquet integers, floats, decimals,
+booleans, dates, timestamps and strings keep their type; anything else
+(lists, structs, maps, JSON, UUIDs, binary) becomes text.
+
 If the page only has a Parquet file at runtime, `openParquet(name, buffer)`
 converts it in the browser and caches the result in OPFS. The first visit is
 slower than loading a prepared image, so prefer `facetful convert` when the
@@ -78,7 +83,7 @@ data is known ahead of time.
 
 The command is the wasm engine under Node — the same module the browser
 loads, so images, SQL and user-defined functions are identical wherever they
-run. Conversion streams (`facetful-format::stream`): two passes over the
+run. CSV conversion streams (`facetful-format::stream`): two passes over the
 input, row groups written as they finish, bounded memory whatever the file
 size, byte-identical to what the browser's own `loadCsv`/`openParquet` build.
 
@@ -110,7 +115,7 @@ facetful inspect data.facetful
 
 ```
 cargo test --workspace          # engine, format, SQL, differential vs sqlite3 (if on PATH)
-./scripts/size-check.sh         # wasm build + wasm-opt, enforces the 300 KB gz budget
+./scripts/size-check.sh         # wasm build + wasm-opt, enforces the size budgets (500 KB gz, lite 300 KB)
 ./scripts/build-package.sh      # the release gate: budget + smokes + differentials + npm pack
 node js/facetful/node-smoke.mjs # JS boundary protocol, compile round-trip
 ```

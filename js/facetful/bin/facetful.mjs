@@ -2,13 +2,15 @@
 // The facetful command, on the same wasm engine the browser runs (design.sv
 // d51): one `npm install facetful` gives the library and this.
 //
-//   facetful convert in.csv out.facetful [--row-group-size N]
+//   facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
 //   facetful inspect file.facetful [--json]
 //   facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
 //   facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf …]
 //
-// Conversion streams: two passes over the CSV in 1 MB chunks, row groups
-// written as they finish, memory bounded whatever the file size. Tables open
+// CSV conversion streams: two passes over the CSV in 1 MB chunks, row groups
+// written as they finish, memory bounded whatever the file size. Parquet is
+// read whole through hyparquet (../parquet.js, the browser's own path), so it
+// needs memory for the decoded table. Tables open
 // lazily through positional reads (the browser's OPFS import, here fs.readSync).
 // The ready-made functions (../udfs.js) are registered; a --udf module's
 // default export adds more: an array of { name, signature, fn }.
@@ -20,7 +22,7 @@ import { udfs as builtinUdfs } from "../udfs.js";
 const args = process.argv.slice(2);
 const cmd = args.shift();
 const usage = () => {
-  console.error(`usage: facetful convert in.csv out.facetful [--row-group-size N]
+  console.error(`usage: facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
        facetful inspect file.facetful [--json]
        facetful query file.facetful ["select …"] [--table name=path.facetful …] [--udf module.mjs …]
        facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf module.mjs …]`);
@@ -118,6 +120,42 @@ function printResult(r, ms) {
   console.log(`(${r.rowCount} row${r.rowCount === 1 ? "" : "s"}, ${ms.toFixed(1)} ms)`);
 }
 
+/** Parquet files start with the magic "PAR1", whatever they are called. */
+function isParquet(path) {
+  const fd = openSync(path, "r");
+  const magic = Buffer.alloc(4);
+  const n = readSync(fd, magic, 0, 4, 0);
+  closeSync(fd);
+  return n === 4 && magic.toString("latin1") === "PAR1";
+}
+
+async function convertParquet(input, output, groupSize) {
+  let hyparquet;
+  try {
+    hyparquet = await import("hyparquet");
+  } catch {
+    console.error("converting Parquet needs hyparquet: npm install hyparquet");
+    process.exit(1);
+  }
+  const { parquetToColumns, zstdCompressors } = await import("../parquet.js");
+  const t0 = performance.now();
+  const file = readFileSync(input);
+  const { rows, columns } = await parquetToColumns(
+    hyparquet,
+    file.buffer.slice(file.byteOffset, file.byteOffset + file.byteLength),
+    { compressorsFor: async (codecs) => (codecs.has("ZSTD") ? zstdCompressors(await import("../fzstd.js")) : {}) },
+  );
+  const bytes = engine.imageBytes(engine.compileTable(rows, columns, { groupTarget: groupSize }));
+  const out = openSync(output, "w");
+  writeSync(out, bytes);
+  closeSync(out);
+  console.error(`${input}: ${rows} rows`);
+  for (const c of columns) {
+    console.error(`  ${c.name}: ${c.kind === "text" ? "text" : c.temporal ?? (c.isInt ? "int" : "float")}`);
+  }
+  console.error(`${output}: ${bytes.byteLength} bytes (${Math.ceil(rows / groupSize)} row groups, ${(performance.now() - t0).toFixed(0)} ms)`);
+}
+
 function convert(input, output, groupSize) {
   const CHUNK = 1 << 20;
   const h = engine.w.convert_begin(groupSize);
@@ -174,7 +212,8 @@ try {
   if (cmd === "convert") {
     const { pos, groupSize } = parse(args);
     if (pos.length !== 2) usage();
-    convert(pos[0], pos[1], groupSize);
+    if (isParquet(pos[0])) await convertParquet(pos[0], pos[1], groupSize);
+    else convert(pos[0], pos[1], groupSize);
   } else if (cmd === "inspect") {
     const { pos, json } = parse(args);
     if (pos.length !== 1) usage();
