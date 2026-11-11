@@ -69,8 +69,8 @@ The npm package lives in [`js/facetful`](js/facetful) — see its README for
 the full API (OPFS persistence, `warm()`, cache budgets, transferable column
 buffers).
 
-`convert` reads CSV (streamed, bounded memory, types inferred) and Parquet
-. Parquet integers, floats, decimals,
+`convert` reads CSV (streamed, bounded memory, types inferred) and Parquet.
+Parquet integers, floats, decimals,
 booleans, dates, timestamps and strings keep their type; anything else
 (lists, structs, maps, JSON, UUIDs, binary) becomes text.
 
