@@ -6,9 +6,12 @@ of WebAssembly, zero runtime dependencies, running in a dedicated worker.
 Built for one job and fast at it: **exploring 100K–5M row datasets in the
 browser** — facet counts, pivots, top-k, filters — at interaction speed.
 
-- **Open Parquet instantly.** First visit transcodes once (seconds) and caches
-  the compiled image in OPFS; every visit after reopens in ~20–40 ms with zero
-  decode. Measured on a real 183K×52 dataset: facet queries 1–4 ms.
+- **Ship a prepared image.** `facetful convert` builds a `.facetful` file ahead
+  of time; the page fetches it from any static host and opens it as it
+  arrives, with no decoding or conversion in the browser. Measured on a real
+  183K×52 dataset: facet queries 1–4 ms.
+- **Parquet when you need it.** `openParquet` converts in the browser on the
+  first visit and caches the compiled image in OPFS for later visits.
 - **SELECT-only SQL**, SQLite-flavored semantics, verified cell-for-cell
   against SQLite by a differential test suite. Friendly errors with carets and
   did-you-mean hints.
@@ -46,8 +49,7 @@ default in both.
 import { Facetful } from "facetful";
 
 const db = await Facetful.open();
-const buf = await (await fetch("plants.parquet")).arrayBuffer();
-await db.openParquet("plants", buf); // transcode once, OPFS-cached thereafter
+await db.loadUrl("plants", "data.facetful"); // opens as it downloads, no conversion
 
 const r = await db.query(`
   select "Country/area", count(*) as n, round(sum("Capacity (MW)"), 1) as mw
@@ -81,12 +83,13 @@ console.log(r.elapsedMs, r.stats); // ms in worker, row groups pruned
 The SQL table is always named `t`. Multiple tables coexist:
 `db.query(sql, { table: "plants" })`.
 
-## The three ways in
+## The ways in
 
 | method | use when |
 |---|---|
-| `openParquet(name, buf)` | the default: Parquet in, OPFS-cached compiled image, instant repeat visits |
-| `load(name, buf)` | you already have a `.facetful` image (built by `facetful convert`) |
+| `loadUrl(name, url)` | the default: a `.facetful` image built ahead of time by `facetful convert`, fetched from a static host |
+| `load(name, buf)` | you already hold a `.facetful` image as an ArrayBuffer |
+| `openParquet(name, buf)` | the source is Parquet at runtime: converted in the browser on the first visit, OPFS-cached after |
 | `loadCsv(name, fileOrBuffer, {persist})` | a CSV: streamed through the converter in the worker, types inferred, optionally persisted |
 | `loadOpfs(name, path, {cacheBytes})` | the file is in OPFS; open lazily, spill-over for big data |
 

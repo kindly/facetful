@@ -19,10 +19,15 @@ are designed around repeated queries over immutable datasets.
   group (LRU, 16 MB). A burst of facet queries sharing a filter evaluates it
   once while the mask remains cached. A `LIKE '%needle%'` that extends a
   cached needle verifies only the rows the shorter one matched.
-- **Parquet input**: `openParquet()` transcodes in the
-  browser (hyparquet + the same Rust compiler the CLI uses), caches the image
-  in OPFS keyed by content hash, and reuses that image on subsequent opens
-  while it remains cached.
+- **Prepared images**: `facetful convert` builds the image ahead of time, at
+  build or publish time. The page fetches it with `loadUrl()` and opens it as
+  it arrives, with no decoding or conversion in the browser. This is the
+  primary path.
+- **Parquet input**: when the source can only be Parquet at runtime,
+  `openParquet()` transcodes in the browser (hyparquet + the same Rust
+  compiler the CLI uses), caches the image in OPFS keyed by content hash, and
+  reuses that image on subsequent opens while it remains cached. The first
+  visit pays for the conversion.
 - **OPFS storage**: tables can live in OPFS and load segments through
   a byte-budgeted LRU cache, limiting how much source data stays in memory.
 - **SELECT-only SQL** with SQLite-compatible semantics for the supported
@@ -32,14 +37,23 @@ are designed around repeated queries over immutable datasets.
 - **Safe Rust** in the executor (`unsafe` only at the wasm FFI edge);
   the wasm SIMD128 kernels use the safe intrinsics.
 
-## Quickstart (browser)
+## Quickstart
+
+Convert the data once, ahead of time, and host the image next to the page:
+
+```
+npm install facetful
+npx facetful convert plants.csv plants.facetful   # streaming, bounded memory, type inference
+npx facetful query plants.facetful                # REPL; or one-shot with a SQL arg
+```
+
+Then load it in the browser:
 
 ```js
 import { Facetful } from "facetful";
 
 const db = await Facetful.open();
-const buf = await (await fetch("plants.parquet")).arrayBuffer();
-await db.openParquet("plants", buf); // transcode once, OPFS-cached thereafter
+await db.loadUrl("plants", "plants.facetful"); // opens as it downloads, no conversion
 
 const r = await db.query(`
   select "Country", count(*) as n, round(sum("Capacity (MW)"), 1) as mw
@@ -55,13 +69,12 @@ The npm package lives in [`js/facetful`](js/facetful) — see its README for
 the full API (OPFS persistence, `warm()`, cache budgets, transferable column
 buffers).
 
-## Quickstart (the `facetful` command)
+If the page only has a Parquet file at runtime, `openParquet(name, buffer)`
+converts it in the browser and caches the result in OPFS. The first visit is
+slower than loading a prepared image, so prefer `facetful convert` when the
+data is known ahead of time.
 
-```
-npm install facetful
-npx facetful convert data.csv data.facetful   # streaming, bounded memory, type inference
-npx facetful query data.facetful              # REPL; or one-shot with a SQL arg
-```
+## The `facetful` command
 
 The command is the wasm engine under Node — the same module the browser
 loads, so images, SQL and user-defined functions are identical wherever they
