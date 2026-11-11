@@ -69,6 +69,35 @@ for (const { file, compiled } of paths) for (const sql of QUERIES) {
     process.exit(1);
   }
 }
+// column types: the common scalars keep their kind, everything else is text
+// (spikes/facet-spike/types.parquet, written by DuckDB: 5 rows, i = 1..5)
+{
+  const pq = readFileSync(new URL("spikes/facet-spike/types.parquet", root));
+  const { rows: n, columns } = await parquetToColumns(hp, pq.buffer.slice(pq.byteOffset, pq.byteOffset + pq.byteLength), { compressorsFor });
+  const kinds = Object.fromEntries(columns.map((c) => [c.name, c.kind === "text" ? "text" : c.temporal ?? (c.isInt ? "int" : "float")]));
+  const wantKinds = {
+    i32: "int", i64: "int", b: "int", dbl: "float", dec2: "float", dec0: "int", s: "text", s_null: "text",
+    d: "date", ts: "timestamp", ts_ns: "timestamp", u_s: "text", u: "text", lst: "text", slst: "text",
+    st: "text", mp: "text", u64: "int", i_null: "int", tail: "text",
+  };
+  for (const [name, want] of Object.entries(wantKinds)) {
+    if (kinds[name] !== want) throw new Error(`types.parquet: column ${name} is ${kinds[name]}, expected ${want}`);
+  }
+  const t = engine.openImage(engine.compileTable(n, columns));
+  const got = cells(engine.query(t.handle,
+    "select i32, i64, b, dbl, dec2, dec0, s, s_null, d, ts, ts_ns, u = u_s, lst, slst, st, mp, u64, i_null, tail from t where i32 = 3 or i32 = 4 order by i32"));
+  const want = [
+    "3", "30000000000", "0", "0.75", "3.75", "3", "name_3", "NULL", "19726", "1704114000000", "1704114000000", "1", "[3,4]", '["a3",null]', '{"a":3,"b":"q3"}', '{"k":3}', "3", "3", "tail_3",
+    "4", "40000000000", "1", "1", "5", "4", "name_4", "x4", "19727", "1704117600000", "1704117600000", "1", "[4,5]", '["a4",null]', '{"a":4,"b":"q4"}', '{"k":4}', "4", "NULL", "tail_4",
+  ];
+  if (got.length !== want.length || got.some((v, i) => v !== want[i])) {
+    console.error("MISMATCH (types.parquet)");
+    console.error("got: ", got.join(" | "));
+    console.error("want:", want.join(" | "));
+    process.exit(1);
+  }
+}
+
 console.log(
   `parquet-path differential: OK — ${QUERIES.length} queries agree cell-for-cell ` +
   `(${rows} rows; transcode in node ${paths.map((p) => `${p.file} ${p.ms.toFixed(0)} ms`).join(", ")})`,

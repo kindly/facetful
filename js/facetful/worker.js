@@ -100,7 +100,7 @@ let hp = null;
 async function loadHyparquet() {
   if (hp) return hp;
   // literal specifier when unconfigured, so bundlers resolve + code-split the
-  // optional peer dependency; explicit URLs bypass the bundler entirely
+  // loaded only when Parquet is opened; explicit URLs bypass the bundler entirely
   hp =
     hyparquetUrl === "hyparquet"
       ? await import("hyparquet")

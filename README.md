@@ -59,13 +59,18 @@ buffers).
 
 ```
 npm install facetful
-npx facetful convert data.csv data.facetful   # streaming, bounded memory, type inference
+npx facetful convert data.csv data.facetful   # CSV or Parquet in
 npx facetful query data.facetful              # REPL; or one-shot with a SQL arg
 ```
 
+`convert` reads CSV (streamed, bounded memory, types inferred) and Parquet.
+Parquet integers, floats, decimals, booleans, dates, timestamps and strings
+keep their type; anything else (lists, structs, maps, JSON, UUIDs, binary)
+becomes text.
+
 The command is the wasm engine under Node — the same module the browser
 loads, so images, SQL and user-defined functions are identical wherever they
-run. Conversion streams (`facetful-format::stream`): two passes over the
+run. CSV conversion streams (`facetful-format::stream`): two passes over the
 input, row groups written as they finish, bounded memory whatever the file
 size, byte-identical to what the browser's own `loadCsv`/`openParquet` build.
 

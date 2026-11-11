@@ -1,7 +1,7 @@
 # facetful
 
-A tiny columnar SQL engine for browser faceting. Rust compiled to ~150 KB gz
-of WebAssembly, zero runtime dependencies, running in a dedicated worker.
+A tiny columnar SQL engine for browser faceting. Rust compiled to ~290 KB gz
+of WebAssembly, nothing else to load in the browser, running in a dedicated worker.
 
 Built for one job and fast at it: **exploring 100K–5M row datasets in the
 browser** — facet counts, pivots, top-k, filters — at interaction speed.
@@ -29,7 +29,8 @@ One install gives the browser library **and** the `facetful` command:
 
 ```
 npm install facetful
-npx facetful convert data.csv data.facetful        # streaming: any file size, ~20 MB of memory
+npx facetful convert data.csv data.facetful        # CSV streams: any file size, ~20 MB of memory
+npx facetful convert data.parquet data.facetful    # Parquet too
 npx facetful query data.facetful "select country, count(*) as n from t group by country order by n desc limit 5"
 npx facetful inspect data.facetful      # rows, row groups, sort keys; per column kind, bytes, nulls, range or dictionary size
 ```
@@ -97,7 +98,7 @@ without one.
 ## The `facetful` command
 
 ```
-facetful convert in.csv out.facetful [--row-group-size N]
+facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
 facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
 facetful materialize in.facetful "select …" out.facetful [--table …] [--udf …]
 ```
@@ -202,9 +203,11 @@ on both sides.
 ## Parquet support
 
 Reading uses [hyparquet](https://github.com/hyparam/hyparquet) (~20 KB gz),
-declared as an optional peer dependency and loaded dynamically only when a
-Parquet method is called. Under a bundler, `npm install hyparquet` is enough;
-without one, pass `hyparquetUrl` to `Facetful.open`.
+installed with the package so that `facetful convert` reads Parquet out of the
+box. The browser never loads it unless a Parquet method is called: a page
+that loads prepared images ships the engine and nothing else. Under a bundler
+the dynamic import resolves by itself; without one, pass `hyparquetUrl` to
+`Facetful.open`.
 
 Compression: SNAPPY, ZSTD or none. ZSTD uses a vendored copy of
 [fzstd](https://github.com/101arrowz/fzstd) (~3 KB gz), loaded only for a file
@@ -213,11 +216,14 @@ COMPRESSION_LEVEL 19`) makes a file a little over half the size of Snappy, so
 the download is shorter, and costs little to decode. Other codecs fail with a
 clear error.
 
-Flat schemas only (no nested/repeated columns). BOOLEAN/INT32/INT64 →
-integers (narrowed), FLOAT/DOUBLE → float64, strings → dictionary-encoded when
-it pays, DATE/TIMESTAMP → real date/timestamp columns (days / ms since epoch,
-ISO strings on output). Int64 values beyond 2^53 lose precision in the
-browser transcoder (the native CLI has no such limit).
+The same reader serves `openParquet` in the browser and `facetful convert
+in.parquet` on the command line. BOOLEAN/INT32/INT64 → integers (narrowed),
+FLOAT/DOUBLE → float64, DECIMAL → integer (scale 0) or float64, strings →
+dictionary-encoded when it pays, DATE/TIMESTAMP (INT96 included) → real
+date/timestamp columns (days / ms since epoch, ISO strings on output).
+Everything else becomes text: lists, structs and maps as JSON, JSON columns
+as written, UUIDs in their usual form, fixed-length binary and geometry as
+hex. Integers beyond 2^53 and decimals beyond 15 digits lose precision.
 
 ## SQL dialect, briefly
 
