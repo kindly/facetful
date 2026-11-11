@@ -70,7 +70,7 @@ the full API (OPFS persistence, `warm()`, cache budgets, transferable column
 buffers).
 
 `convert` reads CSV (streamed, bounded memory, types inferred) and Parquet
-(needs `npm install hyparquet`). Parquet integers, floats, decimals,
+. Parquet integers, floats, decimals,
 booleans, dates, timestamps and strings keep their type; anything else
 (lists, structs, maps, JSON, UUIDs, binary) becomes text.
 

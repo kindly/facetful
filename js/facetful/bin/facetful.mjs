@@ -134,7 +134,7 @@ async function convertParquet(input, output, groupSize) {
   try {
     hyparquet = await import("hyparquet");
   } catch {
-    console.error("converting Parquet needs hyparquet: npm install hyparquet");
+    console.error("converting Parquet needs the hyparquet package, which installs with facetful: run npm install");
     process.exit(1);
   }
   const { parquetToColumns, zstdCompressors } = await import("../parquet.js");

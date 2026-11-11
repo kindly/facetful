@@ -1,7 +1,7 @@
 # facetful
 
 A tiny columnar SQL engine for browser faceting. Rust compiled to ~290 KB gz
-of WebAssembly, zero runtime dependencies, running in a dedicated worker.
+of WebAssembly, nothing else to load in the browser, running in a dedicated worker.
 
 Built for one job and fast at it: **exploring 100K–5M row datasets in the
 browser** — facet counts, pivots, top-k, filters — at interaction speed.
@@ -33,7 +33,7 @@ One install gives the browser library **and** the `facetful` command:
 ```
 npm install facetful
 npx facetful convert data.csv data.facetful        # CSV streams: any file size, ~20 MB of memory
-npx facetful convert data.parquet data.facetful    # Parquet too (needs: npm install hyparquet)
+npx facetful convert data.parquet data.facetful    # Parquet too
 npx facetful query data.facetful "select country, count(*) as n from t group by country order by n desc limit 5"
 npx facetful inspect data.facetful      # rows, row groups, sort keys; per column kind, bytes, nulls, range or dictionary size
 ```
@@ -206,9 +206,11 @@ on both sides.
 ## Parquet support
 
 Reading uses [hyparquet](https://github.com/hyparam/hyparquet) (~20 KB gz),
-declared as an optional peer dependency and loaded dynamically only when a
-Parquet method is called. Under a bundler, `npm install hyparquet` is enough;
-without one, pass `hyparquetUrl` to `Facetful.open`.
+installed with the package so that `facetful convert` reads Parquet out of the
+box. The browser never loads it unless a Parquet method is called: a page
+that loads prepared images ships the engine and nothing else. Under a bundler
+the dynamic import resolves by itself; without one, pass `hyparquetUrl` to
+`Facetful.open`.
 
 Compression: SNAPPY, ZSTD or none. ZSTD uses a vendored copy of
 [fzstd](https://github.com/101arrowz/fzstd) (~3 KB gz), loaded only for a file
