@@ -189,6 +189,7 @@ impl Parser {
             }
         }
 
+        let tail = self.toks[self.pos].span.start;
         let mut order_by = Vec::new();
         if self.eat(&Tok::Order) {
             self.expect(Tok::By, "after 'order'")?;
@@ -231,6 +232,7 @@ impl Parser {
             order_by,
             limit,
             offset,
+            tail,
         })
     }
 

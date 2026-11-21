@@ -24,3 +24,36 @@ fn derived_tables_are_refused() {
         assert!(d.render(sql).contains("not in this build (lite)"), "{sql}: {}", d.render(sql));
     }
 }
+
+/// Retained results are in the lite build: rows of the table and grouped
+/// results page and sort; a join is refused as it is in a query.
+#[test]
+fn retained_results_page_and_sort() {
+    use facetful_engine::sql::{prepare, NoCatalog};
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../spikes/facet-spike/data-200000.facetful")).unwrap();
+    let mut t = Table::open(bytes).unwrap();
+    let rows = |mut r: facetful_engine::sql::exec::QueryResult| {
+        r.ensure_rows();
+        r.rows.iter().map(|row| format!("{row:?}")).collect::<Vec<_>>()
+    };
+    let mut h = prepare(&mut t, "select id, country, capacity from t where capacity > 100").unwrap();
+    assert!(h.is_rows() && h.has_row_ids());
+    let n = h.rows();
+    let got = rows(h.page(&mut t, n - 700, n + 10, None).unwrap());
+    let want = rows(run_query(&mut t, &format!("select id, country, capacity from t where capacity > 100 limit 700 offset {}", n - 700)).unwrap());
+    assert_eq!(got, want);
+    h.sort(&mut t, "capacity desc, id, country", &mut NoCatalog).unwrap();
+    let got = rows(h.page(&mut t, n / 2, n / 2 + 512, None).unwrap());
+    let want = rows(run_query(&mut t, &format!("select id, country, capacity from t where capacity > 100 order by capacity desc, id, country limit 512 offset {}", n / 2)).unwrap());
+    assert_eq!(got.len(), 512);
+    // rows equal in all three keys are whole duplicates, so any tie order reads the same
+    assert_eq!(got, want);
+    let h = prepare(&mut t, "select country, count(*) as n from t group by country order by n desc, country").unwrap();
+    assert!(!h.is_rows());
+    let got = rows(h.page(&mut t, 5, 15, None).unwrap());
+    let want = rows(run_query(&mut t, "select country, count(*) as n from t group by country order by n desc, country limit 10 offset 5").unwrap());
+    assert_eq!(got, want);
+    let sql = "select count(*) from t join t u on t.id = u.id";
+    let Err(d) = prepare(&mut t, sql) else { panic!("{sql} was prepared in the lite build") };
+    assert!(d.render(sql).contains("not in this build (lite)"));
+}

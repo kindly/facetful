@@ -194,10 +194,91 @@ if (be.ok || !be.isQueryError || !/statement 1: .*unknown column 'contry'/s.test
   if (!(m.wasmBytes > 1 << 20) || m.tables !== 5) throw new Error(`memoryStats ${JSON.stringify(m)}`);
 }
 
+// retained results (prepare / page / sortHandle / closeHandle): blocks of a
+// handle equal the same rows of the query, before and after a sort
+{
+  const cells = (res) => {
+    const out = [];
+    for (let i = 0; i < res.rowCount; i++) {
+      out.push(res.columns.map((c) => {
+        if (!((c.validity[i >> 3] >> (i & 7)) & 1)) return null;
+        if (c.values) return c.values[i];
+        if (c.codes) return dec.decode(c.dict.bytes.subarray(c.dict.offsets[c.codes[i]], c.dict.offsets[c.codes[i] + 1]));
+        return text(c, i);
+      }).join("|"));
+    }
+    return out.join("\n");
+  };
+  const same = async (page, sql, what) => {
+    const q = await ok({ cmd: "query", table: "t", sql });
+    if (page.result.rowCount !== q.result.rowCount || cells(page.result) !== cells(q.result)) throw new Error(`handle ${what}: differs from ${sql}`);
+  };
+  const base = "select id, country, capacity from t where capacity > 3";
+  const h = await ok({ cmd: "prepare", table: "t", sql: base });
+  if (h.rows !== 111597 || h.kind !== "rows" || h.columns.map((c) => `${c.name}:${c.kind}`).join() !== "id:int,country:text,capacity:float") {
+    throw new Error(`prepare ${JSON.stringify(h)}`);
+  }
+  let pg = await ok({ cmd: "page", handle: h.handle, start: 70000, end: 70512, dictText: true });
+  if (!pg.result.columns[1].codes) throw new Error("page: dictText gives codes");
+  await same(pg, `${base} limit 512 offset 70000`, "unsorted block");
+  pg = await ok({ cmd: "page", handle: h.handle, start: 111500, end: 999999 });
+  await same(pg, `${base} limit 512 offset 111500`, "last block, clamped");
+  // (id repeats, so the order is made total: equal rows are whole duplicates)
+  const sorted = await ok({ cmd: "sortHandle", handle: h.handle, orderBy: "capacity desc, id, country" });
+  if (sorted.rows !== 111597) throw new Error(`sortHandle rows ${sorted.rows}`);
+  pg = await ok({ cmd: "page", handle: h.handle, start: 50000, end: 50512 });
+  await same(pg, `${base} order by capacity desc, id, country limit 512 offset 50000`, "sorted block");
+  pg = await ok({ cmd: "page", handle: h.handle, start: 50000, end: 50100, columns: ["capacity", "id"] });
+  await same(pg, `select capacity, id from t where capacity > 3 order by capacity desc, id, country limit 100 offset 50000`, "chosen columns");
+  // a refused sort leaves the order as it was
+  let bad = await send({ cmd: "sortHandle", handle: h.handle, orderBy: "nope" });
+  if (bad.ok || !bad.isQueryError || !/unknown column 'nope'/.test(bad.error)) throw new Error(`sortHandle error: ${JSON.stringify(bad)}`);
+  bad = await send({ cmd: "page", handle: h.handle, start: 0, end: 5, columns: ["nope"] });
+  if (bad.ok || !/no result column 'nope'/.test(bad.error)) throw new Error(`page column error: ${JSON.stringify(bad)}`);
+  pg = await ok({ cmd: "page", handle: h.handle, start: 50000, end: 50512 });
+  await same(pg, `${base} order by capacity desc, id, country limit 512 offset 50000`, "block after a refused sort");
+  // a grouped result is kept whole
+  const g = await ok({ cmd: "prepare", table: "t", sql: "select country, count(*) as n from t group by country order by n desc, country" });
+  if (g.rows !== 200 || g.kind !== "result") throw new Error(`prepare grouped ${JSON.stringify(g)}`);
+  pg = await ok({ cmd: "page", handle: g.handle, start: 190, end: 300 });
+  await same(pg, "select country, count(*) as n from t group by country order by n desc, country limit 10 offset 190", "grouped block");
+  await ok({ cmd: "sortHandle", handle: g.handle, orderBy: "country desc" });
+  pg = await ok({ cmd: "page", handle: g.handle, start: 0, end: 20 });
+  await same(pg, "select country, count(*) as n from t group by country order by country desc limit 20", "grouped block, sorted");
+  // closed: page and sort say so; closing twice is fine
+  await ok({ cmd: "closeHandle", handle: g.handle });
+  await ok({ cmd: "closeHandle", handle: g.handle });
+  for (const msg of [{ cmd: "page", handle: g.handle, start: 0, end: 5 }, { cmd: "sortHandle", handle: g.handle, orderBy: "n" }]) {
+    bad = await send(msg);
+    if (bad.ok || !/result handle \d+ is closed/.test(bad.error)) throw new Error(`closed handle: ${JSON.stringify(bad)}`);
+  }
+  // stale: the table's name is loaded again, so the handle's rows are not that table's
+  await ok({ cmd: "load", name: "again", buffer: toBuffer(image) });
+  const st = await ok({ cmd: "prepare", table: "again", sql: "select id from again where capacity > 290" });
+  const kept = await ok({ cmd: "prepare", table: "again", sql: "select count(*) as n from again" });
+  await ok({ cmd: "page", handle: st.handle, start: 0, end: 5 });
+  await ok({ cmd: "load", name: "again", buffer: toBuffer(image) });
+  for (const msg of [{ cmd: "page", handle: st.handle, start: 0, end: 5 }, { cmd: "sortHandle", handle: st.handle, orderBy: "id" }, { cmd: "page", handle: kept.handle, start: 0, end: 1 }]) {
+    bad = await send(msg);
+    if (bad.ok || !/result handle is stale: its table was replaced/.test(bad.error)) throw new Error(`stale handle: ${JSON.stringify(bad)}`);
+  }
+  // at most 8 stay open: the least recently used goes (h was used last of the three)
+  await ok({ cmd: "page", handle: h.handle, start: 0, end: 1 });
+  const more = [];
+  for (let i = 0; i < 6; i++) more.push(await ok({ cmd: "prepare", table: "t", sql: `select id from t where capacity > ${i}` }));
+  bad = await send({ cmd: "page", handle: st.handle, start: 0, end: 1 });
+  if (bad.ok || !/is closed \(closed, or evicted: at most 8 stay open\)/.test(bad.error)) throw new Error(`evicted handle: ${JSON.stringify(bad)}`);
+  await ok({ cmd: "page", handle: h.handle, start: 0, end: 1 });
+  for (const m of [h, ...more]) await ok({ cmd: "closeHandle", handle: m.handle });
+  // a statement that does not parse: no handle
+  bad = await send({ cmd: "prepare", table: "t", sql: "select contry from t" });
+  if (bad.ok || !bad.isQueryError || !/unknown column 'contry'/.test(bad.error)) throw new Error(`prepare error: ${JSON.stringify(bad)}`);
+}
+
 // errors come back as replies, with the query flag set for SQL errors
 let e = await send({ cmd: "query", table: "nope", sql: "select 1" });
 if (e.ok || !/no table loaded: 'nope'/.test(e.error)) throw new Error(`missing table: ${e.error}`);
 e = await send({ cmd: "query", sql: "select contry from t" });
 if (e.ok || !e.isQueryError || !/unknown column 'contry'/.test(e.error)) throw new Error(`query error: ${e.error}`);
 
-console.log("worker smoke: OK (load, query, materialize, join, loadCsv, dictText, registerFunction, errors)");
+console.log("worker smoke: OK (load, query, materialize, join, loadCsv, dictText, registerFunction, result handles, errors)");

@@ -630,6 +630,72 @@ export class Engine {
     return out;
   }
 
+  /** Run SQL and keep its result in the wasm for paging (docs/result-handles.sv):
+   *  the rows of a plain SELECT over the table as row ids (a u32 each; none
+   *  for an unfiltered, unsorted one), a grouped or joined result whole.
+   *  Returns { handle, rows, columns: [{ name, kind }], kind }, kind "rows"
+   *  or "result". Free with `preparedFree`. */
+  prepare(tableHandle, sql) {
+    const [p, n] = this._put(sql);
+    const h = this.w.prepared_run(tableHandle, p, n);
+    this.w.dealloc(p, n);
+    if (this.w.prepared_is_err(h)) {
+      const len = this.w.prepared_error(h, this.scratch, 4096);
+      const msg = this.dec.decode(new Uint8Array(this.mem(), this.scratch, len));
+      this.w.prepared_free(h);
+      throw new QueryError(msg);
+    }
+    const columns = [];
+    for (let i = 0, nc = this.w.prepared_cols(h); i < nc; i++) {
+      const len = this.w.prepared_col_name(h, i, this.scratch, 4096);
+      columns.push({
+        name: this.dec.decode(new Uint8Array(this.mem(), this.scratch, len)),
+        kind: KINDS[this.w.prepared_col_kind(h, i)],
+      });
+    }
+    return { handle: h, rows: this.w.prepared_rows(h), columns, kind: this.w.prepared_kind(h) ? "rows" : "result" };
+  }
+
+  /** Rows start..end (end exclusive, clamped to the result) of a prepared
+   *  result, in the form `query` returns. `columns`: the result columns
+   *  wanted, by name, in that order (default all). `dictText` as in `query`;
+   *  a page's dictionary holds the values that page uses. */
+  preparedPage(h, start, end, { columns, dictText = false } = {}) {
+    if (dictText !== false && dictText !== true && dictText !== "all") throw new Error(`dictText: expected true, false or "all", got ${JSON.stringify(dictText)}`);
+    if (!(Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end >= start)) {
+      throw new Error(`page: expected 0 <= start <= end, got ${start}, ${end}`);
+    }
+    const [p, n] = this._put(columns ? columns.join("\0") : "");
+    const flags = dictText === "all" ? 3 : dictText ? 1 : 0;
+    const o = this.w.prepared_page(h, Math.min(start, 0xffffffff), Math.min(end, 0xffffffff), p, n, columns ? 0 : 1, flags);
+    this.w.dealloc(p, n);
+    return this._readOutcome(o);
+  }
+
+  /** Re-order a prepared result: `orderBy` is the text after ORDER BY ("" for
+   *  none). Rows of the table are re-sorted reading the key columns only,
+   *  ties in table order; a kept result runs again. Returns the row count.
+   *  Throws a QueryError, leaving the result as it was, when it cannot. */
+  preparedSort(h, orderBy) {
+    const [p, n] = this._put(String(orderBy ?? ""));
+    const err = this.w.prepared_sort(h, p, n);
+    this.w.dealloc(p, n);
+    if (err) this._readOutcome(err); // throws its message, and frees it
+    return this.w.prepared_rows(h);
+  }
+
+  preparedFree(h) {
+    this.w.prepared_free(h);
+  }
+
+  /** A string's UTF-8 bytes in wasm memory: [pointer, length] (dealloc after). */
+  _put(text) {
+    const bytes = this.enc.encode(text);
+    const p = u32(this.w.alloc(bytes.byteLength));
+    new Uint8Array(this.mem(), p, bytes.byteLength).set(bytes);
+    return [p, bytes.byteLength];
+  }
+
   /** Copy an outcome's columns out of wasm memory and free it. */
   _readOutcome(h) {
     try {

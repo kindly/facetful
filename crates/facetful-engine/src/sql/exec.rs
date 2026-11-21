@@ -31,6 +31,7 @@ mod plain;
 mod sort;
 mod topk;
 mod batch;
+mod rowset;
 #[cfg(feature = "search")]
 mod search;
 use vector::*;
@@ -42,6 +43,7 @@ use output::*;
 use filter::*;
 use grouping::*;
 pub use value::{compact_dict, OutCol, QueryResult, Val};
+pub use rowset::{slice_result, RowSet};
 
 /// Fused execution of a family of facet-shaped statements (design.sv d59):
 /// classify each bound query, run the fusable ones together with shared
@@ -91,6 +93,13 @@ fn collect_aggs(b: &Bound, out: &mut Vec<Bound>) {
         }
         _ => {}
     }
+}
+
+/// Whether `b` calls an aggregate anywhere.
+pub fn has_aggregate(b: &Bound) -> bool {
+    let mut aggs = Vec::new();
+    collect_aggs(b, &mut aggs);
+    !aggs.is_empty()
 }
 
 fn collect_columns(b: &Bound, out: &mut Vec<usize>) {

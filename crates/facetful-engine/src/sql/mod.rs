@@ -239,34 +239,8 @@ fn exec_query<S: ReadAt>(
     scope: &Scope,
     cat: &mut dyn Catalog<S>,
 ) -> Result<(binder::BoundQuery, exec::QueryResult), Diagnostic> {
-    let mut scope: Vec<(String, String)> = scope.to_vec();
-    for cte in &q.with {
-        let key = derive(table, &cte.query, cte.body_span, src, &scope, cat)?;
-        scope.push((cte.name.clone(), key));
-    }
-    let mut target = match &q.from_subquery {
-        Some(sub) => Target::Derived(derive(table, sub, q.from_span, src, &scope, cat)?),
-        None => resolve_name(&q.from, &scope, cat),
-    };
-    // `IN (select …)` in WHERE becomes a synthetic LEFT JOIN + IS [NOT] NULL
-    let expanded = expand_in_subqueries(table, q, src, &mut scope, cat)?;
-    let q = expanded.as_ref().unwrap_or(q);
-    let rewritten;
-    let unqualified;
-    let q = if q.joins.is_empty() {
-        match strip_own_alias(q) {
-            Some(u) => {
-                unqualified = u;
-                &unqualified
-            }
-            None => q,
-        }
-    } else {
-        let (t, rq) = resolve_joins(table, q, src, &scope, cat, target)?;
-        target = t;
-        rewritten = rq;
-        &rewritten
-    };
+    let (target, q) = resolve(table, q, src, scope, cat)?;
+    let q = &q;
     let exec_err = |e: crate::format::FormatError| {
         Diagnostic::new(format!("execution error: {e}"), span::Span::new(0, 0))
     };
@@ -289,6 +263,213 @@ fn exec_query<S: ReadAt>(
             run(table.derived_table(&key).expect("a derived table was just materialized or found"))
         }
         Target::Catalog(name) => run(cat.table(&name).expect("resolved a moment ago").0),
+    }
+}
+
+/// What `q` reads once its `WITH`, `FROM (subquery)`, `IN (select …)` and
+/// `JOIN`s are materialized, and the query to bind and run against that.
+fn resolve<S: ReadAt>(
+    table: &mut Table<S>,
+    q: &ast::Query,
+    src: &str,
+    scope: &Scope,
+    cat: &mut dyn Catalog<S>,
+) -> Result<(Target, ast::Query), Diagnostic> {
+    let mut scope: Vec<(String, String)> = scope.to_vec();
+    for cte in &q.with {
+        let key = derive(table, &cte.query, cte.body_span, src, &scope, cat)?;
+        scope.push((cte.name.clone(), key));
+    }
+    let target = match &q.from_subquery {
+        Some(sub) => Target::Derived(derive(table, sub, q.from_span, src, &scope, cat)?),
+        None => resolve_name(&q.from, &scope, cat),
+    };
+    // `IN (select …)` in WHERE becomes a synthetic LEFT JOIN + IS [NOT] NULL
+    let expanded = expand_in_subqueries(table, q, src, &mut scope, cat)?;
+    let q = expanded.as_ref().unwrap_or(q);
+    if q.joins.is_empty() {
+        Ok((target, strip_own_alias(q).unwrap_or_else(|| q.clone())))
+    } else {
+        resolve_joins(table, q, src, &scope, cat, target)
+    }
+}
+
+/// A query's result retained for paging (docs/result-handles.sv): a grid
+/// asks for blocks of rows and re-sorts without the result ever being built
+/// whole.
+pub struct Prepared {
+    src: String,
+    /// `src[..tail]` is the statement up to its ORDER BY; its LIMIT/OFFSET
+    tail: usize,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    columns: Vec<String>,
+    col_types: Vec<binder::Ty>,
+    kind: PreparedKind,
+}
+
+enum PreparedKind {
+    /// a plain SELECT over the table itself: its rows as ids, gathered and
+    /// evaluated a page at a time
+    Rows { query: ast::Query, bound: binder::BoundQuery, set: exec::RowSet },
+    /// anything else (grouped, joined, from a derived or another table): not
+    /// rows of the table, so the computed result, sliced
+    Kept(exec::QueryResult),
+}
+
+/// Run `src` and retain its result: `page` then gives any block of its rows.
+pub fn prepare_with<S: ReadAt>(table: &mut Table<S>, src: &str, cat: &mut dyn Catalog<S>) -> Result<Prepared, Diagnostic> {
+    let parsed = parse_query(src)?;
+    let kind = prepare_kind(table, &parsed, src, None, cat)?;
+    let (columns, col_types) = match &kind {
+        PreparedKind::Rows { bound, .. } => {
+            (bound.select.iter().map(|s| s.name.clone()).collect(), bound.select.iter().map(|s| s.expr.ty()).collect())
+        }
+        PreparedKind::Kept(r) => (r.columns.clone(), r.col_types.clone()),
+    };
+    Ok(Prepared { src: src.to_string(), tail: parsed.tail, limit: parsed.limit, offset: parsed.offset, columns, col_types, kind })
+}
+
+/// `prepare_with` over the table alone.
+pub fn prepare<S: ReadAt>(table: &mut Table<S>, src: &str) -> Result<Prepared, Diagnostic> {
+    prepare_with(table, src, &mut NoCatalog)
+}
+
+/// Retain `parsed`'s result. `seed`: the rows and resolved query of the same
+/// statement under another ORDER BY, so its WHERE is not evaluated again.
+fn prepare_kind<S: ReadAt>(
+    table: &mut Table<S>,
+    parsed: &ast::Query,
+    src: &str,
+    seed: Option<(&ast::Query, &exec::RowSet)>,
+    cat: &mut dyn Catalog<S>,
+) -> Result<PreparedKind, Diagnostic> {
+    let exec_err = |e: crate::format::FormatError| Diagnostic::new(format!("execution error: {e}"), span::Span::new(0, 0));
+    let resolved = match seed {
+        // the statement resolved to the table itself before: only its ORDER BY is new
+        Some((q, _)) => {
+            let q = ast::Query { order_by: parsed.order_by.clone(), ..q.clone() };
+            Some(strip_own_alias(&q).unwrap_or(q))
+        }
+        None => match resolve(table, parsed, src, &[], cat)? {
+            (Target::Base, q) => Some(q),
+            _ => None,
+        },
+    };
+    if let Some(query) = resolved {
+        let schema = table.catalog().schema.clone();
+        let bound = binder::Binder::new(&schema).bind_query(&query)?;
+        // (the binder does not look for aggregates in ORDER BY)
+        if seed.is_some() && (bound.is_aggregate || bound.order_by.iter().any(|(e, _)| exec::has_aggregate(e))) {
+            return Err(Diagnostic::new("a retained result of rows cannot be sorted by an aggregate", parsed.span));
+        }
+        if !bound.is_aggregate {
+            crate::udf::take_error();
+            let set = exec::RowSet::build(table, &bound, seed.map(|s| s.1)).map_err(exec_err)?;
+            if let Some(e) = crate::udf::take_error() {
+                table.masks().clear();
+                return Err(Diagnostic::new(format!("user-defined function failed: {e}"), parsed.span));
+            }
+            return Ok(PreparedKind::Rows { query, bound, set });
+        }
+    }
+    let (_, r) = exec_query(table, parsed, src, &[], cat)?;
+    Ok(PreparedKind::Kept(r))
+}
+
+impl Prepared {
+    /// Rows in the result.
+    pub fn rows(&self) -> usize {
+        match &self.kind {
+            PreparedKind::Rows { bound, set, .. } => set.len(bound),
+            PreparedKind::Kept(r) => if r.cols.is_some() { r.out_rows } else { r.rows.len() },
+        }
+    }
+
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    pub fn col_types(&self) -> &[binder::Ty] {
+        &self.col_types
+    }
+
+    /// Whether the result is rows of the table, gathered a page at a time
+    /// (false: a computed result kept whole).
+    pub fn is_rows(&self) -> bool {
+        matches!(self.kind, PreparedKind::Rows { .. })
+    }
+
+    /// Whether row ids are held for it (not for an unfiltered, unsorted
+    /// SELECT, nor a kept result).
+    pub fn has_row_ids(&self) -> bool {
+        matches!(&self.kind, PreparedKind::Rows { set, .. } if set.has_ids())
+    }
+
+    /// Rows `start..end` (clamped to the result) of the named columns, or of
+    /// every column: the rows the statement itself gives there. `table` is
+    /// the table it was prepared on.
+    pub fn page<S: ReadAt>(
+        &self,
+        table: &mut Table<S>,
+        start: usize,
+        end: usize,
+        columns: Option<&[&str]>,
+    ) -> Result<exec::QueryResult, String> {
+        let which: Vec<usize> = match columns {
+            None => (0..self.columns.len()).collect(),
+            Some(names) => names
+                .iter()
+                .map(|n| self.columns.iter().position(|c| c == n).ok_or_else(|| format!("page: no result column '{n}'")))
+                .collect::<Result<_, _>>()?,
+        };
+        match &self.kind {
+            PreparedKind::Kept(r) => Ok(exec::slice_result(r, &which, start, end)),
+            PreparedKind::Rows { bound, set, .. } => {
+                crate::udf::take_error();
+                let r = set.page(table, bound, &which, start, end).map_err(|e| format!("execution error: {e}"))?;
+                match crate::udf::take_error() {
+                    Some(e) => Err(format!("user-defined function failed: {e}")),
+                    None => Ok(r),
+                }
+            }
+        }
+    }
+
+    /// Re-order the result: what the statement gives with `order_by` (the
+    /// text after ORDER BY; empty for none) in place of its own, under the
+    /// same LIMIT/OFFSET. Rows of the table are re-sorted by reading the key
+    /// columns only, ties in table order; a kept result runs again. On an
+    /// error (rendered) the result is as it was.
+    pub fn sort<S: ReadAt>(&mut self, table: &mut Table<S>, order_by: &str, cat: &mut dyn Catalog<S>) -> Result<(), String> {
+        let mut src = self.src[..self.tail].trim_end().to_string();
+        if !order_by.trim().is_empty() {
+            src.push_str(" order by ");
+            src.push_str(order_by.trim());
+        }
+        if let Some(l) = self.limit {
+            src.push_str(&format!(" limit {l}"));
+        }
+        if let Some(o) = self.offset {
+            src.push_str(&format!(" offset {o}"));
+        }
+        let kind = parse_query(&src).and_then(|parsed| {
+            if parsed.limit != self.limit || parsed.offset != self.offset {
+                return Err(Diagnostic::new("sort takes the text after ORDER BY: expressions, each with an optional ASC or DESC", parsed.span));
+            }
+            let seed = match &self.kind {
+                PreparedKind::Rows { query, set, .. } => Some((query, set)),
+                PreparedKind::Kept(_) => None,
+            };
+            prepare_kind(table, &parsed, &src, seed, cat)
+        });
+        match kind {
+            Ok(kind) => {
+                self.kind = kind;
+                Ok(())
+            }
+            Err(d) => Err(d.render(&src)),
+        }
     }
 }
 

@@ -183,7 +183,7 @@ fn with_texts<S: ReadAt, R>(
 /// A plain-text column for `refs`, gathered straight off the image: one pass
 /// for lengths and validity, one to copy the bytes into place. Nothing but
 /// the output is allocated.
-fn gather_segments<S: ReadAt>(
+pub(super) fn gather_segments<S: ReadAt>(
     table: &mut Table<S>,
     col: usize,
     refs: &[(u32, u32)],

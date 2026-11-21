@@ -13,6 +13,20 @@ const tables = new Map(); // name -> handle
 const setTable = (name, handle) => { tables.set(name, handle); engine.catalogRegister(name, handle); };
 let lastTable = null;
 
+// Retained results (prepare): id -> { h }, least recently used first.
+// A handle the page forgot to close is evicted once more than MAX_HANDLES
+// are open, so its row ids (4 bytes a row) or kept result are freed.
+const handles = new Map();
+let nextHandle = 1;
+const MAX_HANDLES = 8;
+function useHandle(id) {
+  const e = handles.get(id);
+  if (!e) throw new Error(`result handle ${id} is closed (closed, or evicted: at most ${MAX_HANDLES} stay open)`);
+  handles.delete(id);
+  handles.set(id, e); // most recently used last
+  return e;
+}
+
 // OPFS file registry: the wasm's opfs_read import addresses files by these ids.
 const opfsFiles = new Map(); // fileId -> { handle: FileSystemSyncAccessHandle, path }
 let nextFileId = 1;
@@ -482,6 +496,38 @@ self.onmessage = async (e) => {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
       reply({ ok: true, ...engine.cacheStats(handle) });
+    } else if (cmd === "prepare") {
+      const table = e.data.table ? tables.get(e.data.table) : lastTable;
+      if (!table) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
+      const t0 = performance.now();
+      const { handle: h, rows, columns, kind } = engine.prepare(table, e.data.sql);
+      const elapsedMs = performance.now() - t0;
+      for (const [id, old] of handles) {
+        if (handles.size < MAX_HANDLES) break;
+        engine.preparedFree(old.h);
+        handles.delete(id);
+      }
+      const handle = nextHandle++;
+      handles.set(handle, { h });
+      reply({ ok: true, handle, rows, columns, kind, elapsedMs });
+    } else if (cmd === "page") {
+      const { h } = useHandle(e.data.handle);
+      const t0 = performance.now();
+      const result = engine.preparedPage(h, e.data.start, e.data.end, { columns: e.data.columns, dictText: e.data.dictText ?? false });
+      result.elapsedMs = performance.now() - t0;
+      reply({ ok: true, result }, transferables(result));
+    } else if (cmd === "sortHandle") {
+      const { h } = useHandle(e.data.handle);
+      const t0 = performance.now();
+      const rows = engine.preparedSort(h, e.data.orderBy);
+      reply({ ok: true, rows, elapsedMs: performance.now() - t0 });
+    } else if (cmd === "closeHandle") {
+      const entry = handles.get(e.data.handle);
+      if (entry) {
+        engine.preparedFree(entry.h);
+        handles.delete(e.data.handle);
+      }
+      reply({ ok: true });
     } else if (cmd === "queryBatch") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);

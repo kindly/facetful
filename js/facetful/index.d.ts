@@ -337,8 +337,72 @@ export declare class Facetful {
    */
   query(sqls: string[], options?: { table?: string; dictText?: boolean | "all" }): Promise<Result[]>;
 
+  /**
+   * Run SQL and keep its result in the worker, for a grid over a result of
+   * millions of rows: `page(start, end)` returns any block of it and
+   * `sort(orderBy)` re-orders it, so neither the first query nor a sort
+   * copies every column to this thread. In the lite build too.
+   *
+   * A plain SELECT over the table (any WHERE, ORDER BY, LIMIT/OFFSET,
+   * expressions, `search()`, `search_rank()`) keeps only its row ids, 4
+   * bytes a row, and none when it has no WHERE and no ORDER BY; each page is
+   * gathered from the table and its expressions run on that page's rows
+   * (`kind: "rows"`). A grouped or joined result is not rows of the table:
+   * it is computed once and kept whole in the worker (`kind: "result"`).
+   *
+   * The rows are fixed when this resolves. At most 8 handles stay open in
+   * the worker (the least recently used is closed beyond that), and a
+   * handle whose table was loaded again under the same name rejects.
+   * `dictText` is the default for the handle's pages.
+   */
+  prepare(sql: string, options?: { table?: string; dictText?: boolean | "all" }): Promise<ResultHandle>;
+
   /** Terminate the worker. */
   close(): void;
+}
+
+/** A block of a retained result: a Result plus where it sits. */
+export interface Page extends Result {
+  /** the `start` asked for */
+  start: number;
+  /** the handle's `generation` when the page was asked for */
+  generation: number;
+}
+
+/** A result kept in the worker; see `Facetful.prepare`. */
+export declare class ResultHandle {
+  /** Rows in the result. */
+  rows: number;
+  columns: { name: string; kind: ColumnKind }[];
+  /** "rows": rows of the table, gathered a page at a time. "result": a
+   *  grouped or joined result, kept whole in the worker. */
+  kind: "rows" | "result";
+  /** Time `prepare` took inside the worker, ms. */
+  elapsedMs: number;
+  /** Counts the `sort()` calls. A page carries the value it was asked
+   *  under: one older than this shows the order before the last sort (it
+   *  matches the `generation` a facetful-grid `need()` passes on). */
+  generation: number;
+  closed: boolean;
+  /**
+   * Rows `start..end` (end exclusive, clamped to the result) in the form
+   * `query` returns: the same rows the statement gives with
+   * `LIMIT end - start OFFSET start`. `columns` picks result columns by
+   * name, in that order. With `dictText` a page's dictionary holds the
+   * values that page uses, so codes are not comparable between pages.
+   */
+  page(start: number, end: number, options?: { columns?: string[]; dictText?: boolean | "all" }): Promise<Page>;
+  /**
+   * Re-order by `orderBy`, the text after ORDER BY (`'"Amount" desc, "Title"'`;
+   * `""` for no ORDER BY): the statement's result with that ORDER BY in place
+   * of its own, same LIMIT/OFFSET. Rows of the table are re-sorted by reading
+   * only the key columns, without running the WHERE again, and rows with
+   * equal keys stay in table order; a kept result runs again. Rejects, and
+   * keeps the old order, when `orderBy` does not bind.
+   */
+  sort(orderBy: string): Promise<{ rows: number; generation: number; elapsedMs: number }>;
+  /** Free the result in the worker. `page` and `sort` reject afterwards. */
+  close(): Promise<void>;
 }
 
 /** What `searchSuggest` offers for a query typed so far. */

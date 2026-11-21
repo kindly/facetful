@@ -84,6 +84,31 @@ console.log(r.elapsedMs, r.stats); // ms in worker, row groups pruned
 The SQL table is always named `t`. Multiple tables coexist:
 `db.query(sql, { table: "plants" })`.
 
+## Big results in a grid: `prepare`
+
+`query()` copies the whole result to the page. For a grid that shows a few
+hundred rows of a result of millions, keep the result in the worker and ask
+for blocks:
+
+```js
+const h = await db.prepare(`select * from t where status = 'operating'`, { dictText: true });
+h.rows;                                  // row count; h.columns: [{ name, kind }]
+const page = await h.page(1024, 1536);   // rows 1024..1535 as a Result (columnRaw, rows(), …)
+await h.sort("mw desc, country");        // the text after ORDER BY; "" for none
+await h.page(0, 512, { columns: ["country", "mw"] });
+await h.close();
+```
+
+For a plain SELECT over the table the worker keeps 4 bytes a row (nothing for
+an unfiltered, unsorted one) and gathers each page from the table, so a
+sorted block of 512 rows of every column takes 2 to 4 ms on a 1.5M-row
+table, and a sort reads only its key columns. `search()` and `search_rank()`
+work. Rows with equal sort keys stay in table order. Grouped and joined
+results are kept whole in the worker and sliced. `h.generation` counts
+sorts, and each page carries the value it was asked under, so a late page
+from before a sort can be dropped. At most 8 handles stay open. It is in the
+lite build too. Design and measurements: `docs/result-handles.sv`.
+
 ## The ways in
 
 | method | use when |

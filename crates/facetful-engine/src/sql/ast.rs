@@ -152,4 +152,7 @@ pub struct Query {
     pub order_by: Vec<OrderItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// where ORDER BY starts in the text (LIMIT without one, else the end):
+    /// what a retained result's `sort` replaces
+    pub tail: usize,
 }

@@ -288,8 +288,70 @@ export class Facetful {
     return new Result(result);
   }
 
+  /**
+   * Run SQL and keep its result in the worker, for a grid that shows a few
+   * hundred rows of a result of millions: `page(start, end)` gives any block
+   * of rows, `sort(orderBy)` re-orders it, and nothing else crosses to this
+   * thread. For a plain SELECT over the table the worker keeps only the row
+   * ids (4 bytes a row; nothing for an unfiltered, unsorted SELECT) and
+   * gathers each page from the table; a grouped or joined result is kept
+   * whole. `dictText` is the default for its pages. See ResultHandle.
+   */
+  async prepare(sql, { table, dictText } = {}) {
+    const { handle, rows, columns, kind, elapsedMs } = await this._call({ cmd: "prepare", sql, table });
+    return new ResultHandle(this, { handle, rows, columns, kind, elapsedMs, dictText });
+  }
+
   close() {
     this._worker.terminate();
+  }
+}
+
+/** A result kept in the worker (`Facetful.prepare`). */
+export class ResultHandle {
+  constructor(db, { handle, rows, columns, kind, elapsedMs, dictText }) {
+    this._db = db;
+    this._handle = handle;
+    this._dictText = dictText;
+    this.rows = rows;
+    this.columns = columns;
+    this.kind = kind;
+    this.elapsedMs = elapsedMs;
+    this.generation = 0;
+    this.closed = false;
+  }
+
+  /** Rows start..end (end exclusive; clamped to the result) as a Result,
+   *  with `start` and the handle's `generation` when it was asked for: a
+   *  page that comes back with an older generation than the handle's was
+   *  asked for before a `sort()` and shows the old order. `columns` picks
+   *  result columns by name, in that order (default all). */
+  async page(start, end, { columns, dictText = this._dictText } = {}) {
+    const generation = this.generation;
+    const { result } = await this._db._call({ cmd: "page", handle: this._handle, start, end, columns, dictText });
+    const r = new Result(result);
+    r.start = start;
+    r.generation = generation;
+    return r;
+  }
+
+  /** Re-order the result by `orderBy`, the text after ORDER BY ("" for the
+   *  statement without one): what the statement would give with that ORDER
+   *  BY in place of its own, under the same LIMIT/OFFSET. `generation`
+   *  moves on at once; pages asked for from now on have the new order. When
+   *  it is refused (a name that is no column) the order stays as it was. */
+  async sort(orderBy) {
+    const generation = ++this.generation;
+    const { rows, elapsedMs } = await this._db._call({ cmd: "sortHandle", handle: this._handle, orderBy: orderBy ?? "" });
+    this.rows = rows;
+    return { rows, generation, elapsedMs };
+  }
+
+  /** Free the result in the worker. `page` and `sort` reject afterwards. */
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    await this._db._call({ cmd: "closeHandle", handle: this._handle });
   }
 }
 

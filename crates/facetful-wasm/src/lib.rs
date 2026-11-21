@@ -1261,6 +1261,164 @@ pub extern "C" fn outcome_free(h: usize) {
     drop(unsafe { Box::from_raw(h as *mut Outcome) });
 }
 
+// ---------------- retained results (docs/result-handles.sv) ----------------
+//
+// `prepared_run` runs a statement and keeps its result in here: the rows of
+// a plain SELECT as row ids, anything else whole. `prepared_page` gives a
+// block of it as an ordinary outcome (read with the `col_*` getters), and
+// `prepared_sort` re-orders it. JS frees it with `prepared_free`.
+
+pub struct PreparedH {
+    p: facetful_engine::sql::Prepared,
+    table: usize,
+    /// the table's catalog registrations when prepared (empty: not registered)
+    ids: Vec<u64>,
+}
+
+type PreparedOutcome = Result<PreparedH, String>;
+
+fn prepared(h: usize) -> &'static mut PreparedOutcome {
+    unsafe { &mut *(h as *mut PreparedOutcome) }
+}
+
+/// The table behind a handle, unless it has been replaced: every name it was
+/// loaded under now means another table, so its rows are no longer what a
+/// query over that name gives.
+fn prepared_table(h: &PreparedH) -> Result<&'static mut T, String> {
+    let cat = unsafe { &*core::ptr::addr_of!(CATALOG) };
+    if !h.ids.is_empty() && !cat.iter().any(|(_, t, id)| *t == h.table && h.ids.contains(id)) {
+        return Err("result handle is stale: its table was replaced; prepare the statement again".into());
+    }
+    Ok(unsafe { &mut *(h.table as *mut T) })
+}
+
+#[no_mangle]
+pub extern "C" fn prepared_run(t: usize, sql_ptr: *const u8, sql_len: usize) -> usize {
+    let table = unsafe { &mut *(t as *mut T) };
+    let sql = unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) };
+    let out: PreparedOutcome = match core::str::from_utf8(sql) {
+        Err(_) => Err("query is not valid UTF-8".into()),
+        Ok(sql) => match facetful_engine::sql::prepare_with(table, sql, &mut WasmCatalog { base: t }) {
+            Ok(p) => {
+                let cat = unsafe { &*core::ptr::addr_of!(CATALOG) };
+                let ids = cat.iter().filter(|(_, h, _)| *h == t).map(|(_, _, id)| *id).collect();
+                Ok(PreparedH { p, table: t, ids })
+            }
+            Err(d) => Err(d.render(sql)),
+        },
+    };
+    Box::into_raw(Box::new(out)) as usize
+}
+
+#[no_mangle]
+pub extern "C" fn prepared_is_err(h: usize) -> u32 {
+    prepared(h).is_err() as u32
+}
+
+/// Copy the rendered error into out (cap bytes); returns byte length.
+#[no_mangle]
+pub extern "C" fn prepared_error(h: usize, out: *mut u8, cap: usize) -> u32 {
+    let Err(e) = prepared(h) else { return 0 };
+    let b = e.as_bytes();
+    let n = b.len().min(cap);
+    unsafe { core::slice::from_raw_parts_mut(out, n) }.copy_from_slice(&b[..n]);
+    n as u32
+}
+
+#[no_mangle]
+pub extern "C" fn prepared_rows(h: usize) -> u32 {
+    prepared(h).as_ref().map_or(0, |h| h.p.rows() as u32)
+}
+
+/// 2: rows of the table with row ids held; 1: rows of the table in table
+/// order (no ids); 0: a computed result kept whole.
+#[no_mangle]
+pub extern "C" fn prepared_kind(h: usize) -> u32 {
+    prepared(h).as_ref().map_or(0, |h| h.p.is_rows() as u32 + h.p.has_row_ids() as u32)
+}
+
+#[no_mangle]
+pub extern "C" fn prepared_cols(h: usize) -> u32 {
+    prepared(h).as_ref().map_or(0, |h| h.p.columns().len() as u32)
+}
+
+#[no_mangle]
+pub extern "C" fn prepared_col_name(h: usize, i: usize, out: *mut u8, cap: usize) -> u32 {
+    let Some(name) = prepared(h).as_ref().ok().and_then(|h| h.p.columns().get(i)) else { return 0 };
+    let b = name.as_bytes();
+    let n = b.len().min(cap);
+    unsafe { core::slice::from_raw_parts_mut(out, n) }.copy_from_slice(&b[..n]);
+    n as u32
+}
+
+/// A column's kind as `col_kind` gives it (a NULL-literal column, whose
+/// pages take their kind from their values, says float).
+#[no_mangle]
+pub extern "C" fn prepared_col_kind(h: usize, i: usize) -> u32 {
+    use facetful_engine::sql::binder::Ty;
+    match prepared(h).as_ref().ok().and_then(|h| h.p.col_types().get(i)) {
+        Some(Ty::Int) => 1,
+        Some(Ty::Float | Ty::Null) => 2,
+        Some(Ty::Bool) => 3,
+        Some(Ty::Text) => 4,
+        Some(Ty::Date) => 5,
+        Some(Ty::Timestamp) => 6,
+        None => 0,
+    }
+}
+
+/// Rows `start..end` (clamped) as an outcome handle, read and freed like a
+/// query's. `cols_ptr..cols_len`: the columns wanted, names separated by
+/// NUL, in that order (`all_cols` != 0: every column). `flags` as
+/// `query_run_opts` takes them.
+#[no_mangle]
+pub extern "C" fn prepared_page(
+    h: usize,
+    start: u32,
+    end: u32,
+    cols_ptr: *const u8,
+    cols_len: usize,
+    all_cols: u32,
+    flags: u32,
+) -> usize {
+    let run = || -> Result<Outcome, String> {
+        let h = prepared(h).as_ref().map_err(|e| e.clone())?;
+        let table = prepared_table(h)?;
+        let names = core::str::from_utf8(unsafe { core::slice::from_raw_parts(cols_ptr, cols_len) })
+            .map_err(|_| "column names are not valid UTF-8".to_string())?;
+        let names: Vec<&str> = if cols_len == 0 { Vec::new() } else { names.split('\0').collect() };
+        let r = h.p.page(table, start as usize, end as usize, (all_cols == 0).then_some(names.as_slice()))?;
+        let (sg, tg) = (r.scanned_groups as u32, r.total_groups as u32);
+        Ok(match columnize(r, flags & 1 != 0, flags & 2 != 0) {
+            Outcome::Ok { cols, rows, .. } => Outcome::Ok { cols, rows, scanned: sg, total: tg },
+            e => e,
+        })
+    };
+    Box::into_raw(Box::new(run().unwrap_or_else(Outcome::Err))) as usize
+}
+
+/// Re-order the result by `order` (the text after ORDER BY; empty: none).
+/// Returns 0, or an error outcome handle (the result is then as it was).
+#[no_mangle]
+pub extern "C" fn prepared_sort(h: usize, order_ptr: *const u8, order_len: usize) -> usize {
+    let run = || -> Result<(), String> {
+        let h = prepared(h).as_mut().map_err(|e| e.clone())?;
+        let table = prepared_table(h)?;
+        let order = core::str::from_utf8(unsafe { core::slice::from_raw_parts(order_ptr, order_len) })
+            .map_err(|_| "ORDER BY is not valid UTF-8".to_string())?;
+        h.p.sort(table, order, &mut WasmCatalog { base: h.table })
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(e) => Box::into_raw(Box::new(Outcome::Err(e))) as usize,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn prepared_free(h: usize) {
+    drop(unsafe { Box::from_raw(h as *mut PreparedOutcome) });
+}
+
 // ---------------- baseline compiler (Parquet transcode path) ----------------
 
 #[cfg(feature = "write")]

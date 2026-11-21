@@ -42,72 +42,80 @@ impl FullSort {
 
     pub(super) fn finish<S: ReadAt>(self, table: &mut Table<S>, sh: &Shared) -> Result<QueryResult, FormatError> {
         let q = sh.q;
-        let groups = &self.groups;
-        // flatten refs: (group slot, row)
-        let total: usize = groups.iter().map(|(_, k)| k.len()).sum();
-        let mut refs: Vec<(u32, u32)> = Vec::with_capacity(total);
-        for (gslot, (_, kept_rows)) in groups.iter().enumerate() {
-            for &r in kept_rows {
-                refs.push((gslot as u32, r));
-            }
-        }
-        let numeric_keys = sh
-            .ord_tys
-            .iter()
-            .all(|t| matches!(t, Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp));
-        let nk = q.order_by.len();
-
-        let order_refs: Vec<(u32, u32)> = if numeric_keys && nk == 1 {
-            let (_, dir) = &q.order_by[0];
-            let desc = *dir == SortDir::Desc;
-            let ty = sh.ord_tys[0];
-            // payload = index into refs, keeping the element at 16 bytes
-            let mut keyed: Vec<(u8, u64, u32)> = refs
-                .iter()
-                .enumerate()
-                .map(|(i, &(g, r))| {
-                    let (v, k) = encode_order(&groups[g as usize].0[0], r as usize, ty, desc);
-                    (v, k, i as u32)
-                })
-                .collect();
-            sort_keyed2(&mut keyed);
-            keyed.into_iter().map(|t| refs[t.2 as usize]).collect()
-        } else if numeric_keys {
-            let mut flat: Vec<(u8, u64)> = Vec::with_capacity(refs.len() * nk);
-            for &(g, r) in &refs {
-                for (ki, (_, dir)) in q.order_by.iter().enumerate() {
-                    flat.push(encode_order(
-                        &groups[g as usize].0[ki],
-                        r as usize,
-                        sh.ord_tys[ki],
-                        *dir == SortDir::Desc,
-                    ));
-                }
-            }
-            let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
-            sort_perm_packed(&mut perm, &flat, nk);
-            perm.into_iter().map(|p| refs[p as usize]).collect()
-        } else {
-            // text keys: materialize the (small) key tuples, sort refs by them
-            let keys: Vec<Vec<Val>> = refs
-                .iter()
-                .map(|&(g, r)| {
-                    groups[g as usize]
-                        .0
-                        .iter()
-                        .zip(&sh.ord_tys)
-                        .map(|(v, t)| v.val_at(r as usize, *t))
-                        .collect()
-                })
-                .collect();
-            let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
-            sort_perm_keys(&mut perm, &keys, &q.order_by);
-            perm.into_iter().map(|p| refs[p as usize]).collect()
-        };
+        let order_refs = sort_refs(&self.groups, &q.order_by, &sh.ord_tys, false);
 
         let (offset, limit) = sh.window();
         let final_refs: Vec<(u32, u32)> = order_refs.into_iter().skip(offset).take(limit).collect();
         let cols = project(table, q, &sh.sel_tys, &self.srcs, &final_refs, &self.gids, self.ctxs.as_deref())?;
         Ok(sh.result(table, Vec::new(), Some(cols), final_refs.len()))
+    }
+}
+
+/// The kept rows of every scanned group as (group slot, row) refs, in ORDER
+/// BY order. `groups[slot]` = that group's ORDER BY lanes and kept rows.
+/// With `by_row`, equal keys keep slot-then-row order (a retained result's
+/// sort is then the same whatever order its rows were in before); without,
+/// numeric ties fall where the unstable sort leaves them, which is faster.
+pub(super) fn sort_refs(
+    groups: &[(Vec<VV>, Vec<u32>)],
+    order_by: &[(Bound, SortDir)],
+    ord_tys: &[Ty],
+    by_row: bool,
+) -> Vec<(u32, u32)> {
+    // flatten refs: (group slot, row)
+    let total: usize = groups.iter().map(|(_, k)| k.len()).sum();
+    let mut refs: Vec<(u32, u32)> = Vec::with_capacity(total);
+    for (gslot, (_, kept_rows)) in groups.iter().enumerate() {
+        for &r in kept_rows {
+            refs.push((gslot as u32, r));
+        }
+    }
+    let numeric_keys = ord_tys.iter().all(|t| matches!(t, Ty::Int | Ty::Float | Ty::Date | Ty::Timestamp));
+    let nk = order_by.len();
+
+    if numeric_keys && nk == 1 {
+        let (_, dir) = &order_by[0];
+        let desc = *dir == SortDir::Desc;
+        let ty = ord_tys[0];
+        // payload = index into refs, keeping the element at 16 bytes
+        let mut keyed: Vec<(u8, u64, u32)> = refs
+            .iter()
+            .enumerate()
+            .map(|(i, &(g, r))| {
+                let (v, k) = encode_order(&groups[g as usize].0[0], r as usize, ty, desc);
+                (v, k, i as u32)
+            })
+            .collect();
+        if by_row {
+            sort_keyed3(&mut keyed);
+        } else {
+            sort_keyed2(&mut keyed);
+        }
+        keyed.into_iter().map(|t| refs[t.2 as usize]).collect()
+    } else if numeric_keys {
+        // by_row: the ref's index as one more key
+        let width = nk + by_row as usize;
+        let mut flat: Vec<(u8, u64)> = Vec::with_capacity(refs.len() * width);
+        for (i, &(g, r)) in refs.iter().enumerate() {
+            for (ki, (_, dir)) in order_by.iter().enumerate() {
+                flat.push(encode_order(&groups[g as usize].0[ki], r as usize, ord_tys[ki], *dir == SortDir::Desc));
+            }
+            if by_row {
+                flat.push((0, i as u64));
+            }
+        }
+        let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
+        sort_perm_packed(&mut perm, &flat, width);
+        perm.into_iter().map(|p| refs[p as usize]).collect()
+    } else {
+        // text keys: materialize the (small) key tuples, sort refs by them
+        // (a stable sort: ties keep ref order either way)
+        let keys: Vec<Vec<Val>> = refs
+            .iter()
+            .map(|&(g, r)| groups[g as usize].0.iter().zip(ord_tys).map(|(v, t)| v.val_at(r as usize, *t)).collect())
+            .collect();
+        let mut perm: Vec<u32> = (0..refs.len() as u32).collect();
+        sort_perm_keys(&mut perm, &keys, order_by);
+        perm.into_iter().map(|p| refs[p as usize]).collect()
     }
 }

@@ -43,6 +43,30 @@ window.__smoke = (async () => {
     eq((await step("materialize", () => db.materialize("m", "select country, count(*) as n from t group by country", { table: "t" }))).rows, 200, "materialize rows");
     eq((await db.query("select count(*) as n from m", { table: "m" })).column("n")[0], 200, "query on materialized");
     eq((await step("join", () => db.query("select count(*) as n from t join m on t.country = m.country", { table: "t" }))).column("n")[0], 200000, "join count");
+    // a retained result: blocks of it, sorted in the worker, through the public API
+    const h = await step("prepare", () => db.prepare("select id, country, capacity from t where capacity > 3", { table: "t", dictText: true }));
+    eq(h.rows, plain.rowCount, "prepare rows");
+    eq(h.kind, "rows", "prepare kind");
+    let pg = await step("page", () => h.page(70000, 70512));
+    eq(pg.rowCount, 512, "page rows");
+    eq(pg.start, 70000, "page start");
+    eq(pg.generation, 0, "page generation");
+    if (!pg.columnRaw("country").codes) throw new Error("page: dictText from prepare");
+    const want = await db.query("select id, country, capacity from t where capacity > 3 limit 512 offset 70000", { table: "t" });
+    eq(JSON.stringify([...pg.rows()]), JSON.stringify([...want.rows()]), "page equals the query's rows");
+    const early = h.page(0, 5);
+    const sorting = step("sort", () => h.sort("capacity desc, id, country"));
+    eq(h.generation, 1, "generation moves on when sort is called");
+    eq((await early).generation, 0, "a page asked for before the sort carries the old generation");
+    eq((await sorting).generation, 1, "sort generation");
+    pg = await h.page(100, 110, { columns: ["capacity", "id"] });
+    eq(pg.generation, 1, "page generation after the sort");
+    const top = await db.query("select capacity, id from t where capacity > 3 order by capacity desc, id, country limit 10 offset 100", { table: "t" });
+    eq(JSON.stringify([...pg.rows()]), JSON.stringify([...top.rows()]), "sorted page equals the query's rows");
+    await h.close();
+    let closedMsg = "";
+    try { await h.page(0, 5); } catch (e) { closedMsg = String(e.message); }
+    if (!/is closed/.test(closedMsg)) throw new Error("page on a closed handle: " + closedMsg);
     const csv = new Blob([await (await fetch("/spikes/facet-spike/data-200000.csv")).arrayBuffer()], { type: "text/csv" });
     eq((await step("loadCsv(Blob)", () => db.loadCsv("c", csv))).rows, 200000, "loadCsv rows");
     eq((await db.query("select count(*) as n from c where capacity is null", { table: "c" })).column("n")[0],
