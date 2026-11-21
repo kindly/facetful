@@ -106,7 +106,9 @@ table, and a sort reads only its key columns. `search()` and `search_rank()`
 work. Rows with equal sort keys stay in table order. Grouped and joined
 results are kept whole in the worker and sliced. `h.generation` counts
 sorts, and each page carries the value it was asked under, so a late page
-from before a sort can be dropped. At most 8 handles stay open. It is in the
+from before a sort can be dropped. Close a handle
+when its grid goes: 5 may be open at once (`maxHandles` at `open`), and
+`prepare` rejects beyond that, naming the open statements. It is in the
 lite build too. Design and measurements: `docs/result-handles.sv`.
 
 ## The ways in

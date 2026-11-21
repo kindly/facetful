@@ -262,14 +262,18 @@ if (be.ok || !be.isQueryError || !/statement 1: .*unknown column 'contry'/s.test
     bad = await send(msg);
     if (bad.ok || !/result handle is stale: its table was replaced/.test(bad.error)) throw new Error(`stale handle: ${JSON.stringify(bad)}`);
   }
-  // at most 8 stay open: the least recently used goes (h was used last of the three)
-  await ok({ cmd: "page", handle: h.handle, start: 0, end: 1 });
+  // a pool of 5: h, st and kept are open, two more fit, the sixth is
+  // refused naming the open statements, and nothing open is taken away
   const more = [];
-  for (let i = 0; i < 6; i++) more.push(await ok({ cmd: "prepare", table: "t", sql: `select id from t where capacity > ${i}` }));
-  bad = await send({ cmd: "page", handle: st.handle, start: 0, end: 1 });
-  if (bad.ok || !/is closed \(closed, or evicted: at most 8 stay open\)/.test(bad.error)) throw new Error(`evicted handle: ${JSON.stringify(bad)}`);
+  for (let i = 0; i < 2; i++) more.push(await ok({ cmd: "prepare", table: "t", sql: `select id from t where capacity > ${i}` }));
+  bad = await send({ cmd: "prepare", table: "t", sql: "select id from t" });
+  if (bad.ok || !/^5 result handles are open and maxHandles is 5: close\(\) one/.test(bad.error) || !bad.error.includes("\n  select id from t where capacity > 1"))
+    throw new Error(`full pool: ${JSON.stringify(bad)}`);
   await ok({ cmd: "page", handle: h.handle, start: 0, end: 1 });
-  for (const m of [h, ...more]) await ok({ cmd: "closeHandle", handle: m.handle });
+  // closing one (a stale one counts until closed) makes room
+  await ok({ cmd: "closeHandle", handle: st.handle });
+  more.push(await ok({ cmd: "prepare", table: "t", sql: "select id from t" }));
+  for (const m of [h, kept, ...more]) await ok({ cmd: "closeHandle", handle: m.handle });
   // a statement that does not parse: no handle
   bad = await send({ cmd: "prepare", table: "t", sql: "select contry from t" });
   if (bad.ok || !bad.isQueryError || !/unknown column 'contry'/.test(bad.error)) throw new Error(`prepare error: ${JSON.stringify(bad)}`);

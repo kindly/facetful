@@ -9,7 +9,7 @@
 //   [...r.rows()]              // row objects, materialized lazily
 
 export class Facetful {
-  static async open({ wasmUrl, workerUrl, hyparquetUrl, udfs = true } = {}) {
+  static async open({ wasmUrl, workerUrl, hyparquetUrl, udfs = true, maxHandles } = {}) {
     // the no-argument form must stay a literal `new Worker(new URL(...))`
     // expression: bundlers (Vite, webpack) statically analyze exactly that
     // pattern to compile the worker graph
@@ -22,6 +22,7 @@ export class Facetful {
       wasmUrl: String(wasmUrl ?? new URL("./facetful_wasm.wasm", import.meta.url)),
       hyparquetUrl,
       udfs,
+      maxHandles,
     });
     return db;
   }
@@ -299,13 +300,26 @@ export class Facetful {
    */
   async prepare(sql, { table, dictText } = {}) {
     const { handle, rows, columns, kind, elapsedMs } = await this._call({ cmd: "prepare", sql, table });
-    return new ResultHandle(this, { handle, rows, columns, kind, elapsedMs, dictText });
+    const h = new ResultHandle(this, { handle, rows, columns, kind, elapsedMs, dictText });
+    forgotten?.register(h, { db: this, handle, sql }, h);
+    return h;
   }
 
   close() {
     this._worker.terminate();
   }
 }
+
+// A ResultHandle collected without close(): free its place in the worker's
+// pool and say so. Collection can come late or never, so this is a net
+// under close(), not a replacement for it.
+const forgotten =
+  typeof FinalizationRegistry === "undefined"
+    ? null
+    : new FinalizationRegistry(({ db, handle, sql }) => {
+        console.warn(`facetful: a result handle was dropped without close(): ${sql.replace(/\s+/g, " ").trim().slice(0, 80)}`);
+        db._call({ cmd: "closeHandle", handle }).catch(() => {});
+      });
 
 /** A result kept in the worker (`Facetful.prepare`). */
 export class ResultHandle {
@@ -351,6 +365,7 @@ export class ResultHandle {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    forgotten?.unregister(this);
     await this._db._call({ cmd: "closeHandle", handle: this._handle });
   }
 }

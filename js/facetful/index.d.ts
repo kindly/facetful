@@ -16,6 +16,9 @@ export interface OpenOptions {
   hyparquetUrl?: string;
   /** register the ready-made functions from `facetful/udfs` at open (default true) */
   udfs?: boolean;
+  /** how many `prepare` results may be open at once (default 5): when that
+   *  many are, `prepare` rejects until one is closed */
+  maxHandles?: number;
 }
 
 export interface QueryStats {
@@ -350,9 +353,14 @@ export declare class Facetful {
    * (`kind: "rows"`). A grouped or joined result is not rows of the table:
    * it is computed once and kept whole in the worker (`kind: "result"`).
    *
-   * The rows are fixed when this resolves. At most 8 handles stay open in
-   * the worker (the least recently used is closed beyond that), and a
-   * handle whose table was loaded again under the same name rejects.
+   * The rows are fixed when this resolves, and a handle whose table was
+   * loaded again under the same name rejects.
+   *
+   * Close a handle when its grid goes. The worker holds a pool of 5
+   * (`maxHandles` at `open`): with that many open, `prepare` rejects and
+   * names the open statements, so a forgotten `close()` shows up at once.
+   * A handle that is garbage collected unclosed is closed with a
+   * `console.warn`, but collection can come late, so don't lean on it.
    * `dictText` is the default for the handle's pages.
    */
   prepare(sql: string, options?: { table?: string; dictText?: boolean | "all" }): Promise<ResultHandle>;

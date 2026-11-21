@@ -57,7 +57,9 @@ The rows are fixed when `prepare` resolves. A search index built later changes w
 
 **Kept results.** Aggregates, joins, CTEs, subqueries and `FROM another_table` run as a query does, and the handle keeps the `QueryResult`. `page` slices it. `sort` runs the statement again with the new ORDER BY, which for joins hits the derived-table cache. One rule covers both kinds of handle that way.
 
-**Stale and forgotten handles.** A handle records its table's catalog registrations. When every name the table was loaded under now means another table, `page` and `sort` reject with "result handle is stale". facetful has no `drop`, so replacing a name is the only way a table goes away today. The worker keeps at most 8 handles and closes the least recently used beyond that. A closed or evicted handle rejects with "result handle N is closed".
+**Stale and forgotten handles.** A handle records its table's catalog registrations. When every name the table was loaded under now means another table, `page` and `sort` reject with "result handle is stale". facetful has no `drop`, so replacing a name is the only way a table goes away today. A closed handle rejects with "result handle N is closed".
+
+**A pool of 5.** The worker holds at most `maxHandles` open handles, 5 unless `Facetful.open({ maxHandles })` says otherwise. With the pool full, `prepare` rejects before it runs anything and lists the open statements. The first version closed the least recently used handle instead. That hid a forgotten `close()` and could take a handle away from a grid still showing it, so David asked for a refusal (21 November). A grid that replaces its result prepares the new handle and then closes the old one, so it needs 2 places for a moment. On the page, a `ResultHandle` that is garbage collected unclosed is closed through a `FinalizationRegistry` with a `console.warn`. Collection can come late or never, so that only catches some leaks.
 </sv-prose>
 
 <sv-prose id="rh-numbers">
@@ -112,7 +114,7 @@ Leaving "Description Rare" out of a block saves about 0.1 ms. The grid has no re
 
 - `crates/facetful-engine/tests/handles.rs`. 5 select lists, 6 WHEREs, 7 orders and 4 windows, every combination. Blocks of the handle equal the same rows of the query, including blocks across row groups, past the end and empty. Then every order after every other through `sort()`. The table has NULLs in a plain text, a dictionary and a float column, and many ties. Also aliases and positions in `sort`, refused sorts, chosen columns, dictionary columns staying codes, grouped and joined results, `search()` and `search_rank()` with and without the word index, and rows fixed at prepare.
 - `tests/lite.rs` runs a handle in the lite build and checks a join is refused there.
-- `node-worker-smoke.mjs` drives the worker's messages. It covers blocks against queries, a refused sort, closed handles, a stale handle after its table's name is loaded again, and eviction past 8.
+- `node-worker-smoke.mjs` drives the worker's messages. It covers blocks against queries, a refused sort, closed handles, a stale handle after its table's name is loaded again, and a full pool refusing a sixth handle until one is closed.
 - `browser-smoke.mjs` uses the public API in Chromium, including `generation` on a page asked for before a sort.
 
 `./scripts/build-package.sh` passes.
@@ -125,7 +127,7 @@ Leaving "Description Rare" out of a block saves about 0.1 ms. The grid has no re
 - **`order by count(*)` on a statement with no GROUP BY panics** in the executor ("unbound scalar function count"). `query()` on main does the same. The binder doesn't look for aggregates in ORDER BY. `sort()` refuses such an order itself, but `prepare` and `query` still trap.
 - **No `drop`.** A table loaded again under the same name leaves the old table in wasm memory. Handles notice the replacement. Freeing the table is its own change.
 - **Page lanes load to the deepest row.** A page reads each lane of each row group it touches from the start of the group to its deepest row, then picks its rows. That costs 2 to 4 ms for grantnav's worst case. Picking straight from the segments would cut it if a table with far more row groups needs it.
-- **Kept results stay whole in the worker.** A join of every grantnav column is as large as the query result. The cap of 8 handles is the only limit.
+- **Kept results stay whole in the worker.** A join of every grantnav column is as large as the query result. The pool of 5 handles is the only limit.
 - **Step 2.** facetful-grid's demo moves to `prepare`, `need()` and `invalidate()`, with pages of 512 keyed by generation.
 </sv-prose>
 

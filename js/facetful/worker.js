@@ -13,19 +13,19 @@ const tables = new Map(); // name -> handle
 const setTable = (name, handle) => { tables.set(name, handle); engine.catalogRegister(name, handle); };
 let lastTable = null;
 
-// Retained results (prepare): id -> { h }, least recently used first.
-// A handle the page forgot to close is evicted once more than MAX_HANDLES
-// are open, so its row ids (4 bytes a row) or kept result are freed.
+// Retained results (prepare): id -> { h, sql }. A pool of maxHandles (set at
+// init): when it is full prepare is refused, naming the open statements, so
+// a page that forgets close() finds out at once and no handle in use is
+// taken away. Each holds row ids (4 bytes a row) or a kept result.
 const handles = new Map();
 let nextHandle = 1;
-const MAX_HANDLES = 8;
+let maxHandles = 5;
 function useHandle(id) {
   const e = handles.get(id);
-  if (!e) throw new Error(`result handle ${id} is closed (closed, or evicted: at most ${MAX_HANDLES} stay open)`);
-  handles.delete(id);
-  handles.set(id, e); // most recently used last
+  if (!e) throw new Error(`result handle ${id} is closed`);
   return e;
 }
+const brief = (sql) => { const s = sql.replace(/\s+/g, " ").trim(); return s.length > 80 ? s.slice(0, 77) + "..." : s; };
 
 // OPFS file registry: the wasm's opfs_read import addresses files by these ids.
 const opfsFiles = new Map(); // fileId -> { handle: FileSystemSyncAccessHandle, path }
@@ -296,6 +296,10 @@ self.onmessage = async (e) => {
       // the ready-made functions (udfs.js) are on by default: they cost
       // nothing until a query calls one, and agents expect date_trunc to exist
       if (e.data.udfs !== false) for (const u of builtinUdfs) engine.registerFunction(u.name, u.signature, u.fn);
+      if (e.data.maxHandles != null) {
+        if (!Number.isInteger(e.data.maxHandles) || e.data.maxHandles < 1) throw new Error(`maxHandles must be a whole number of 1 or more, not ${e.data.maxHandles}`);
+        maxHandles = e.data.maxHandles;
+      }
       reply({ ok: true });
     } else if (cmd === "load") {
       const { handle, rows } = engine.openTable(e.data.buffer);
@@ -499,16 +503,15 @@ self.onmessage = async (e) => {
     } else if (cmd === "prepare") {
       const table = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!table) throw new Error(`no table loaded${e.data.table ? `: '${e.data.table}'` : ""}`);
+      if (handles.size >= maxHandles) {
+        const open = [...handles.values()].map((o) => `\n  ${brief(o.sql)}`).join("");
+        throw new Error(`${handles.size} result handles are open and maxHandles is ${maxHandles}: close() one before preparing another. Open:${open}`);
+      }
       const t0 = performance.now();
       const { handle: h, rows, columns, kind } = engine.prepare(table, e.data.sql);
       const elapsedMs = performance.now() - t0;
-      for (const [id, old] of handles) {
-        if (handles.size < MAX_HANDLES) break;
-        engine.preparedFree(old.h);
-        handles.delete(id);
-      }
       const handle = nextHandle++;
-      handles.set(handle, { h });
+      handles.set(handle, { h, sql: e.data.sql });
       reply({ ok: true, handle, rows, columns, kind, elapsedMs });
     } else if (cmd === "page") {
       const { h } = useHandle(e.data.handle);
