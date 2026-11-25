@@ -180,10 +180,12 @@ export declare class Facetful {
 
   /**
    * Resolves when the table's search index, from `loadUrl`, is in use.
-   * Await it before a `search()` query on a table loaded with
-   * `searchColumns`: when the download outran indexing
-   * (`searchReady: false`), `search()` finds no rows until the index is
-   * finished.
+   * Until then (`searchReady: false`: the download outran indexing),
+   * `search()` scans the rows and matches words as typed, the last as a
+   * prefix: no spelling corrections and no other forms of a word, so
+   * `countr owner` finds nothing that the index would correct to
+   * `country owner`. `searchSuggest` says which it was (`indexed`). Await
+   * this before a search that should behave as the index does.
    */
   searchReady(options?: { table?: string }): Promise<void>;
 

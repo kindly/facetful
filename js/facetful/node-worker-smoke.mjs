@@ -12,7 +12,9 @@ const here = new URL(".", import.meta.url);
 const spike = new URL("../../spikes/facet-spike/", import.meta.url);
 
 // the worker's globals: `self`, `postMessage`, and a fetch that reads files,
-// handing the body out in 64 KB chunks like a network would
+// handing the body out in 64 KB chunks like a network would, pausing 2 ms
+// a megabyte (so the loader is kept waiting and indexes as it loads, as on
+// a real network; without the pause that hung on timing and failed CI once)
 const pending = new Map();
 globalThis.self = globalThis;
 globalThis.postMessage = (msg) => {
@@ -23,10 +25,11 @@ globalThis.postMessage = (msg) => {
 // (`#1` on the URL makes the first chunk one byte, as a network may)
 globalThis.fetch = async (url) => {
   const bytes = fs.readFileSync(fileURLToPath(url));
-  let at = 0;
+  let at = 0, next = 0;
   const body = new ReadableStream({
-    pull(c) {
+    async pull(c) {
       if (at >= bytes.length) return c.close();
+      if (at >= next) { next += 1 << 20; await new Promise((r) => setTimeout(r, 2)); }
       const n = at === 0 && new URL(url).hash === "#1" ? 1 : 65536;
       c.enqueue(new Uint8Array(bytes.subarray(at, at + n)));
       at += n;

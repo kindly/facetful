@@ -61,7 +61,8 @@ export class Facetful {
    * is ready with the table (`indexedWhileLoading` row groups were done
    * before the last byte). When the download outruns indexing the table
    * opens anyway (`searchReady: false`): the rest is indexed in the
-   * background, search() scans meanwhile, and `searchReady()` resolves when
+   * background, search() scans meanwhile (words as typed, without the
+   * index's corrections and word forms), and `searchReady()` resolves when
    * the index is in use. `persist` (an OPFS path) writes the image there
    * as it arrives, for `loadOpfs` on a later visit; without OPFS it is
    * skipped (`persisted: false`). `expectedBytes` sizes the buffer once when

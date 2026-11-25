@@ -347,7 +347,7 @@ That last point is also the experiment's start-up cost. In its first round a fac
 
 Two other things the agents worked around: `LIKE` treats a typed `%` or `_` as a wildcard and has no escape, and it does not match "İ" to "i". And nearly every agent turned capacity into whole kW to sum without float drift.
 
-**Found on the way: `search()` before the index is finished.** A table streamed in faster than its index is built (`searchReady: false`) finds no rows with `search()` until the index is done, where the comments say it scans meanwhile. The engine from before this branch does the same with a plain image, so it is not from packing. Not fixed here; `index.d.ts` now says to await `searchReady()`.
+**Found on the way: `search()` before the index is finished.** A table streamed in faster than its index is built (`searchReady: false`) seemed to find no rows with `search()` until the index was done. It scans, as the comments say; the query tested (`countr owner_1`) has a typo, which only the index corrects, so the scan finds nothing. Plain words agree. The note in `index.d.ts` now says so, and the browser smoke checks the scan mid-build.
 
 **Not done, and why.**
 

@@ -108,6 +108,11 @@ window.__smoke = (async () => {
     const pk = await step("loadUrl(packed, index, persist)", () => db.loadUrl("pk", "/packed/spikes/facet-spike/data-200000.facetful", { searchColumns: cols, persist: "smoke/pk.facetful" }));
     eq(pk.rows, 200000, "packed loadUrl rows");
     eq(pk.persisted, true, "packed loadUrl wrote OPFS");
+    // straight after loadUrl the index may still be building: search()
+    // scans meanwhile, which agrees on words typed in full (only the index
+    // corrects a typo such as sq's "countr")
+    const exact = (t) => "select count(*) as n from " + t + " where search('country owner_1', country, owner)";
+    eq((await db.query(exact("pk"), { table: "pk" })).column("n")[0], viaStream, "search straight after loadUrl (searchReady " + pk.searchReady + ")");
     eq(await res("pk"), wholeRes, "the packed image agrees with the whole image");
     await db.buildSearchIndex(cols, { table: "pk" }); // whatever the download outran
     eq((await db.query(sq("pk"), { table: "pk" })).column("n")[0], viaStream, "the packed image's index agrees");
