@@ -21,11 +21,15 @@ import { udfs as builtinUdfs } from "../udfs.js";
 
 const args = process.argv.slice(2);
 const cmd = args.shift();
+/** A problem to report in one line, not as a stack. */
+class CliError extends Error {}
 const usage = () => {
   console.error(`usage: facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
        facetful inspect file.facetful [--json]
        facetful query file.facetful ["select …"] [--table name=path.facetful …] [--udf module.mjs …]
-       facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf module.mjs …]`);
+       facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf module.mjs …]
+       facetful publish file.facetful [out-dir]
+       facetful check-url https://…/file.facetful [--origin https://your.site]`);
   process.exit(2);
 };
 
@@ -208,8 +212,151 @@ function convert(input, output, groupSize) {
   console.error(`${output}: ${written} bytes (${Math.ceil(rows / groupSize)} row groups, ${(performance.now() - t0).toFixed(0)} ms)`);
 }
 
+/** `facetful publish`: the copies of an image to put on a static host:
+ *  `.br` (brotli 11, 16 MB window) for hosts that can send it with
+ *  `Content-Encoding: br` (S3, DigitalOcean Spaces), `.gz` for hosts that
+ *  can't set headers (GitHub Pages), which `loadUrl` decompresses in the page.
+ *  Both stream, so memory stays small whatever the image's size. */
+async function publish(input, outDir) {
+  const { basename, join, resolve } = await import("node:path");
+  const { mkdirSync, statSync, createReadStream, createWriteStream } = await import("node:fs");
+  const { pipeline } = await import("node:stream/promises");
+  const zlib = await import("node:zlib");
+  openLazy(input); // refuses anything that is not an image
+  const raw = statSync(input).size;
+  const dir = outDir ?? resolve(input, "..");
+  mkdirSync(dir, { recursive: true });
+  const name = basename(input);
+  const C = zlib.constants;
+  const out = {};
+  for (const [ext, make] of [
+    ["br", () => zlib.createBrotliCompress({ params: { [C.BROTLI_PARAM_QUALITY]: 11, [C.BROTLI_PARAM_LGWIN]: 24, [C.BROTLI_PARAM_SIZE_HINT]: raw } })],
+    ["gz", () => zlib.createGzip({ level: 9 })],
+  ]) {
+    const path = join(dir, `${name}.${ext}`);
+    const t0 = performance.now();
+    let done = 0, shown = -1;
+    const from = createReadStream(input, { highWaterMark: 1 << 20 });
+    from.on("data", (c) => {
+      done += c.length;
+      const pct = Math.floor((done / raw) * 100);
+      if (process.stderr.isTTY && pct !== shown) process.stderr.write(`\r${ext}: ${(shown = pct)}%`);
+    });
+    await pipeline(from, make(), createWriteStream(path));
+    out[ext] = { path, bytes: statSync(path).size };
+    if (process.stderr.isTTY) process.stderr.write("\r");
+    console.error(`${path}: ${human(out[ext].bytes)} (${((out[ext].bytes / raw) * 100).toFixed(1)}% of ${human(raw)}, ${((performance.now() - t0) / 1000).toFixed(1)} s)`);
+  }
+  console.error(`
+Where to put which (check the result with: facetful check-url <url>):
+
+  S3 (or anything S3-like): upload the .br under the image's own name, saying
+  it is brotli; browsers undo that themselves as it streams. Needs https.
+    aws s3 cp ${out.br.path} s3://BUCKET/PATH/${name} \\
+      --content-encoding br --content-type application/octet-stream \\
+      --cache-control "public, max-age=3600"
+
+  DigitalOcean Spaces: the same, against the Spaces endpoint.
+    aws s3 cp ${out.br.path} s3://SPACE/PATH/${name} \\
+      --endpoint-url https://REGION.digitaloceanspaces.com --acl public-read \\
+      --content-encoding br --content-type application/octet-stream \\
+      --cache-control "public, max-age=3600"
+
+  GitHub Pages: headers can't be set there, so commit the .gz and load that
+  URL; loadUrl decompresses a gzip file in the page as it streams.
+    db.loadUrl("t", "${name}.gz")
+  Pages refuses files over 100 MB.
+
+  "immutable" with a long max-age is right only when the file's name changes
+  whenever the data does. A page on another origin needs CORS on the bucket.`);
+}
+
+/** `facetful check-url`: fetch an image the way a browser would and say
+ *  what the host does: compression, bytes on the wire, headers, CORS, and
+ *  whether what arrives is a whole image. */
+async function checkUrl(url, origin) {
+  const zlib = await import("node:zlib");
+  const u = new URL(url);
+  const get = (await import(u.protocol === "https:" ? "node:https" : "node:http")).get;
+  const t0 = performance.now();
+  const res = await new Promise((ok, fail) => {
+    const headers = { "accept-encoding": "br, gzip, deflate", ...(origin ? { origin } : {}) };
+    get(u, { headers }, ok).on("error", (e) => fail(new CliError(`${url}: can't connect (${e.code ?? e.errors?.[0]?.code ?? e.message})` +
+      ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_USE_ENV_PROXY ? "; behind a proxy, run with NODE_USE_ENV_PROXY=1" : ""))));
+  });
+  const h = res.headers;
+  if (res.statusCode !== 200) {
+    res.resume();
+    throw new CliError(`${url}: HTTP ${res.statusCode}`);
+  }
+  const enc = (h["content-encoding"] ?? "").trim().toLowerCase();
+  const decoders = { br: () => zlib.createBrotliDecompress(), gzip: () => zlib.createGunzip(), deflate: () => zlib.createInflate() };
+  if (enc && !decoders[enc]) throw new CliError(`${url}: Content-Encoding ${enc}, which browsers don't decode`);
+  // what fetch hands the page (the host's encoding undone), then a gzip
+  // file undone as loadUrl would
+  let wire = 0, head = Buffer.alloc(0), tail = Buffer.alloc(0), image = 0, fileGzip = null;
+  const stream = enc ? res.pipe(decoders[enc]()) : res;
+  res.on("data", (c) => (wire += c.length));
+  let inner = null;
+  const take = (c) => {
+    if (image < 4) head = Buffer.concat([head, c]).subarray(0, 4);
+    image += c.length;
+    tail = Buffer.concat([tail, c]).subarray(-4);
+  };
+  let broken = null;
+  await new Promise((ok) => {
+    const fail = (e) => ((broken = e), ok());
+    stream.on("error", fail);
+    stream.on("data", (c) => {
+      if (fileGzip === null) {
+        fileGzip = c[0] === 0x1f && c[1] === 0x8b;
+        if (fileGzip) {
+          inner = zlib.createGunzip();
+          inner.on("data", take);
+          inner.on("error", fail);
+          inner.on("end", ok);
+        }
+      }
+      if (fileGzip) inner.write(c);
+      else take(c);
+    });
+    stream.on("end", () => (fileGzip ? inner.end() : ok()));
+  });
+  const secs = (performance.now() - t0) / 1000;
+  const whole = head.toString("latin1") === "FCT1" && tail.toString("latin1") === "FCT1";
+  const pct = (a, b) => `${((a / b) * 100).toFixed(1)}%`;
+  const lines = [];
+  const say = (ok, s) => lines.push(`${ok === true ? "ok  " : ok === false ? "FIX " : "    "}${s}`);
+  say(null, `${url}`);
+  say(null, `${human(wire)} on the wire for a ${human(image)} image (${pct(wire, image)}), ${secs.toFixed(1)} s`);
+  if (enc === "br") say(true, "Content-Encoding: br: browsers decompress it as it streams (the smallest)");
+  else if (enc === "gzip" || enc === "deflate") say(null, `Content-Encoding: ${enc}: works, but brotli is usually 10-30% smaller (facetful publish)`);
+  else if (fileGzip) say(true, "a gzip file: loadUrl decompresses it in the page as it streams (the GitHub Pages way)");
+  else say(false, "not compressed: run facetful publish and serve the .br (S3, Spaces) or the .gz (GitHub Pages)");
+  if (enc === "br" && u.protocol !== "https:") say(false, "brotli over plain http: browsers only ask for brotli over https");
+  if (broken) say(false, `it doesn't decompress (${broken.code ?? broken.message}): cut short, or not really ${fileGzip ? "gzip" : enc}`);
+  else if (!whole) say(false, `what arrives is not a whole facetful image${fileGzip ? " after gunzip" : ""}: wrong file, or cut short`);
+  else say(true, "a whole facetful image arrives");
+  say(null, `Content-Type: ${h["content-type"] ?? "(none)"}`);
+  say(null, `Cache-Control: ${h["cache-control"] ?? "(none: browsers guess)"}`);
+  const acao = h["access-control-allow-origin"];
+  if (origin) say(acao === "*" || acao === origin, `CORS for ${origin}: ${acao ? `Access-Control-Allow-Origin: ${acao}` : "no Access-Control-Allow-Origin (a page there can't fetch it)"}`);
+  else say(null, `CORS: ${acao ? `Access-Control-Allow-Origin: ${acao}` : "none sent (fine from the same origin; pass --origin https://your.site to check another)"}`);
+  console.log(lines.join("\n"));
+  if (lines.some((l) => l.startsWith("FIX"))) process.exitCode = 1;
+}
+
 try {
-  if (cmd === "convert") {
+  if (cmd === "publish") {
+    const { pos } = parse(args);
+    if (pos.length < 1 || pos.length > 2) usage();
+    await publish(pos[0], pos[1]);
+  } else if (cmd === "check-url") {
+    const i = args.indexOf("--origin");
+    const origin = i >= 0 ? args.splice(i, 2)[1] : undefined;
+    if (args.length !== 1) usage();
+    await checkUrl(args[0], origin);
+  } else if (cmd === "convert") {
     const { pos, groupSize } = parse(args);
     if (pos.length !== 2) usage();
     if (isParquet(pos[0])) await convertParquet(pos[0], pos[1], groupSize);
@@ -260,6 +407,6 @@ try {
     }
   } else usage();
 } catch (e) {
-  console.error(e instanceof QueryError ? e.message : e);
+  console.error(e instanceof QueryError || e instanceof CliError ? e.message : e);
   process.exit(1);
 }

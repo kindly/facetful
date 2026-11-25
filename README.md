@@ -45,7 +45,12 @@ Convert the data once, ahead of time, and host the image next to the page:
 npm install facetful
 npx facetful convert plants.csv plants.facetful   # CSV or Parquet in
 npx facetful query plants.facetful                # REPL; or one-shot with a SQL arg
+npx facetful publish plants.facetful out/         # brotli and gzip copies, and where to upload each
 ```
+
+Serve the brotli copy with `Content-Encoding: br` (S3, DigitalOcean Spaces),
+or the gzip copy where headers can't be set (GitHub Pages): see "Publishing an
+image" in [`js/facetful`](js/facetful/README.md#publishing-an-image-brotli-or-gzip).
 
 Then load it in the browser:
 

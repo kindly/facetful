@@ -125,12 +125,45 @@ Persistence is always explicit (`storeOpfs`), never write-behind. OPFS needs a
 secure context (https or localhost); everything degrades to memory-only
 without one.
 
+## Publishing an image: brotli, or gzip
+
+The download is most of the wait, so serve images compressed. Brotli is the
+smallest (GEM units, 183K rows: 48 MB raw, 6.5 MB brotli, 8.9 MB gzip).
+
+```
+npx facetful publish data.facetful out/    # writes out/data.facetful.br and out/data.facetful.gz
+npx facetful check-url https://…/data.facetful --origin https://your.site
+```
+
+`publish` compresses (brotli at its best setting, which takes about a minute per
+50 MB) and prints the upload commands for the hosts below. `check-url` downloads
+the image as a browser would and says what the host does: compression, bytes
+on the wire, whether a whole image arrives, `Content-Type`, `Cache-Control`
+and CORS for `--origin`. It exits non-zero when something needs fixing.
+
+| host | upload | load with |
+|---|---|---|
+| S3, DigitalOcean Spaces (or anything that keeps per-object headers) | the `.br` under the image's own name, with `Content-Encoding: br` (`aws s3 cp … --content-encoding br`; for Spaces add `--endpoint-url https://REGION.digitaloceanspaces.com`) | `loadUrl(name, ".../data.facetful")`: the browser decompresses as it streams |
+| GitHub Pages (no custom headers) | the `.gz` | `loadUrl(name, ".../data.facetful.gz")`: a gzip file is decompressed in the page as it streams |
+
+Notes:
+- Browsers only ask for brotli over https, so serve the brotli copy over https.
+- GitHub Pages refuses files over 100 MB.
+- Long `max-age` with `immutable` is right only when the file's name changes
+  whenever the data changes.
+- A page on another origin needs CORS on the bucket.
+- In-page decompression uses `DecompressionStream`, which every current
+  browser has for gzip. Chrome has no in-page brotli, which is why the
+  fallback is gzip.
+
 ## The `facetful` command
 
 ```
 facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
 facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
 facetful materialize in.facetful "select …" out.facetful [--table …] [--udf …]
+facetful publish file.facetful [out-dir]
+facetful check-url https://…/file.facetful [--origin https://your.site]
 ```
 
 `convert` streams: two passes over the CSV (types and dictionaries, then

@@ -147,18 +147,55 @@ async function opfsAppender(path) {
   }
 }
 
+/** A response body as image bytes: a gzip file (`facetful publish`'s
+ *  `.gz`, for hosts like GitHub Pages that can't send `Content-Encoding`)
+ *  is decompressed here as it streams; anything else passes through (a
+ *  host's own `Content-Encoding` is already undone by fetch). `gzip` is
+ *  true when this page decompressed it. */
+async function imageBody(body) {
+  const reader = body.getReader();
+  const head = [];
+  let have = 0;
+  while (have < 2) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    head.push(value);
+    have += value.byteLength;
+  }
+  const first = head[0];
+  const b1 = first?.byteLength > 1 ? first[1] : head[1]?.[0];
+  const gzip = first?.[0] === 0x1f && b1 === 0x8b;
+  // the bytes already read, then the rest of the body
+  let stream = new ReadableStream({
+    start(c) {
+      for (const h of head) c.enqueue(h);
+    },
+    async pull(c) {
+      const { done, value } = await reader.read();
+      if (done) c.close();
+      else c.enqueue(value);
+    },
+    cancel(why) {
+      return reader.cancel(why);
+    },
+  });
+  if (gzip) stream = stream.pipeThrough(new DecompressionStream("gzip"));
+  return { stream, gzip };
+}
+
 /** Fetch an image and open it as it arrives (`openStream`): indexed as it
  *  comes with `searchColumns`, written to OPFS with `persist`. */
 async function streamImage({ url, searchColumns, persist, expectedBytes }) {
   const r = await fetch(url);
   if (!r.ok || !r.body) throw new Error(`fetch ${url}: HTTP ${r.status}`);
-  // Content-Length is the image's size only when the response is not
-  // compressed in transit (images also say their size in their header)
-  expectedBytes ??= r.headers.get("content-encoding") ? 0 : Number(r.headers.get("content-length")) || 0;
+  const { stream, gzip } = await imageBody(r.body);
+  // Content-Length is the image's size only when nothing was compressed
+  // (images also say their size in their header)
+  expectedBytes ??= r.headers.get("content-encoding") || gzip ? 0 : Number(r.headers.get("content-length")) || 0;
   const out = persist ? await opfsAppender(persist) : null;
   let loaded;
   try {
-    loaded = await engine.openStream(bodyChunks(r.body), {
+    loaded = await engine.openStream(bodyChunks(stream), {
       expectedBytes,
       searchColumns,
       onChunk: out ? (c) => out.write(c) : undefined,

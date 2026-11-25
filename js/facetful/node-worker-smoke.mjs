@@ -3,7 +3,10 @@
 // itself, 0.4.0–0.5.0) shipped twice: nothing here talks to the wasm except
 // through the worker's message handler.
 import fs from "node:fs";
-import { fileURLToPath } from "node:url";
+import os from "node:os";
+import path from "node:path";
+import zlib from "node:zlib";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = new URL(".", import.meta.url);
 const spike = new URL("../../spikes/facet-spike/", import.meta.url);
@@ -17,14 +20,16 @@ globalThis.postMessage = (msg) => {
   pending.delete(msg.id);
   done(msg);
 };
+// (`#1` on the URL makes the first chunk one byte, as a network may)
 globalThis.fetch = async (url) => {
   const bytes = fs.readFileSync(fileURLToPath(url));
   let at = 0;
   const body = new ReadableStream({
     pull(c) {
       if (at >= bytes.length) return c.close();
-      c.enqueue(new Uint8Array(bytes.subarray(at, at + 65536)));
-      at += 65536;
+      const n = at === 0 && new URL(url).hash === "#1" ? 1 : 65536;
+      c.enqueue(new Uint8Array(bytes.subarray(at, at + n)));
+      at += n;
     },
   });
   return new Response(body, { headers: { "content-length": String(bytes.length) } });
@@ -94,6 +99,24 @@ await ok({ cmd: "searchReady", table: "s" });
 const sqs = sq.replace("from t", "from s");
 const viaStream = (await ok({ cmd: "query", table: "s", sql: sqs })).result.columns[0].values[0];
 if (viaStream !== after) throw new Error(`search over the streamed table: ${viaStream} against ${after}`);
+// a gzip file (facetful publish's .gz, for GitHub Pages) is decompressed
+// as it streams, whatever the size of the first chunk (it replaces `s`,
+// and the checks below run on it)
+{
+  const gz = path.join(os.tmpdir(), `facetful-smoke-${process.pid}.facetful.gz`);
+  fs.writeFileSync(gz, zlib.gzipSync(image, { level: 9 }));
+  try {
+    for (const url of [pathToFileURL(gz).href, pathToFileURL(gz).href + "#1"]) {
+      const z = await ok({ cmd: "loadUrl", name: "s", url, searchColumns: ["country", "owner"] });
+      if (z.rows !== 200000) throw new Error(`loadUrl of a .gz: ${JSON.stringify(z)}`);
+      await ok({ cmd: "searchReady", table: "s" });
+      const n = (await ok({ cmd: "query", table: "s", sql: sq.replace("from t", "from s") })).result.columns[0].values[0];
+      if (n !== after) throw new Error(`search over a .gz image: ${n} against ${after}`);
+    }
+  } finally {
+    fs.rmSync(gz, { force: true });
+  }
+}
 const sgs = (await ok({ cmd: "searchSuggest", table: "s", q: "countr", columns: ["country", "owner"] })).suggestions;
 if (!sgs.indexed) throw new Error("the streamed table's index is not in use");
 // a split image (facetful split): the first part streamed in, the second
