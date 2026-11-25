@@ -101,6 +101,29 @@ window.__smoke = (async () => {
     const wholeRes = await res("t");
     eq(await res("p1"), wholeRes, "streamed parts agree with the whole image");
     eq(await res("q1"), wholeRes, "OPFS parts agree with the whole image");
+    // a packed image (the server packs the same file): unpacked as it
+    // arrives, indexed alike, and written to OPFS as the image it packs, so
+    // the next visit opens it without unpacking
+    const pk = await step("loadUrl(packed, index, persist)", () => db.loadUrl("pk", "/packed/spikes/facet-spike/data-200000.facetful", { searchColumns: cols, persist: "smoke/pk.facetful" }));
+    eq(pk.rows, 200000, "packed loadUrl rows");
+    eq(pk.persisted, true, "packed loadUrl wrote OPFS");
+    eq(await res("pk"), wholeRes, "the packed image agrees with the whole image");
+    await db.buildSearchIndex(cols, { table: "pk" }); // whatever the download outran
+    eq((await db.query(sq("pk"), { table: "pk" })).column("n")[0], viaStream, "the packed image's index agrees");
+    const kept = new Uint8Array(await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle("smoke")).getFileHandle("pk.facetful")).getFile().then((f) => f.arrayBuffer()));
+    const plainBytes = new Uint8Array(await (await fetch("/spikes/facet-spike/data-200000.facetful")).arrayBuffer());
+    eq(kept.length, plainBytes.length, "OPFS holds the unpacked length");
+    if (!kept.every((b, i) => b === plainBytes[i])) throw new Error("OPFS does not hold the image the packed one unpacks to");
+    eq((await step("loadOpfs(packed, persisted)", () => db.loadOpfs("pk2", "smoke/pk.facetful"))).rows, 200000, "the copy kept from a packed image opens");
+    eq(await res("pk2"), wholeRes, "the kept copy agrees with the whole image");
+    // packed parts attach like plain ones
+    await step("loadUrl(packed part 1)", () => db.loadUrl("pp1", "/packed/spikes/facet-spike/data-200000.part1.facetful", { persist: "smoke/pp1.facetful" }));
+    eq((await step("attach(packed part 2)", () => db.attach("/packed/spikes/facet-spike/data-200000.part2.facetful", { table: "pp1", persist: "smoke/pp2.facetful" }))).columns, 8, "packed part attached");
+    eq(await res("pp1"), wholeRes, "packed parts agree with the whole image");
+    await db.loadOpfs("pq1", "smoke/pp1.facetful");
+    await db.attachOpfs("smoke/pp2.facetful", { table: "pq1" });
+    eq(await res("pq1"), wholeRes, "parts kept from packed ones agree with the whole image");
+    for (const f of ["pk", "pp1", "pp2"]) await db.removeOpfs("smoke/" + f + ".facetful");
     // the search index kept in OPFS: built and saved on a first visit, read
     // back on the next (no rebuild), rebuilt when the columns change; one
     // built while streaming in is saved explicitly
@@ -132,7 +155,7 @@ window.__smoke = (async () => {
     eq(info.rows, 200000, "describe rows");
     eq(info.columns.find((c) => c.name === "country").dict, 200, "describe dictionary size");
     const mem = await step("memoryStats", () => db.memoryStats());
-    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 9) throw new Error("memoryStats: " + JSON.stringify(mem));
+    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 13) throw new Error("memoryStats: " + JSON.stringify(mem));
     let msg = "";
     try { await db.query("select contry from t", { table: "t" }); } catch (e) { msg = String(e.message); }
     if (!/unknown column 'contry'/.test(msg)) throw new Error("error path: " + msg);
@@ -147,13 +170,28 @@ window.__smoke = (async () => {
 })();
 </script>`;
 
+// ---- packed images, made here by the engine the page will unpack them with
+const packer = await (await import("./core.js")).instantiate(readFileSync(join(root, "js/facetful/facetful_wasm.wasm")));
+const packedCache = new Map();
+function packed(file) {
+  if (!packedCache.has(file)) {
+    const img = packer.imageFrom(readFileSync(file));
+    packedCache.set(file, packer.packImage(img));
+    packer.freeImage(img);
+  }
+  return packedCache.get(file);
+}
+
 // ---- static server for the repo (the package resolves worker + wasm relative to index.js)
 const TYPES = { ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".html": "text/html", ".csv": "text/csv", ".json": "application/json" };
 const server = createServer((req, res) => {
   const path = decodeURIComponent(new URL(req.url, "http://x").pathname);
   if (path === "/smoke.html") { res.writeHead(200, { "content-type": "text/html" }); return res.end(PAGE); }
-  const file = join(root, path);
+  // /packed/<image>: the image's packed form, as `facetful pack` writes it
+  const packing = path.startsWith("/packed/");
+  const file = join(root, packing ? path.slice(7) : path);
   if (!file.startsWith(root) || !existsSync(file)) { res.writeHead(404); return res.end(); }
+  if (packing) { res.writeHead(200, { "content-type": "application/octet-stream" }); return res.end(packed(file)); }
   const ext = path.slice(path.lastIndexOf("."));
   res.writeHead(200, { "content-type": TYPES[ext] ?? "application/octet-stream" });
   res.end(readFileSync(file));

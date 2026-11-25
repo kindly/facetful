@@ -7,13 +7,13 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startServer } from "./server.mjs";
+import { startServer, DIR } from "./server.mjs";
 
 const list = (v, d) => (process.env[v] ? process.env[v].split(",") : d);
 const browsers = list("BROWSERS", ["chromium", "firefox"]);
 const datasets = list("DATASETS", ["units", "grantnav"]);
 const profiles = list("PROFILES", ["local", "20mbps"]);
-const out = process.env.OUT ?? `/tmp/browserdb-search-browsers/results-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.jsonl`;
+const out = process.env.OUT ?? `${DIR}/results-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.jsonl`;
 const server = await startServer({ out });
 console.log(`server on ${server.port}; results in ${out}`);
 

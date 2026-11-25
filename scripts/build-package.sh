@@ -24,7 +24,12 @@ cmp "${TMPDIR:-/tmp}/gate.facetful" $SPIKE/data-200000.facetful
 node js/facetful/bin/facetful.mjs query "${TMPDIR:-/tmp}/gate.facetful" \
   "select count(*) as n from t where regexp(country, '^country_1[0-9]$')" | grep -q "^25947" || { echo "FAIL: facetful command"; exit 1; }
 node js/facetful/bin/facetful.mjs inspect "${TMPDIR:-/tmp}/gate.facetful" | grep -q "^owner .*utf8/dict (u16 codes) .* 1981 values" || { echo "FAIL: facetful inspect"; exit 1; }
-rm -f "${TMPDIR:-/tmp}/gate.facetful"
+# packed and unpacked again it is the same image, and a packed file queries
+node js/facetful/bin/facetful.mjs pack "${TMPDIR:-/tmp}/gate.facetful" "${TMPDIR:-/tmp}/gate.packed" 2>/dev/null
+node js/facetful/bin/facetful.mjs unpack "${TMPDIR:-/tmp}/gate.packed" "${TMPDIR:-/tmp}/gate.back" 2>/dev/null
+cmp "${TMPDIR:-/tmp}/gate.back" $SPIKE/data-200000.facetful
+node js/facetful/bin/facetful.mjs query "${TMPDIR:-/tmp}/gate.packed" "select count(*) as n from t" | grep -q "^200000" || { echo "FAIL: facetful pack"; exit 1; }
+rm -f "${TMPDIR:-/tmp}/gate.facetful" "${TMPDIR:-/tmp}/gate.packed" "${TMPDIR:-/tmp}/gate.back"
 echo "facetful command: OK"
 
 mkdir -p dist

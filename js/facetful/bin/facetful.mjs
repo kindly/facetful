@@ -6,6 +6,9 @@
 //   facetful inspect file.facetful [--json]
 //   facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
 //   facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf …]
+//   facetful pack|unpack in.facetful out.facetful
+//   facetful sizes file.facetful [--gzip] [--quality N]
+//   facetful order file.facetful [--gzip] [--quality N] [--depth N] [--confirm]
 //
 // CSV conversion streams: two passes over the CSV in 1 MB chunks, row groups
 // written as they finish, memory bounded whatever the file size. Parquet is
@@ -14,7 +17,7 @@
 // lazily through positional reads (the browser's OPFS import, here fs.readSync).
 // The ready-made functions (../udfs.js) are registered; a --udf module's
 // default export adds more: an array of { name, signature, fn }.
-import { readFileSync, openSync, readSync, writeSync, closeSync, fstatSync } from "node:fs";
+import { readFileSync, openSync, readSync, writeSync, closeSync, fstatSync, statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { instantiate, QueryError } from "../core.js";
 import { udfs as builtinUdfs } from "../udfs.js";
@@ -25,7 +28,11 @@ const usage = () => {
   console.error(`usage: facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
        facetful inspect file.facetful [--json]
        facetful query file.facetful ["select …"] [--table name=path.facetful …] [--udf module.mjs …]
-       facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf module.mjs …]`);
+       facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf module.mjs …]
+       facetful pack in.facetful out.facetful      the packed form: smaller to download
+       facetful unpack in.facetful out.facetful
+       facetful sizes file.facetful [--gzip] [--quality 0-11] [--jobs N]
+       facetful order file.facetful [--gzip] [--quality 0-11] [--depth N] [--jobs N] [--confirm]`);
   process.exit(2);
 };
 
@@ -40,8 +47,17 @@ const opfsRead = (fileId, offset, dest) => {
 const engine = await instantiate(readFileSync(new URL("../facetful_wasm.wasm", import.meta.url)), opfsRead);
 for (const u of builtinUdfs) engine.registerFunction(u.name, u.signature, u.fn);
 
+const packedFiles = new Set();
 function openLazy(path) {
   const fd = openSync(path, "r");
+  // a packed image (format version 2) is unpacked into memory: its bytes
+  // are not the ones a table reads
+  const head = Buffer.alloc(10);
+  if (readSync(fd, head, 0, 10, 0) === 10 && head.toString("latin1", 0, 4) === "FCT1" && head.readUInt16LE(8) === 2) {
+    closeSync(fd);
+    packedFiles.add(path);
+    return engine.openImage(engine.imageFrom(readFileSync(path)));
+  }
   const id = nextId++;
   fds.set(id, fd);
   return engine.openOpfsTable(id, fstatSync(fd).size, 256 << 20);
@@ -78,8 +94,8 @@ function inspect(path, json) {
   const { handle } = openLazy(path);
   const info = engine.describe(handle);
   if (json) return console.log(JSON.stringify(info, null, 2));
-  const size = fstatSync(fds.get(nextId - 1)).size;
-  console.log(`${path}: ${human(size)}, format v${info.version}, ${info.rows} rows, ${info.groups} row group${info.groups === 1 ? "" : "s"} (target ${info.target})`);
+  const size = statSync(path).size;
+  console.log(`${path}: ${human(size)}${packedFiles.has(path) ? " packed" : ""}, format v${info.version}, ${info.rows} rows, ${info.groups} row group${info.groups === 1 ? "" : "s"} (target ${info.target})`);
   if (info.sortedBy.length) console.log(`sorted by: ${info.sortedBy.map((k) => k.column + (k.descending ? " desc" : "")).join(", ")}`);
   const range = (c) => {
     if (c.dict !== undefined) return `${c.dict} values`;
@@ -258,6 +274,12 @@ try {
       });
       rl.on("close", () => process.exit(0));
     }
+  } else if (cmd === "pack" || cmd === "unpack") {
+    (await import("./size.mjs")).pack(engine, args, cmd === "pack");
+  } else if (cmd === "sizes") {
+    await (await import("./size.mjs")).sizes(engine, args);
+  } else if (cmd === "order") {
+    await (await import("./size.mjs")).order(engine, openLazy, args);
   } else usage();
 } catch (e) {
   console.error(e instanceof QueryError ? e.message : e);

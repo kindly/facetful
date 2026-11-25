@@ -510,6 +510,67 @@ export class Engine {
     return new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), u32(this.w.image_len(img))).slice();
   }
 
+  /**
+   * An image handle over a copy of `bytes`, a .facetful file in either
+   * form: a packed image is unpacked. Free it with freeImage(), or hand it
+   * to openImage().
+   */
+  imageFrom(bytes) {
+    this._needsWrite("reading an image");
+    const img = this._image(this.w.image_new(bytes.byteLength));
+    new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), bytes.byteLength).set(bytes);
+    if (!this.w.image_is_packed(img)) return img;
+    try {
+      return this._image(this.w.image_unpack(img));
+    } finally {
+      this.w.image_free(img);
+    }
+  }
+
+  /** The packed form of an image (handle): smaller to download, and
+   *  unpacked by the loader as it arrives. The handle stays the caller's. */
+  packImage(img) {
+    this._needsWrite("packing an image");
+    const packed = this._image(this.w.image_pack(img));
+    try {
+      return this.imageBytes(packed);
+    } finally {
+      this.w.image_free(packed);
+    }
+  }
+
+  /** Each column's share of the packed image, in column order (for size
+   *  reports: compress each to see what the column costs to download). */
+  packShares(img) {
+    this._needsWrite("packing an image");
+    const h = this._image(this.w.image_pack_shares(img));
+    try {
+      const at = u32(this.w.image_ptr(h));
+      const view = new DataView(this.mem(), at, u32(this.w.image_len(h)));
+      const n = view.getUint32(0, true);
+      let p = at + 4 + 8 * n;
+      return Array.from({ length: n }, (_, i) => {
+        const len = Number(view.getBigUint64(4 + 8 * i, true));
+        const share = new Uint8Array(this.mem(), p, len).slice();
+        p += len;
+        return share;
+      });
+    } finally {
+      this.w.image_free(h);
+    }
+  }
+
+  freeImage(img) {
+    this.w.image_free(img);
+  }
+
+  /** An image handle, or the engine's reason there is none. */
+  _image(h) {
+    if (h) return h;
+    const n = this.w.image_error(this.scratch, 4096);
+    throw new Error(this.dec.decode(new Uint8Array(this.mem(), this.scratch, n)));
+  }
+
   /** Open a table over a compiled image; consumes the image handle (no copy). */
   openImage(img) {
     this._needsWrite("opening a compiled image");

@@ -31,6 +31,7 @@
     "udfs.js",
     "udfs.d.ts",
     "bin/facetful.mjs",
+    "bin/size.mjs",
     "facetful_wasm.wasm",
     "README.md",
     "LICENSE"

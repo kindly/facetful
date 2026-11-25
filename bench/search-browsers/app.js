@@ -1,6 +1,6 @@
 // The search benchmark page: one dataset, one network profile, in phases
 // that post their results to the server (and show them here).
-//   ?dataset=units|grantnav &p=local|100mbps|20mbps &run=<id> &phase=first|repeat|split
+//   ?dataset=units|grantnav|units-packed|grantnav-packed &p=local|100mbps|20mbps &run=<id> &phase=first|repeat|split
 // first: stream the image in with its search index built as it arrives
 // (persisted to OPFS when there is one), time typing, keep the index;
 // repeat (a fresh page): reopen both from OPFS; split (grantnav): the first
@@ -22,6 +22,11 @@ const DATASETS = {
     split: { first: "grantnav-1.facetful", second: "grantnav-2.facetful", firstCols: ["Title", "Recipient Org:Name", "Grant Programme:Title", "Description Common"], secondCols: ["Description Rare"] },
   },
 };
+
+// the same data as packed images (facetful pack): smaller on the wire,
+// unpacked as they arrive, kept in OPFS unpacked
+DATASETS["units-packed"] = { ...DATASETS.units, file: "units-packed.facetful" };
+DATASETS["grantnav-packed"] = { ...DATASETS.grantnav, file: "grantnav-packed.facetful", split: undefined };
 
 const params = new URLSearchParams(location.search);
 const name = params.get("dataset") ?? "units";

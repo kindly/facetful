@@ -268,9 +268,9 @@ These are the built packer's files, compressed with the commands. They match the
 | grantnav through `openStream` in wasm (Node 26, 64 KB chunks, best of 3) | 217 ms | 360 ms |
 | GEM units, the same | 31 ms | 53 ms |
 | lite build, gz | 243.1 KB | 250.1 KB of 300 |
-| full build, gz | 385.4 KB | 392.5 KB of 500 |
+| full build, gz | 385.4 KB | 409.1 KB of 500 |
 
-The wasm sizes are without `wasm-opt`, which this machine lacks, so CI's numbers will be a little lower on both sides. Packing grantnav takes 3.5 s, which includes unpacking the result and comparing it with the input.
+The wasm sizes are without `wasm-opt`, which this machine lacks, so CI's numbers will be a little lower on both sides. Packing grantnav takes 3.5 s, which includes unpacking the result and comparing it with the input. The full build carries the packer as well as the unpacker (16 KB of the 24), so that the npm command can pack; the lite build has only the unpacker.
 
 **Tests.** In `pack.rs`: every column kind with NULLs and a short last group, under six option sets; the wire cut into chunks of 1, 7 and 4096 bytes with the output checked as a prefix of the image after every push; truncation at every 97th byte; 4,000 single-bit flips, none of which may panic or produce more than the declared length; an empty image. In `tests/load.rs`: a packed image streams in to the same fingerprint and the same query results as the image, split parts pack and attach, and a word index built while a packed image arrives equals the one built over the image.
 
@@ -301,12 +301,28 @@ units-2026-08.facetful: 183125 rows, 52 columns
 
 The order I picked by hand earlier (funder, programme, date) gave 6% at quality 11, which is 43.92 MB against the search's 44.61. So the greedy search finds most of the gain and not the best order: a first key that looks second best alone (funder) can lead somewhere better. Trying the best two or three at each level would cost that many times the run and is not built. It prints the `materialize` command that writes the sorted image, and a reminder that row order is also the order rows come back in without ORDER BY, the order a page sees while the image loads, and what lets a filter on the sort key skip row groups.
 
+**In a browser.** `bench/search-browsers` has both datasets in both forms (`?dataset=units-packed`, `grantnav-packed`). Headless Chromium on this laptop, brotli 9 on the paced profiles (the benchmark's own setting; grantnav is 67.6 MB plain and 52.4 MB packed at that quality), search index built while loading, image written to OPFS as it arrives:
+
+| table ready | as it is | packed |
+|---|---|---|
+| units, local (no network) | 257 ms | 288 ms |
+| units, 100 Mbit/s | 759 ms | 626 ms |
+| units, 20 Mbit/s | 3.52 s | 2.79 s |
+| grantnav, local | 2.32 s | 2.41 s |
+| grantnav, 100 Mbit/s | 5.68 s | 4.35 s |
+| grantnav, 20 Mbit/s | 27.3 s | 21.0 s |
+
+With no network the packed image costs 30 ms more on units and 80 ms on grantnav. On a paced connection it is ready sooner by about the bytes saved: 21 to 23% at these speeds. Every run wrote OPFS, and the repeat visit opened the kept copy in 3.2 to 4.7 ms with the index read back, the same as for a plain image: OPFS holds the unpacked image. Typing times are the same in both forms. Wasm memory after loading is 12 MB higher for packed grantnav (544 against 532 MB) and 20 MB for units (100 against 80).
+
+`js/facetful/browser-smoke.mjs` also loads a packed image with `persist` and a search index, compares the OPFS file with the plain image byte for byte, and attaches packed split parts.
+
+**The npm command** has `pack`, `unpack`, `sizes` and `order` (`js/facetful/bin/size.mjs`), and `inspect`, `query` and `materialize` take a packed file. It packs to the same bytes as the Rust CLI on both datasets. Sizes come from Node's zlib, so they differ slightly from the `brotli` and `gzip` commands (grantnav packed at brotli 5: 55.22 MB against 55.60). `order` on grantnav takes 260 s and picks the same order as the Rust CLI.
+
+
 **Not done, and why.**
 
-- **A browser check of `persist`.** `openStream` now gives `onChunk` the image's next bytes from the engine (`load_image_ptr`, `load_image_len`), so a packed download is written to OPFS unpacked. `worker.js` needed no change. In Node, streaming units and grantnav in either form, in four chunkings, the bytes `onChunk` receives join to the plain image and open with the same rows. The OPFS write and the repeat visit themselves have not been run in a browser.
-- **The npm command.** `pack`, `unpack`, `sizes` and `order` exist in the Rust CLI only. `js/facetful/bin/facetful.mjs` is being edited on main, and the wasm would need a packer export.
+- **A phone.** The browser runs are a laptop. Firefox was not run on the packed datasets.
 - **README and `docs/design.sv`.** Both READMEs have uncommitted edits on main, and `design.sv` has a lock file beside it. The format's own description is in `packed.rs` and `lib.rs`.
-- **A browser and a phone.** Every timing here is Node on this laptop.
 - **More speed in the unpacker.** Word codes were 0.45 s of a 0.52 s native unpack of grantnav. Copying words and plain runs as a fixed 16 or 8 bytes, where the buffers have room, halved the whole unpack to 0.27 s natively, and took the wasm load from 729 ms to 360 ms (units 78 to 53 ms) for 130 bytes of wasm. What is left: word codes are still about 0.2 s of the 0.27 s, and every output byte is zeroed before it is written.
 
 **Things asked about along the way, and measured.**
