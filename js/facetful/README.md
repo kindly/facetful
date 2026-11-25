@@ -129,16 +129,24 @@ without one.
 
 ## Publishing an image: brotli, or gzip
 
-The download is most of the wait, so serve images compressed. Brotli is the
-smallest (GEM units, 183K rows: 48 MB raw, 6.5 MB brotli, 8.9 MB gzip).
+The download is most of the wait, so serve images compressed. `publish`
+packs the image first (see "Packed images" below), then compresses it. GEM
+units, 183K rows, a 48 MB image:
+
+| | brotli | gzip |
+|---|---|---|
+| as it is | 6.5 MB | 8.9 MB |
+| packed (what `publish` writes) | 5.4 MB | 6.6 MB |
 
 ```
-npx facetful publish data.facetful out/    # writes out/data.facetful.br and out/data.facetful.gz
+npx facetful publish data.facetful out/    # packs, then writes out/data.facetful.br and out/data.facetful.gz
 npx facetful check-url https://…/data.facetful --origin https://your.site
 ```
 
-`publish` compresses (brotli at its best setting, which takes about a minute per
-50 MB) and prints the upload commands for the hosts below. `check-url` downloads
+`publish` packs, compresses (brotli at its best setting: 40 s for GEM units)
+and prints the upload commands for the hosts below. A page on an engine from
+before packed images can't read them; `--no-pack` writes copies of the image
+as it is. `check-url` also says whether what arrives is packed. `check-url` downloads
 the image as a browser would and says what the host does: compression, bytes
 on the wire, whether a whole image arrives, `Content-Type`, `Cache-Control`
 and CORS for `--origin`. It exits non-zero when something needs fixing.
@@ -170,7 +178,7 @@ facetful unpack in.facetful out.facetful
 facetful split in.facetful first.facetful second.facetful --columns a,b
 facetful sizes file.facetful [--gzip] [--quality 0-11]
 facetful order file.facetful [--gzip] [--quality 0-11] [--depth N] [--confirm]
-facetful publish file.facetful [out-dir]
+facetful publish file.facetful [out-dir] [--no-pack]
 facetful check-url https://…/file.facetful [--origin https://your.site]
 ```
 

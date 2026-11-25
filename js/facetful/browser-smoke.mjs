@@ -11,6 +11,7 @@ import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { gzipSync } from "node:zlib";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -123,7 +124,20 @@ window.__smoke = (async () => {
     await db.loadOpfs("pq1", "smoke/pp1.facetful");
     await db.attachOpfs("smoke/pp2.facetful", { table: "pq1" });
     eq(await res("pq1"), wholeRes, "parts kept from packed ones agree with the whole image");
-    for (const f of ["pk", "pp1", "pp2"]) await db.removeOpfs("smoke/" + f + ".facetful");
+    // facetful publish's .gz (GitHub Pages: a gzip file, no Content-Encoding),
+    // of the plain image and of the packed one: gunzipped in the page, the
+    // packed one then unpacked, and OPFS keeps the image either way
+    for (const [t, url] of [["gz", "/gz/spikes/facet-spike/data-200000.facetful"], ["pz", "/gz/packed/spikes/facet-spike/data-200000.facetful"]]) {
+      const z = await step("loadUrl(" + (t === "gz" ? "a .gz file" : "a .gz of the packed image") + ", index, persist)", () => db.loadUrl(t, url, { searchColumns: cols, persist: "smoke/" + t + ".facetful" }));
+      eq(z.rows, 200000, t + " loadUrl rows");
+      eq(z.persisted, true, t + " loadUrl wrote OPFS");
+      eq(await res(t), wholeRes, t + ": agrees with the whole image");
+      await db.buildSearchIndex(cols, { table: t });
+      eq((await db.query(sq(t), { table: t })).column("n")[0], viaStream, t + ": the index agrees");
+      const keptZ = new Uint8Array(await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle("smoke")).getFileHandle(t + ".facetful")).getFile().then((f) => f.arrayBuffer()));
+      if (keptZ.length !== plainBytes.length || !keptZ.every((b, i) => b === plainBytes[i])) throw new Error(t + ": OPFS does not hold the plain image");
+    }
+    for (const f of ["pk", "pp1", "pp2", "gz", "pz"]) await db.removeOpfs("smoke/" + f + ".facetful");
     // the search index kept in OPFS: built and saved on a first visit, read
     // back on the next (no rebuild), rebuilt when the columns change; one
     // built while streaming in is saved explicitly
@@ -155,7 +169,7 @@ window.__smoke = (async () => {
     eq(info.rows, 200000, "describe rows");
     eq(info.columns.find((c) => c.name === "country").dict, 200, "describe dictionary size");
     const mem = await step("memoryStats", () => db.memoryStats());
-    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 13) throw new Error("memoryStats: " + JSON.stringify(mem));
+    if (!(mem.wasmBytes > 1 << 20) || mem.tables !== 15) throw new Error("memoryStats: " + JSON.stringify(mem));
     let msg = "";
     try { await db.query("select contry from t", { table: "t" }); } catch (e) { msg = String(e.message); }
     if (!/unknown column 'contry'/.test(msg)) throw new Error("error path: " + msg);
@@ -188,10 +202,14 @@ const TYPES = { ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "a
 const server = createServer((req, res) => {
   const path = decodeURIComponent(new URL(req.url, "http://x").pathname);
   if (path === "/smoke.html") { res.writeHead(200, { "content-type": "text/html" }); return res.end(PAGE); }
+  // /gz/<path>: what follows, as a gzip file (facetful publish's .gz)
+  const gz = path.startsWith("/gz/");
+  const rest = gz ? path.slice(3) : path;
   // /packed/<image>: the image's packed form, as `facetful pack` writes it
-  const packing = path.startsWith("/packed/");
-  const file = join(root, packing ? path.slice(7) : path);
+  const packing = rest.startsWith("/packed/");
+  const file = join(root, packing ? rest.slice(7) : rest);
   if (!file.startsWith(root) || !existsSync(file)) { res.writeHead(404); return res.end(); }
+  if (gz) { res.writeHead(200, { "content-type": "application/gzip" }); return res.end(gzipSync(packing ? packed(file) : readFileSync(file), { level: 9 })); }
   if (packing) { res.writeHead(200, { "content-type": "application/octet-stream" }); return res.end(packed(file)); }
   const ext = path.slice(path.lastIndexOf("."));
   res.writeHead(200, { "content-type": TYPES[ext] ?? "application/octet-stream" });

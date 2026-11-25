@@ -41,7 +41,7 @@ const usage = () => {
        facetful split in.facetful first.facetful second.facetful --columns a,b
        facetful sizes file.facetful [--gzip] [--quality 0-11] [--jobs N]
        facetful order file.facetful [--gzip] [--quality 0-11] [--depth N] [--jobs N] [--confirm]
-       facetful publish file.facetful [out-dir]
+       facetful publish file.facetful [out-dir] [--no-pack]
        facetful check-url https://…/file.facetful [--origin https://your.site]`);
   process.exit(2);
 };
@@ -238,14 +238,32 @@ function convert(input, output, groupSize) {
  *  `.br` (brotli 11, 16 MB window) for hosts that can send it with
  *  `Content-Encoding: br` (S3, DigitalOcean Spaces), `.gz` for hosts that
  *  can't set headers (GitHub Pages), which `loadUrl` decompresses in the page.
- *  Both stream, so memory stays small whatever the image's size. */
-async function publish(input, outDir) {
+ *  Both are of the packed form (`facetful pack`), which compresses about a
+ *  fifth smaller and which `loadUrl` unpacks as it arrives; `--no-pack`
+ *  compresses the image as it is (for pages on an engine before 0.8). The
+ *  packed image is held in memory; compression streams. */
+async function publish(input, outDir, noPack) {
   const { basename, join, resolve } = await import("node:path");
   const { mkdirSync, statSync, createReadStream, createWriteStream } = await import("node:fs");
+  const { Readable } = await import("node:stream");
   const { pipeline } = await import("node:stream/promises");
   const zlib = await import("node:zlib");
   openLazy(input); // refuses anything that is not an image
-  const raw = statSync(input).size;
+  const onDisk = statSync(input).size;
+  let packed = null;
+  if (packedFiles.has(input)) {
+    console.error(`${input} is already packed`);
+  } else if (!noPack) {
+    const t0 = performance.now();
+    const img = engine.imageFrom(readFileSync(input));
+    try {
+      packed = engine.packImage(img);
+    } finally {
+      engine.freeImage(img);
+    }
+    console.error(`packed: ${human(packed.byteLength)} from ${human(onDisk)} (${((performance.now() - t0) / 1000).toFixed(1)} s)`);
+  }
+  const raw = packed ? packed.byteLength : onDisk;
   const dir = outDir ?? resolve(input, "..");
   mkdirSync(dir, { recursive: true });
   const name = basename(input);
@@ -258,7 +276,9 @@ async function publish(input, outDir) {
     const path = join(dir, `${name}.${ext}`);
     const t0 = performance.now();
     let done = 0, shown = -1;
-    const from = createReadStream(input, { highWaterMark: 1 << 20 });
+    const from = packed
+      ? Readable.from((function* () { for (let i = 0; i < packed.byteLength; i += 1 << 20) yield packed.subarray(i, i + (1 << 20)); })())
+      : createReadStream(input, { highWaterMark: 1 << 20 });
     from.on("data", (c) => {
       done += c.length;
       const pct = Math.floor((done / raw) * 100);
@@ -267,9 +287,12 @@ async function publish(input, outDir) {
     await pipeline(from, make(), createWriteStream(path));
     out[ext] = { path, bytes: statSync(path).size };
     if (process.stderr.isTTY) process.stderr.write("\r");
-    console.error(`${path}: ${human(out[ext].bytes)} (${((out[ext].bytes / raw) * 100).toFixed(1)}% of ${human(raw)}, ${((performance.now() - t0) / 1000).toFixed(1)} s)`);
+    console.error(`${path}: ${human(out[ext].bytes)} (${((out[ext].bytes / onDisk) * 100).toFixed(1)}% of the ${human(onDisk)} image, ${((performance.now() - t0) / 1000).toFixed(1)} s)`);
   }
-  console.error(`
+  console.error(`${packed || packedFiles.has(input) ? `
+Both are packed: the page needs facetful 0.8 or later (an older one says
+"unsupported format version 2"). --no-pack makes copies any version reads.
+` : ""}
 Where to put which (check the result with: facetful check-url <url>):
 
   S3 (or anything S3-like): upload the .br under the image's own name, saying
@@ -321,7 +344,7 @@ async function checkUrl(url, origin) {
   res.on("data", (c) => (wire += c.length));
   let inner = null;
   const take = (c) => {
-    if (image < 4) head = Buffer.concat([head, c]).subarray(0, 4);
+    if (image < 10) head = Buffer.concat([head, c]).subarray(0, 10);
     image += c.length;
     tail = Buffer.concat([tail, c]).subarray(-4);
   };
@@ -345,12 +368,14 @@ async function checkUrl(url, origin) {
     stream.on("end", () => (fileGzip ? inner.end() : ok()));
   });
   const secs = (performance.now() - t0) / 1000;
-  const whole = head.toString("latin1") === "FCT1" && tail.toString("latin1") === "FCT1";
+  const whole = head.toString("latin1", 0, 4) === "FCT1" && tail.toString("latin1") === "FCT1";
+  // the format version: 2 is the packed form
+  const packed = head.length === 10 && head.readUInt16LE(8) === 2;
   const pct = (a, b) => `${((a / b) * 100).toFixed(1)}%`;
   const lines = [];
   const say = (ok, s) => lines.push(`${ok === true ? "ok  " : ok === false ? "FIX " : "    "}${s}`);
   say(null, `${url}`);
-  say(null, `${human(wire)} on the wire for a ${human(image)} image (${pct(wire, image)}), ${secs.toFixed(1)} s`);
+  say(null, `${human(wire)} on the wire for a ${human(image)} ${packed ? "packed " : ""}image (${pct(wire, image)}), ${secs.toFixed(1)} s`);
   if (enc === "br") say(true, "Content-Encoding: br: browsers decompress it as it streams (the smallest)");
   else if (enc === "gzip" || enc === "deflate") say(null, `Content-Encoding: ${enc}: works, but brotli is usually 10-30% smaller (facetful publish)`);
   else if (fileGzip) say(true, "a gzip file: loadUrl decompresses it in the page as it streams (the GitHub Pages way)");
@@ -358,7 +383,8 @@ async function checkUrl(url, origin) {
   if (enc === "br" && u.protocol !== "https:") say(false, "brotli over plain http: browsers only ask for brotli over https");
   if (broken) say(false, `it doesn't decompress (${broken.code ?? broken.message}): cut short, or not really ${fileGzip ? "gzip" : enc}`);
   else if (!whole) say(false, `what arrives is not a whole facetful image${fileGzip ? " after gunzip" : ""}: wrong file, or cut short`);
-  else say(true, "a whole facetful image arrives");
+  else say(true, `a whole facetful image arrives${packed ? ", packed (the page needs facetful 0.8 or later)" : ""}`);
+  if (whole && !broken && !packed) say(null, "not packed: facetful publish packs it first, about a fifth less to download");
   say(null, `Content-Type: ${h["content-type"] ?? "(none)"}`);
   say(null, `Cache-Control: ${h["cache-control"] ?? "(none: browsers guess)"}`);
   const acao = h["access-control-allow-origin"];
@@ -370,9 +396,11 @@ async function checkUrl(url, origin) {
 
 try {
   if (cmd === "publish") {
+    const i = args.indexOf("--no-pack");
+    if (i >= 0) args.splice(i, 1);
     const { pos } = parse(args);
     if (pos.length < 1 || pos.length > 2) usage();
-    await publish(pos[0], pos[1]);
+    await publish(pos[0], pos[1], i >= 0);
   } else if (cmd === "check-url") {
     const i = args.indexOf("--origin");
     const origin = i >= 0 ? args.splice(i, 2)[1] : undefined;
