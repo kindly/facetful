@@ -17,3 +17,7 @@ search = ["facetful-engine/search"]
 # joins, CTEs and subqueries, materialize, compileTable (Parquet) and CSV
 # conversion: everything that writes an image. Off in the lite build.
 write = ["facetful-engine/write"]
+# pack, unpack, split and the size reports: what a publisher runs and a page
+# never does. Only in the build the facetful command loads
+# (facetful_cli.wasm), so pages do not download it.
+publish = ["write"]

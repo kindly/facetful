@@ -3,6 +3,9 @@
 # and the lite build (no default features: no search(), and nothing that writes
 # an image: no joins, CTEs, subqueries, materialize, Parquet compiling or CSV
 # conversion) within LITE_BUDGET_GZ.
+# The command's build (the full build plus the publishing commands: pack,
+# unpack, split, size reports) is built too and kept as facetful_cli.wasm
+# beside the others; no page downloads it, so it has no budget.
 # Runs wasm-opt -O3 when available (CI installs it; locally it degrades gracefully).
 # The full build runs last, so it is the artifact left for build-package.sh.
 set -euo pipefail
@@ -34,7 +37,11 @@ check() { # <label> <budget> <cargo feature flags…>
     raw=$(stat -c%s "$out")
     gz=$(gzip -9 -c "$out" | wc -c)
     echo "facetful-wasm ($label): raw ${raw} bytes, gzipped ${gz} bytes (budget ${budget})"
-    if [ "$gz" -gt "$budget" ]; then
+    # a build to keep under its own name: the next build overwrites $WASM
+    if [ -n "${KEEP:-}" ]; then cp "$out" "$KEEP"; fi
+    if [ "$budget" = none ]; then
+        echo "OK: $label has no budget"
+    elif [ "$gz" -gt "$budget" ]; then
         echo "FAIL: $label gzipped size ${gz} exceeds budget ${budget}" >&2
         status=1
     else
@@ -43,5 +50,6 @@ check() { # <label> <budget> <cargo feature flags…>
 }
 
 check lite "$LITE_BUDGET_GZ" --no-default-features
+KEEP=${WASM%facetful_wasm.wasm}facetful_cli.wasm check command none --features publish
 check full "$BUDGET_GZ"
 exit $status

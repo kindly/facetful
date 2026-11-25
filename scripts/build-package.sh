@@ -10,6 +10,8 @@ WASM=target/wasm32-unknown-unknown/release/facetful_wasm.wasm
 # the worker and browser smokes ran against a wasm without the new exports)
 [ "$WASM.opt" -nt "$WASM" ] && WASM="$WASM.opt"
 cp "$WASM" js/facetful/facetful_wasm.wasm
+# the command's own build, kept by size-check.sh (already optimized when wasm-opt ran)
+cp target/wasm32-unknown-unknown/release/facetful_cli.wasm js/facetful/facetful_cli.wasm
 
 node js/facetful/node-smoke.mjs
 node js/facetful/node-parquet-diff.mjs

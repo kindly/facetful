@@ -268,9 +268,10 @@ These are the built packer's files, compressed with the commands. They match the
 | grantnav through `openStream` in wasm (Node 26, 64 KB chunks, best of 3) | 217 ms | 360 ms |
 | GEM units, the same | 31 ms | 53 ms |
 | lite build, gz | 243.1 KB | 250.1 KB of 300 |
-| full build, gz | 385.4 KB | 414.0 KB of 500 |
+| full build, gz | 385.4 KB | 392.8 KB of 500 |
+| the command's build, gz (no page loads it) | | 414.0 KB |
 
-The wasm sizes are without `wasm-opt`, which this machine lacks, so CI's numbers will be a little lower on both sides. Packing grantnav takes 3.5 s, which includes unpacking the result and comparing it with the input. The full build carries the packer and `split` as well as the unpacker (21 KB of the 29), so that the npm command can pack and split; the lite build has only the unpacker.
+The wasm sizes are without `wasm-opt`, which this machine lacks, so CI's numbers will be a little lower on both sides. Packing grantnav takes 3.5 s, which includes unpacking the result and comparing it with the input. The packer and `split` are in neither build a page loads. They are 21 KB gz, and only the `facetful` command runs them, so they sit behind a `publish` feature that only the command's build (`facetful_cli.wasm`, shipped in the npm package beside `facetful_wasm.wasm`) turns on. A page pays for the unpacker alone, 7 KB. The cost is install size: the package carries two wasm files, 871 KB packed where one was about half that.
 
 **Tests.** In `pack.rs`: every column kind with NULLs and a short last group, under six option sets; the wire cut into chunks of 1, 7 and 4096 bytes with the output checked as a prefix of the image after every push; truncation at every 97th byte; 4,000 single-bit flips, none of which may panic or produce more than the declared length; an empty image. In `tests/load.rs`: a packed image streams in to the same fingerprint and the same query results as the image, split parts pack and attach, and a word index built while a packed image arrives equals the one built over the image.
 

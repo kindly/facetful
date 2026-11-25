@@ -91,9 +91,11 @@ data is known ahead of time.
 
 ## The `facetful` command
 
-The command is the wasm engine under Node — the same module the browser
-loads, so images, SQL and user-defined functions are identical wherever they
-run. CSV conversion streams (`facetful-format::stream`): two passes over the
+The command is the wasm engine under Node, so images, SQL and user-defined
+functions are identical wherever they run. It loads `facetful_cli.wasm`: the
+module the browser loads, built with the publishing commands added (the
+`publish` feature), so that pages do not download code only a publisher
+runs. CSV conversion streams (`facetful-format::stream`): two passes over the
 input, row groups written as they finish, bounded memory whatever the file
 size, byte-identical to what the browser's own `loadCsv`/`openParquet` build.
 

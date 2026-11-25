@@ -33,6 +33,7 @@
     "bin/facetful.mjs",
     "bin/size.mjs",
     "facetful_wasm.wasm",
+    "facetful_cli.wasm",
     "README.md",
     "LICENSE"
   ],

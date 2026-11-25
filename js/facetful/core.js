@@ -516,7 +516,7 @@ export class Engine {
    * to openImage().
    */
   imageFrom(bytes) {
-    this._needsWrite("reading an image");
+    this._needsPublish("reading an image");
     const img = this._image(this.w.image_new(bytes.byteLength));
     new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), bytes.byteLength).set(bytes);
     if (!this.w.image_is_packed(img)) return img;
@@ -530,7 +530,7 @@ export class Engine {
   /** The packed form of an image (handle): smaller to download, and
    *  unpacked by the loader as it arrives. The handle stays the caller's. */
   packImage(img) {
-    this._needsWrite("packing an image");
+    this._needsPublish("packing an image");
     const packed = this._image(this.w.image_pack(img));
     try {
       return this.imageBytes(packed);
@@ -542,7 +542,7 @@ export class Engine {
   /** Each column's share of the packed image, in column order (for size
    *  reports: compress each to see what the column costs to download). */
   packShares(img) {
-    this._needsWrite("packing an image");
+    this._needsPublish("packing an image");
     return this._parts(this._image(this.w.image_pack_shares(img)));
   }
 
@@ -553,7 +553,7 @@ export class Engine {
    * [first, second] as bytes.
    */
   splitImage(img, columns) {
-    this._needsWrite("splitting an image");
+    this._needsPublish("splitting an image");
     const names = this.enc.encode(columns.join("\0"));
     const p = u32(this.w.alloc(names.byteLength));
     new Uint8Array(this.mem(), p, names.byteLength).set(names);
@@ -665,6 +665,10 @@ export class Engine {
    *  conversion, materialize, joins, CTEs or subqueries. */
   _needsWrite(what) {
     if (!this.w.compile_begin) throw new Error(`${what} needs the full facetful build (this one is lite)`);
+  }
+
+  _needsPublish(what) {
+    if (!this.w.image_pack) throw new Error(`${what} needs the facetful command's build (facetful_cli.wasm): the builds for pages leave the publishing commands out`);
   }
 
   /** Make `handle` reachable by `name` from other tables' queries (FROM / JOIN). */

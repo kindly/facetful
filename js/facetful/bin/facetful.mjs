@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // The facetful command, on the same wasm engine the browser runs (design.sv
-// d51): one `npm install facetful` gives the library and this.
+// d51): one `npm install facetful` gives the library and this. It loads
+// facetful_cli.wasm, the full build with the publishing commands added
+// (pack, unpack, split, sizes, order), which pages have no use for.
 //
 //   facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
 //   facetful inspect file.facetful [--json]
@@ -46,7 +48,7 @@ const opfsRead = (fileId, offset, dest) => {
   if (fd === undefined) return -1;
   return readSync(fd, dest, 0, dest.length, offset);
 };
-const engine = await instantiate(readFileSync(new URL("../facetful_wasm.wasm", import.meta.url)), opfsRead);
+const engine = await instantiate(readFileSync(new URL("../facetful_cli.wasm", import.meta.url)), opfsRead);
 for (const u of builtinUdfs) engine.registerFunction(u.name, u.signature, u.fn);
 
 const packedFiles = new Set();

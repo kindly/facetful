@@ -39,7 +39,8 @@ npx facetful inspect data.facetful      # rows, row groups, sort keys; per colum
 ```
 
 The command runs the same wasm engine the browser does (Node is the second
-runtime), so a `.facetful` built here is exactly what `openParquet` would have
+runtime; its build, `facetful_cli.wasm`, adds the publishing commands, which
+the build a page loads leaves out), so a `.facetful` built here is exactly what `openParquet` would have
 built, and SQL — including your registered functions, via `--udf module.mjs` —
 behaves identically in both places. CSV can also be opened directly in the
 browser with `loadCsv` (below). The ready-made functions (`json_extract`,

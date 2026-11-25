@@ -1560,13 +1560,14 @@ pub extern "C" fn image_len(h: usize) -> usize {
     unsafe { &*(h as *const Vec<u8>) }.len()
 }
 
-// ---------------- packed images (the facetful command) ----------------
+// ---------------- packing and splitting (the facetful command) ----------------
 
-#[cfg(feature = "write")]
+#[cfg(feature = "publish")]
 mod pack_exports {
-// The packer is for publishing, so it lives with what writes images and
-// stays out of the lite build. The unpacker a page needs is in the loader
-// (`load_push`, `table_open`), whatever the features.
+// Publishing steps, which only the facetful command runs: they are in its
+// own build (the `publish` feature, facetful_cli.wasm) and in neither build
+// a page loads. The unpacker a page needs is in the loader (`load_push`,
+// `table_open`), whatever the features.
 
 use facetful_engine::format::{pack, packed};
 use std::sync::Mutex;

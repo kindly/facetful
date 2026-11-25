@@ -4,6 +4,7 @@ target-simd/
 dist/
 *.wasm.gz
 js/facetful/facetful_wasm.wasm
+js/facetful/facetful_cli.wasm
 
 # dependencies
 node_modules/

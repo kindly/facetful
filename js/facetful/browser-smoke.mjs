@@ -170,8 +170,9 @@ window.__smoke = (async () => {
 })();
 </script>`;
 
-// ---- packed images, made here by the engine the page will unpack them with
-const packer = await (await import("./core.js")).instantiate(readFileSync(join(root, "js/facetful/facetful_wasm.wasm")));
+// ---- packed images, made here by the command's build of the engine (the
+// page's build can only unpack)
+const packer = await (await import("./core.js")).instantiate(readFileSync(join(root, "js/facetful/facetful_cli.wasm")));
 const packedCache = new Map();
 function packed(file) {
   if (!packedCache.has(file)) {
