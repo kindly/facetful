@@ -6,15 +6,26 @@
 //! the streamed groups against it and the table carries on with the footer's
 //! catalog (statistics, layout flags): no copy, no second parse of the data.
 //!
+//! A packed image (`format::packed`) is unpacked as it arrives: its bytes go
+//! through an `Unpacker`, which appends the image they stand for to the same
+//! buffer a whole row group at a time, and everything else here reads that
+//! buffer as if the image had been sent as it is.
+//!
 //! The table is not queried before `finish`: masks and statistics assume a
 //! table that no longer changes.
 
+use crate::format::packed::{self, Unpacker};
 use crate::format::read::{self, NextGroup, ReadAt};
 use crate::format::FormatError;
 use crate::Table;
 
 pub struct TableLoad<S: ReadAt> {
-    /// bytes received before the header and dictionaries were complete
+    /// the first bytes received, until there are enough to tell a packed
+    /// image from one sent as it is
+    sniff: Option<Vec<u8>>,
+    /// for a packed image: turns what arrives into the image
+    unpacker: Option<Unpacker>,
+    /// the image's bytes before its header and dictionaries were complete
     pending: Vec<u8>,
     table: Option<Table<S>>,
     /// where the next row group starts
@@ -36,6 +47,8 @@ impl<S: ReadAt> TableLoad<S> {
     /// Images whose header gives their length need none.
     pub fn new(expected_len: usize) -> TableLoad<S> {
         TableLoad {
+            sniff: Some(Vec::new()),
+            unpacker: None,
             pending: Vec::with_capacity(expected_len),
             table: None,
             next: 0,
@@ -49,25 +62,45 @@ impl<S: ReadAt> TableLoad<S> {
         }
     }
 
-    /// Append the next bytes of the image.
+    /// Append the next bytes of the image, or of its packed form.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), FormatError> {
-        match &mut self.table {
-            None => {
-                self.pending.extend_from_slice(chunk);
-                let Some((cat, first)) = read::open_prefix(&self.pending)? else { return Ok(()) };
-                let mut bytes = std::mem::take(&mut self.pending);
-                // the header says how long the image is: room for all of it
-                // now rather than doubling as it arrives
-                if let Some(n) = cat.image_len {
-                    bytes.reserve_exact((n as usize).saturating_sub(bytes.len()));
-                }
-                let src = S::from_memory(bytes).ok_or(FormatError::Io("source cannot hold memory"))?;
-                self.table = Some(Table::from_catalog(src, cat));
-                self.next = first;
-                #[cfg(feature = "search")]
-                self.start_index()?;
+        if let Some(first) = &mut self.sniff {
+            first.extend_from_slice(chunk);
+            if first.len() < 10 {
+                return Ok(());
             }
-            Some(t) => t.src.memory_mut().ok_or(FormatError::Io("source cannot grow"))?.extend_from_slice(chunk),
+            let first = self.sniff.take().expect("checked above");
+            if packed::is_packed(&first) {
+                self.unpacker = Some(Unpacker::new());
+            }
+            return self.take(&first);
+        }
+        self.take(chunk)
+    }
+
+    /// `push` once the first bytes have said which form is arriving.
+    fn take(&mut self, chunk: &[u8]) -> Result<(), FormatError> {
+        let image = match &mut self.table {
+            None => &mut self.pending,
+            Some(t) => t.src.memory_mut().ok_or(FormatError::Io("source cannot grow"))?,
+        };
+        match &mut self.unpacker {
+            Some(un) => un.push(chunk, image)?,
+            None => image.extend_from_slice(chunk),
+        }
+        if self.table.is_none() {
+            let Some((cat, first)) = read::open_prefix(&self.pending)? else { return Ok(()) };
+            let mut bytes = std::mem::take(&mut self.pending);
+            // the header says how long the image is: room for all of it
+            // now rather than doubling as it arrives
+            if let Some(n) = cat.image_len {
+                bytes.reserve_exact((n as usize).saturating_sub(bytes.len()));
+            }
+            let src = S::from_memory(bytes).ok_or(FormatError::Io("source cannot hold memory"))?;
+            self.table = Some(Table::from_catalog(src, cat));
+            self.next = first;
+            #[cfg(feature = "search")]
+            self.start_index()?;
         }
         let t = self.table.as_mut().expect("opened above");
         let bytes = t.src.read_ref(0, t.src.len() as usize).expect("memory source");
@@ -85,6 +118,20 @@ impl<S: ReadAt> TableLoad<S> {
         Ok(())
     }
 
+    /// The image is arriving packed (known from its first 10 bytes on).
+    pub fn packed(&self) -> bool {
+        self.unpacker.is_some()
+    }
+
+    /// The image's bytes so far. For a packed image these are what a
+    /// loader keeps for the next visit (OPFS), not the bytes it was sent.
+    pub fn image(&self) -> &[u8] {
+        match &self.table {
+            Some(t) => t.src.read_ref(0, t.src.len() as usize).unwrap_or(&[]),
+            None => &self.pending,
+        }
+    }
+
     /// The header and dictionaries are in: the schema is known.
     pub fn header_ready(&self) -> bool {
         self.table.is_some()
@@ -95,9 +142,11 @@ impl<S: ReadAt> TableLoad<S> {
         self.table.as_ref().map_or(0, |t| t.cat.groups.len())
     }
 
-    /// Bytes received.
+    /// Bytes of the image so far: those received, or for a packed image
+    /// those unpacked.
     pub fn bytes(&self) -> usize {
-        self.table.as_ref().map_or(self.pending.len(), |t| t.src.len() as usize)
+        let sniffed = self.sniff.as_ref().map_or(0, |s| s.len());
+        sniffed + self.table.as_ref().map_or(self.pending.len(), |t| t.src.len() as usize)
     }
 
     /// Build the word index over these columns while the image arrives
@@ -138,6 +187,9 @@ impl<S: ReadAt> TableLoad<S> {
     /// build (`search_index_step` finishes it). Should the footer disagree
     /// with what was streamed, the index starts over from the footer's groups.
     pub fn finish(self) -> Result<Table<S>, FormatError> {
+        if self.unpacker.as_ref().is_some_and(|un| !un.done()) {
+            return Err(FormatError::Truncated);
+        }
         let mut t = self.table.ok_or(FormatError::Truncated)?;
         let full = read::open(&t.src)?;
         let agrees = t.cat.groups.len() <= full.groups.len()

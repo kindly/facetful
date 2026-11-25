@@ -144,6 +144,14 @@ pub struct FacetResult {
 
 impl<S: ReadAt> Table<S> {
     pub fn open(src: S) -> Result<Self, FormatError> {
+        // a packed image held in memory is unpacked; one that is not in
+        // memory (OPFS) has to be stored unpacked
+        if let Some(wire) = src.read_ref(0, src.len() as usize).filter(|b| format::packed::is_packed(b)) {
+            let image = format::packed::unpack(wire)?;
+            let src = S::from_memory(image).ok_or(FormatError::Io("a packed image must be unpacked before it is opened here"))?;
+            let cat = read::open(&src)?;
+            return Ok(Self::from_catalog(src, cat));
+        }
         let cat = read::open(&src)?;
         Ok(Self::from_catalog(src, cat))
     }

@@ -248,7 +248,7 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
 
 /// Bytes of the dictionary lens table that follows the header (0 without
 /// dictionary columns).
-fn dict_table_len(schema: &Schema) -> usize {
+pub(crate) fn dict_table_len(schema: &Schema) -> usize {
     let ndict = schema.columns.iter().filter(|c| c.is_dict()).count();
     if ndict == 0 { 0 } else { crate::align_up(ndict * 8) }
 }

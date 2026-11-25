@@ -9,6 +9,8 @@
 
 use facetful_format as fmt;
 
+mod size;
+
 use fmt::Stats;
 use std::process::exit;
 
@@ -40,6 +42,10 @@ fn main() {
         Some("materialize") => materialize(&args[1..]),
         Some("join") => join(&args[1..]),
         Some("split") => split(&args[1..]),
+        Some("pack") => pack(&args[1..], true),
+        Some("unpack") => pack(&args[1..], false),
+        Some("sizes") => size::sizes(&args[1..]),
+        Some("order") => size::order(&args[1..]),
         _ => {
             eprintln!("usage: facetful convert in.csv out.facetful [--row-group-size N]");
             eprintln!("       facetful inspect file.facetful");
@@ -47,9 +53,62 @@ fn main() {
             eprintln!("       facetful materialize in.facetful \"select …\" out.facetful [--row-group-size N]");
             eprintln!("       facetful join left.facetful right.facetful out.facetful --on l=r[,l2=r2] [--columns a,b] [--inner]");
             eprintln!("       facetful split in.facetful first.facetful second.facetful --columns a,b");
+            eprintln!("       facetful pack in.facetful out.facetful     (smaller to download; opens the same)");
+            eprintln!("       facetful unpack in.facetful out.facetful");
+            eprintln!("       facetful sizes file.facetful [--gzip]      (what each column costs to download)");
+            eprintln!("       facetful order file.facetful [--gzip]      (row orders that compress better)");
             exit(2);
         }
     }
+}
+
+// ---------------- pack / unpack ----------------
+
+/// An image file's bytes: unpacked, when the file holds the packed form.
+pub(crate) fn read_image(path: &str) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("cannot read {path}: {e}");
+        exit(1);
+    });
+    if !fmt::packed::is_packed(&bytes) {
+        return bytes;
+    }
+    fmt::packed::unpack(&bytes).unwrap_or_else(|e| {
+        eprintln!("{path}: {e}");
+        exit(1);
+    })
+}
+
+/// `facetful pack in out`: the image in its packed form, which is smaller
+/// to download (before and after brotli or gzip) and which every loader
+/// unpacks into the same image as it arrives. `facetful unpack in out`
+/// gives the image back, byte for byte. Either takes either form.
+fn pack(args: &[String], packing: bool) {
+    let [input, output] = args else {
+        eprintln!("usage: facetful {} in.facetful out.facetful", if packing { "pack" } else { "unpack" });
+        exit(2);
+    };
+    let on_disk = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
+    let image = read_image(input);
+    let out = if packing {
+        fmt::pack::pack(&image).unwrap_or_else(|e| {
+            eprintln!("{input}: {e}");
+            exit(1);
+        })
+    } else {
+        // not an image: say so here, not when it is next opened
+        let src: &[u8] = &image;
+        if let Err(e) = fmt::read::open(&src) {
+            eprintln!("{input}: {e}");
+            exit(1);
+        }
+        image
+    };
+    std::fs::write(output, &out).unwrap_or_else(|e| {
+        eprintln!("cannot write {output}: {e}");
+        exit(1);
+    });
+    eprintln!("{output}: {} bytes ({} from {on_disk})", out.len(), if packing { "packed" } else { "unpacked" });
 }
 
 // ---------------- split ----------------
@@ -77,7 +136,7 @@ fn split(args: &[String]) {
         eprintln!("{e}");
         exit(1);
     };
-    let bytes = std::fs::read(input).unwrap_or_else(|e| fail(format!("cannot read {input}: {e}")));
+    let bytes = read_image(input);
     let src: &[u8] = &bytes;
     let cat = fmt::read::open(&src).unwrap_or_else(|e| fail(format!("{input}: {e:?}")));
     let cols: Vec<usize> = columns
@@ -436,10 +495,8 @@ fn inspect(args: &[String]) {
         eprintln!("usage: facetful inspect file.facetful");
         exit(2);
     });
-    let bytes = std::fs::read(path).unwrap_or_else(|e| {
-        eprintln!("cannot read {path}: {e}");
-        exit(1);
-    });
+    let on_disk = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let bytes = read_image(path);
     let src: &[u8] = &bytes;
     let cat = fmt::read::open(&src).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
@@ -447,6 +504,9 @@ fn inspect(args: &[String]) {
     });
     println!("{path}: format v{}, {} rows, {} row groups (target {})",
         cat.version, cat.total_rows, cat.groups.len(), cat.row_group_target);
+    if on_disk != bytes.len() as u64 {
+        println!("packed: {on_disk} bytes, {} unpacked (the sizes below)", bytes.len());
+    }
     if !cat.sorted_by.is_empty() {
         let keys: Vec<String> = cat.sorted_by.iter()
             .map(|k| format!("{}{}", cat.schema.columns[k.column as usize].name, if k.descending { " desc" } else { "" }))

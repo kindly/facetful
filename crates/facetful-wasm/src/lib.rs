@@ -240,8 +240,8 @@ pub extern "C" fn format_version() -> u32 {
     facetful_engine::format::VERSION as u32
 }
 
-/// Takes ownership of an `alloc`'d buffer holding a whole .facetful file.
-/// Returns a table handle, or 0 on parse failure.
+/// Takes ownership of an `alloc`'d buffer holding a whole .facetful file,
+/// packed or not. Returns a table handle, or 0 on parse failure.
 #[no_mangle]
 pub extern "C" fn table_open(ptr: *mut u8, len: usize) -> usize {
     let bytes = unsafe { Vec::from_raw_parts(ptr, len, len) };
@@ -282,6 +282,30 @@ pub extern "C" fn load_push(h: usize, ptr: *const u8, len: usize) -> i32 {
     let l = unsafe { &mut *(h as *mut facetful_engine::load::TableLoad<Src>) };
     let chunk = unsafe { core::slice::from_raw_parts(ptr, len) };
     if l.push(chunk).is_ok() { 0 } else { -1 }
+}
+
+/// Whether the image is arriving packed (`format::packed`): 1 or 0, known
+/// once 10 bytes are in. The bytes to keep for a later visit are then the
+/// unpacked ones (`load_image_ptr`, `load_image_len`), not those pushed.
+#[no_mangle]
+pub extern "C" fn load_packed(h: usize) -> u32 {
+    let l = unsafe { &*(h as *const facetful_engine::load::TableLoad<Src>) };
+    l.packed() as u32
+}
+
+/// The image so far, unpacked when it arrives packed. It only grows: the
+/// bytes before an earlier `load_image_len` do not change, but the pointer
+/// may, so both are read again after every `load_push`.
+#[no_mangle]
+pub extern "C" fn load_image_ptr(h: usize) -> *const u8 {
+    let l = unsafe { &*(h as *const facetful_engine::load::TableLoad<Src>) };
+    l.image().as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn load_image_len(h: usize) -> usize {
+    let l = unsafe { &*(h as *const facetful_engine::load::TableLoad<Src>) };
+    l.image().len()
 }
 
 /// Row groups whose bytes are complete; -1 until the header and

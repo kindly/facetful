@@ -1,0 +1,15 @@
+# Spike: how much smaller can an image be on the wire? See docs/file-size.sv.
+[package]
+name = "size-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+facetful-format = { path = "../../crates/facetful-format" }
+
+[profile.release]
+opt-level = 3
+debug = false

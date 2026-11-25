@@ -15,10 +15,15 @@
 //! 8-byte alignment so a loaded segment can be viewed as its native type directly —
 //! the on-disk bytes of a segment ARE the in-memory representation (zero-decode).
 //! No serde anywhere: the codec is hand-rolled little-endian.
+//!
+//! For the wire an image can be packed (`pack`, `packed`): a smaller form the
+//! loader unpacks back into the same bytes as they arrive.
 
 mod cluster;
 pub mod compile;
 pub mod fxhash;
+pub mod pack;
+pub mod packed;
 pub mod stream;
 pub mod time;
 pub mod read;
@@ -27,6 +32,10 @@ pub mod write;
 
 pub const MAGIC: [u8; 4] = *b"FCT1";
 pub const VERSION: u16 = 1;
+/// The version in the header of a packed image (`packed`): a transport form
+/// that unpacks to a version 1 image, byte for byte. Readers of images
+/// refuse it as they refuse any version above `VERSION`.
+pub const PACKED_VERSION: u16 = 2;
 /// Max segments a single column contributes to one row group
 /// (dict columns: codes + dict offsets + dict bytes).
 pub const MAX_SEGS: usize = 3;

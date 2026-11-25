@@ -193,8 +193,10 @@ export class Engine {
    * Uint8Array (a fetch body). With `searchColumns`, the word index is built
    * a row group at a time as groups complete, so it is ready with the table
    * instead of being built after. `expectedBytes` (the image's size, when
-   * known) allocates the buffer once; `onChunk(bytes)` sees each chunk after
-   * it is taken (to write it to OPFS, say). Returns { handle, rows,
+   * known) allocates the buffer once; `onChunk(bytes)` sees the image's next
+   * bytes after each chunk is taken (to write them to OPFS, say): the chunk
+   * itself, or for a packed image the bytes it unpacked to, so what is kept
+   * opens on the next visit without unpacking. Returns { handle, rows,
    * indexedWhileLoading, indexLeft }: row groups indexed before the last
    * byte, and those still to index (when the download outran indexing;
    * `stepSearchIndex` finishes them, search() scans until then).
@@ -203,6 +205,8 @@ export class Engine {
     if (searchColumns && !this.w.load_index_columns) throw new Error("this facetful build has no search index (lite build)");
     const h = this.w.load_begin(expectedBytes);
     let indexed = 0;
+    // image bytes already given to onChunk
+    let kept = 0;
     try {
       if (searchColumns) {
         const names = this.enc.encode(searchColumns.join("\0"));
@@ -223,7 +227,17 @@ export class Engine {
         const rc = this.w.load_push(h, p, chunk.byteLength);
         this.w.dealloc(p, chunk.byteLength);
         if (rc < 0) throw new Error("not a valid .facetful image, or a column to index is not a text column in it");
-        if (onChunk) await onChunk(chunk);
+        if (onChunk) {
+          // the engine's copy of the image so far, not the chunk: a packed
+          // image's chunks are not the image's bytes. Copied out, since
+          // wasm memory may move while onChunk is awaited.
+          const len = this.w.load_image_len(h);
+          if (len > kept) {
+            const bytes = new Uint8Array(this.mem(), u32(this.w.load_image_ptr(h)) + kept, len - kept).slice();
+            kept = len;
+            await onChunk(bytes);
+          }
+        }
         // index a group when the source has kept us waiting (we are level
         // with the download, so indexing costs nothing); chunks that are
         // already there mean the download is ahead, and the table should not
