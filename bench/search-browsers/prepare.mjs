@@ -11,7 +11,7 @@ import zlib from "node:zlib";
 import { execFileSync } from "node:child_process";
 
 const root = new URL("../../", import.meta.url).pathname;
-const out = "/tmp/browserdb-search-browsers/assets";
+const out = `${process.env.SEARCH_BENCH_DIR ?? "/tmp/browserdb-search-browsers"}/assets`;
 fs.mkdirSync(out, { recursive: true });
 const esbuild = process.env.ESBUILD || "/home/david/projects/gem-query/node_modules/esbuild/bin/esbuild";
 const run = (cmd, args) => execFileSync(cmd, args, { cwd: root, stdio: "inherit" });
@@ -35,11 +35,17 @@ const link = (src, name) => {
   if (!fs.existsSync(dst)) fs.symlinkSync(src, dst);
 };
 link(grantnav, "grantnav.facetful");
-link(path.join(root, "data/units-2026-08.facetful"), "units.facetful");
+link(process.env.UNITS || path.join(root, "data/units-2026-08.facetful"), "units.facetful");
 if (!fs.existsSync(`${out}/grantnav-1.facetful`)) {
   run(path.join(root, "target/release/facetful"), ["split", grantnav, `${out}/grantnav-1.facetful`, `${out}/grantnav-2.facetful`, "--columns", "Description Rare,Identifier"]);
 }
-const files = ["units.facetful", "grantnav.facetful", "grantnav-1.facetful", "grantnav-2.facetful"];
+// the packed form of each (facetful pack): what the page unpacks as it arrives
+for (const name of ["units", "grantnav"]) {
+  if (!fs.existsSync(`${out}/${name}-packed.facetful`)) {
+    run(path.join(root, "target/release/facetful"), ["pack", `${out}/${name}.facetful`, `${out}/${name}-packed.facetful`]);
+  }
+}
+const files = ["units.facetful", "grantnav.facetful", "grantnav-1.facetful", "grantnav-2.facetful", "units-packed.facetful", "grantnav-packed.facetful"];
 const manifest = { preparedAt: new Date().toISOString(), files: {} };
 for (const f of files) {
   const raw = fs.statSync(`${out}/${f}`).size;

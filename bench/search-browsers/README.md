@@ -6,9 +6,10 @@ ranked top 20 at every keystroke), keeps the image and index in OPFS, reopens
 them on a fresh page, and (grantnav) loads a split image. Results go back to
 the server as JSON lines.
 
-Datasets: GEM units (183,125 rows, a typical dashboard) and grantnav (1.52M
-rows, the stress case; read from `~/projects/gratnav` in place, or
-`GRANTNAV=`). Network profiles: `local` (the file as it is, as fast as it
+Datasets: GEM units (183,125 rows, a typical dashboard; `data/`, or `UNITS=`)
+and grantnav (1.52M rows, the stress case; read from `~/projects/gratnav` in
+place, or `GRANTNAV=`). `units-packed` and `grantnav-packed` are the same
+data as packed images (`facetful pack`). Network profiles: `local` (the file as it is, as fast as it
 goes: what the device costs) and `100mbps` / `20mbps` (brotli, paced, with
 latency: what users see).
 
@@ -19,6 +20,8 @@ node bench/search-browsers/prepare.mjs     # wasm, bundles, split parts, brotli 
 node bench/search-browsers/run.mjs         # BROWSERS=chromium,firefox DATASETS=units,grantnav PROFILES=local,20mbps
 node bench/search-browsers/summarize.mjs /tmp/browserdb-search-browsers/results-*.jsonl
 ```
+
+`SEARCH_BENCH_DIR=` moves everything written from `/tmp/browserdb-search-browsers`.
 
 Each run starts the browser headless with a fresh profile on the page's URL
 and waits for the page to post that it is done; no browser automation

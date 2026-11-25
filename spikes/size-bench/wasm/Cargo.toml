@@ -1,0 +1,26 @@
+# The unpacker alone, as wasm: decode speed and code size (unpack-bench.mjs).
+[package]
+name = "unpack-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+facetful-format = { path = "../../../crates/facetful-format" }
+
+[features]
+# without it only the allocator and the header parser are left: the size baseline
+unpack = []
+default = ["unpack"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

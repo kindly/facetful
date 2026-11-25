@@ -23,6 +23,16 @@ are designed around repeated queries over immutable datasets.
   build or publish time. The page fetches it with `loadUrl()` and opens it as
   it arrives, with no decoding or conversion in the browser. This is the
   primary path.
+- **Packed images**: `facetful pack` rewrites an image in a form that
+  compresses better, about 20% less to download after brotli and 25 to 30%
+  after gzip. `loadUrl()` unpacks it a row group at a time as it arrives,
+  into the same bytes the plain image has, so queries, OPFS and repeat
+  visits are unchanged. `facetful sizes` shows what each column costs to
+  download and `facetful order` looks for a row order that compresses
+  better.
+- **Split images**: `facetful split` writes an image as two files with the
+  same rows. The page loads the first (the columns its filters and totals
+  need) and can answer, then `attach()`es the second; SQL sees one table.
 - **Parquet input**: when the source can only be Parquet at runtime,
   `openParquet()` transcodes in the browser (hyparquet + the same Rust
   compiler the CLI uses), caches the image in OPFS keyed by content hash, and
@@ -86,11 +96,17 @@ data is known ahead of time.
 
 ## The `facetful` command
 
-The command is the wasm engine under Node — the same module the browser
-loads, so images, SQL and user-defined functions are identical wherever they
-run. CSV conversion streams (`facetful-format::stream`): two passes over the
+The command is the wasm engine under Node, so images, SQL and user-defined
+functions are identical wherever they run. It loads `facetful_cli.wasm`: the
+module the browser loads, built with the publishing commands added (the
+`publish` feature), so that pages do not download code only a publisher
+runs. CSV conversion streams (`facetful-format::stream`): two passes over the
 input, row groups written as they finish, bounded memory whatever the file
 size, byte-identical to what the browser's own `loadCsv`/`openParquet` build.
+
+Besides `convert`, `query`, `materialize` and `inspect` it has the
+publishing commands `pack`, `unpack`, `split`, `sizes` and `order`
+(`js/facetful/README.md`; measurements in `docs/file-size.sv`).
 
 The Rust CLI (`crates/facetful-cli`) is a **development tool**, not a user
 path: benchmarks, the SQLite differential, `inspect`, native profiling. It

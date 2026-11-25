@@ -193,8 +193,10 @@ export class Engine {
    * Uint8Array (a fetch body). With `searchColumns`, the word index is built
    * a row group at a time as groups complete, so it is ready with the table
    * instead of being built after. `expectedBytes` (the image's size, when
-   * known) allocates the buffer once; `onChunk(bytes)` sees each chunk after
-   * it is taken (to write it to OPFS, say). Returns { handle, rows,
+   * known) allocates the buffer once; `onChunk(bytes)` sees the image's next
+   * bytes after each chunk is taken (to write them to OPFS, say): the chunk
+   * itself, or for a packed image the bytes it unpacked to, so what is kept
+   * opens on the next visit without unpacking. Returns { handle, rows,
    * indexedWhileLoading, indexLeft }: row groups indexed before the last
    * byte, and those still to index (when the download outran indexing;
    * `stepSearchIndex` finishes them, search() scans until then).
@@ -203,6 +205,8 @@ export class Engine {
     if (searchColumns && !this.w.load_index_columns) throw new Error("this facetful build has no search index (lite build)");
     const h = this.w.load_begin(expectedBytes);
     let indexed = 0;
+    // image bytes already given to onChunk
+    let kept = 0;
     try {
       if (searchColumns) {
         const names = this.enc.encode(searchColumns.join("\0"));
@@ -223,7 +227,17 @@ export class Engine {
         const rc = this.w.load_push(h, p, chunk.byteLength);
         this.w.dealloc(p, chunk.byteLength);
         if (rc < 0) throw new Error("not a valid .facetful image, or a column to index is not a text column in it");
-        if (onChunk) await onChunk(chunk);
+        if (onChunk) {
+          // the engine's copy of the image so far, not the chunk: a packed
+          // image's chunks are not the image's bytes. Copied out, since
+          // wasm memory may move while onChunk is awaited.
+          const len = this.w.load_image_len(h);
+          if (len > kept) {
+            const bytes = new Uint8Array(this.mem(), u32(this.w.load_image_ptr(h)) + kept, len - kept).slice();
+            kept = len;
+            await onChunk(bytes);
+          }
+        }
         // index a group when the source has kept us waiting (we are level
         // with the download, so indexing costs nothing); chunks that are
         // already there mean the download is ahead, and the table should not
@@ -496,6 +510,92 @@ export class Engine {
     return new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), u32(this.w.image_len(img))).slice();
   }
 
+  /**
+   * An image handle over a copy of `bytes`, a .facetful file in either
+   * form: a packed image is unpacked. Free it with freeImage(), or hand it
+   * to openImage().
+   */
+  imageFrom(bytes) {
+    this._needsPublish("reading an image");
+    const img = this._image(this.w.image_new(bytes.byteLength));
+    new Uint8Array(this.mem(), u32(this.w.image_ptr(img)), bytes.byteLength).set(bytes);
+    if (!this.w.image_is_packed(img)) return img;
+    try {
+      return this._image(this.w.image_unpack(img));
+    } finally {
+      this.w.image_free(img);
+    }
+  }
+
+  /** The packed form of an image (handle): smaller to download, and
+   *  unpacked by the loader as it arrives. The handle stays the caller's. */
+  packImage(img) {
+    this._needsPublish("packing an image");
+    const packed = this._image(this.w.image_pack(img));
+    try {
+      return this.imageBytes(packed);
+    } finally {
+      this.w.image_free(packed);
+    }
+  }
+
+  /** Each column's share of the packed image, in column order (for size
+   *  reports: compress each to see what the column costs to download). */
+  packShares(img) {
+    this._needsPublish("packing an image");
+    return this._parts(this._image(this.w.image_pack_shares(img)));
+  }
+
+  /**
+   * The image (handle) as the two parts of a split image: `columns` go to
+   * the second part, the rest stay in the first. A page loads the first
+   * and `attach`es the second, and queries them as one table. Returns
+   * [first, second] as bytes.
+   */
+  splitImage(img, columns) {
+    this._needsPublish("splitting an image");
+    const names = this.enc.encode(columns.join("\0"));
+    const p = u32(this.w.alloc(names.byteLength));
+    new Uint8Array(this.mem(), p, names.byteLength).set(names);
+    // the pair's id: random, so that parts of different splits never attach
+    const id = crypto.getRandomValues(new BigUint64Array(1))[0];
+    try {
+      return this._parts(this._image(this.w.image_split(img, p, names.byteLength, id)));
+    } finally {
+      this.w.dealloc(p, names.byteLength);
+    }
+  }
+
+  /** Byte strings out of one handle (a count, their lengths, then each),
+   *  which is freed. */
+  _parts(h) {
+    try {
+      const at = u32(this.w.image_ptr(h));
+      const view = new DataView(this.mem(), at, u32(this.w.image_len(h)));
+      const n = view.getUint32(0, true);
+      let p = at + 4 + 8 * n;
+      return Array.from({ length: n }, (_, i) => {
+        const len = Number(view.getBigUint64(4 + 8 * i, true));
+        const share = new Uint8Array(this.mem(), p, len).slice();
+        p += len;
+        return share;
+      });
+    } finally {
+      this.w.image_free(h);
+    }
+  }
+
+  freeImage(img) {
+    this.w.image_free(img);
+  }
+
+  /** An image handle, or the engine's reason there is none. */
+  _image(h) {
+    if (h) return h;
+    const n = this.w.image_error(this.scratch, 4096);
+    throw new Error(this.dec.decode(new Uint8Array(this.mem(), this.scratch, n)));
+  }
+
   /** Open a table over a compiled image; consumes the image handle (no copy). */
   openImage(img) {
     this._needsWrite("opening a compiled image");
@@ -565,6 +665,10 @@ export class Engine {
    *  conversion, materialize, joins, CTEs or subqueries. */
   _needsWrite(what) {
     if (!this.w.compile_begin) throw new Error(`${what} needs the full facetful build (this one is lite)`);
+  }
+
+  _needsPublish(what) {
+    if (!this.w.image_pack) throw new Error(`${what} needs the facetful command's build (facetful_cli.wasm): the builds for pages leave the publishing commands out`);
   }
 
   /** Make `handle` reachable by `name` from other tables' queries (FROM / JOIN). */

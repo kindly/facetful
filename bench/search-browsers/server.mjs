@@ -10,7 +10,10 @@ import fs from "node:fs";
 import os from "node:os";
 import { EventEmitter } from "node:events";
 
-export const ASSETS = "/tmp/browserdb-search-browsers/assets";
+// SEARCH_BENCH_DIR moves everything this benchmark writes (grantnav's copies
+// are large for a small /tmp)
+export const DIR = process.env.SEARCH_BENCH_DIR ?? "/tmp/browserdb-search-browsers";
+export const ASSETS = `${DIR}/assets`;
 export const PROFILES = {
   local: null,
   "100mbps": { mbps: 100, latency: 20 },
@@ -78,9 +81,9 @@ export async function startServer({ port = 0, host = "127.0.0.1", out } = {}) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const s = await startServer({ port: Number(process.argv[2] ?? 8077), host: "0.0.0.0", out: "/tmp/browserdb-search-browsers/manual.jsonl" });
+  const s = await startServer({ port: Number(process.argv[2] ?? 8077), host: "0.0.0.0", out: `${DIR}/manual.jsonl` });
   const lan = Object.values(os.networkInterfaces()).flat().filter((a) => a.family === "IPv4" && !a.internal).map((a) => a.address);
   console.log(`serving on port ${s.port}; open on a device: ${lan.map((ip) => `http://${ip}:${s.port}/?dataset=units`).join("  ")}`);
-  console.log("results are appended to /tmp/browserdb-search-browsers/manual.jsonl");
+  console.log(`results are appended to ${DIR}/manual.jsonl`);
   s.results.on("result", (r) => console.log(`${r.phase ?? ""} ${r.dataset ?? ""}: ${r.error ? "ERROR " + r.error : "ok"}`));
 }

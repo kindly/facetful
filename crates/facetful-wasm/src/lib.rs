@@ -240,8 +240,8 @@ pub extern "C" fn format_version() -> u32 {
     facetful_engine::format::VERSION as u32
 }
 
-/// Takes ownership of an `alloc`'d buffer holding a whole .facetful file.
-/// Returns a table handle, or 0 on parse failure.
+/// Takes ownership of an `alloc`'d buffer holding a whole .facetful file,
+/// packed or not. Returns a table handle, or 0 on parse failure.
 #[no_mangle]
 pub extern "C" fn table_open(ptr: *mut u8, len: usize) -> usize {
     let bytes = unsafe { Vec::from_raw_parts(ptr, len, len) };
@@ -282,6 +282,30 @@ pub extern "C" fn load_push(h: usize, ptr: *const u8, len: usize) -> i32 {
     let l = unsafe { &mut *(h as *mut facetful_engine::load::TableLoad<Src>) };
     let chunk = unsafe { core::slice::from_raw_parts(ptr, len) };
     if l.push(chunk).is_ok() { 0 } else { -1 }
+}
+
+/// Whether the image is arriving packed (`format::packed`): 1 or 0, known
+/// once 10 bytes are in. The bytes to keep for a later visit are then the
+/// unpacked ones (`load_image_ptr`, `load_image_len`), not those pushed.
+#[no_mangle]
+pub extern "C" fn load_packed(h: usize) -> u32 {
+    let l = unsafe { &*(h as *const facetful_engine::load::TableLoad<Src>) };
+    l.packed() as u32
+}
+
+/// The image so far, unpacked when it arrives packed. It only grows: the
+/// bytes before an earlier `load_image_len` do not change, but the pointer
+/// may, so both are read again after every `load_push`.
+#[no_mangle]
+pub extern "C" fn load_image_ptr(h: usize) -> *const u8 {
+    let l = unsafe { &*(h as *const facetful_engine::load::TableLoad<Src>) };
+    l.image().as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn load_image_len(h: usize) -> usize {
+    let l = unsafe { &*(h as *const facetful_engine::load::TableLoad<Src>) };
+    l.image().len()
 }
 
 /// Row groups whose bytes are complete; -1 until the header and
@@ -470,6 +494,10 @@ pub extern "C" fn table_describe(t: usize, out: *mut u8, cap: usize) -> u32 {
         if c.is_dict() {
             let n = t.dictionary(ci).map(|d| d.len()).unwrap_or(0);
             s.push_str(&format!(",\"dict\":{n}"));
+            // the dictionary's own bytes, which "bytes" (the codes) leaves out
+            if let Some(d) = cat.dicts.get(ci).copied().flatten() {
+                s.push_str(&format!(",\"dictBytes\":{}", d.offsets_len as u64 + d.bytes_len as u64));
+            }
         }
         if cat.clustered.get(ci).copied().unwrap_or(false) {
             s.push_str(",\"clustered\":true");
@@ -1530,6 +1558,118 @@ pub extern "C" fn image_ptr(h: usize) -> *const u8 {
 #[no_mangle]
 pub extern "C" fn image_len(h: usize) -> usize {
     unsafe { &*(h as *const Vec<u8>) }.len()
+}
+
+// ---------------- packing and splitting (the facetful command) ----------------
+
+#[cfg(feature = "publish")]
+mod pack_exports {
+// Publishing steps, which only the facetful command runs: they are in its
+// own build (the `publish` feature, facetful_cli.wasm) and in neither build
+// a page loads. The unpacker a page needs is in the loader (`load_push`,
+// `table_open`), whatever the features.
+
+use facetful_engine::format::{pack, packed};
+use std::sync::Mutex;
+
+/// Why the last call here returned 0.
+static ERROR: Mutex<String> = Mutex::new(String::new());
+
+fn done(r: Result<Vec<u8>, facetful_engine::format::FormatError>) -> usize {
+    match r {
+        Ok(bytes) => Box::into_raw(Box::new(bytes)) as usize,
+        Err(e) => {
+            *ERROR.lock().unwrap() = e.to_string();
+            0
+        }
+    }
+}
+
+fn image(h: usize) -> &'static Vec<u8> {
+    unsafe { &*(h as *const Vec<u8>) }
+}
+
+/// An image handle of `len` zero bytes for JS to fill through `image_ptr`
+/// (a file read in, say). 0 when there is no memory for it.
+#[no_mangle]
+pub extern "C" fn image_new(len: usize) -> usize {
+    let mut v: Vec<u8> = Vec::new();
+    if v.try_reserve_exact(len).is_err() {
+        *ERROR.lock().unwrap() = "not enough memory for the image".into();
+        return 0;
+    }
+    v.resize(len, 0);
+    Box::into_raw(Box::new(v)) as usize
+}
+
+#[no_mangle]
+pub extern "C" fn image_is_packed(h: usize) -> u32 {
+    packed::is_packed(image(h)) as u32
+}
+
+/// The packed form of an image, as a new handle; 0 with `image_error`.
+#[no_mangle]
+pub extern "C" fn image_pack(h: usize) -> usize {
+    done(pack::pack(image(h)))
+}
+
+/// The image a packed one unpacks to, as a new handle; 0 with `image_error`.
+#[no_mangle]
+pub extern "C" fn image_unpack(h: usize) -> usize {
+    done(packed::unpack(image(h)))
+}
+
+/// Each column's share of the packed image, for size reports: a count
+/// (u32), that many lengths (u64 each), then the shares end to end.
+#[no_mangle]
+pub extern "C" fn image_pack_shares(h: usize) -> usize {
+    done(pack::pack_columns(image(h), pack::Opts::ALL).map(|shares| {
+        let mut out = (shares.len() as u32).to_le_bytes().to_vec();
+        shares.iter().for_each(|s| out.extend_from_slice(&(s.len() as u64).to_le_bytes()));
+        shares.iter().for_each(|s| out.extend_from_slice(s));
+        out
+    }))
+}
+
+/// The image as the two parts of a split image (`facetful split`): the
+/// columns named (separated by 0 bytes) go to the second part. One handle
+/// laid out like `image_pack_shares`: a count of 2, two lengths, the parts.
+/// `id` is the pair's split id, random and not 0.
+#[no_mangle]
+pub extern "C" fn image_split(h: usize, names: *const u8, names_len: usize, id: u64) -> usize {
+    let src: &[u8] = image(h);
+    let names = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(names, names_len) }).into_owned();
+    let cat = match facetful_engine::format::read::open(&src) {
+        Ok(cat) => cat,
+        Err(e) => return done(Err(e)),
+    };
+    let mut cols = Vec::new();
+    for name in names.split('\0') {
+        match cat.schema.columns.iter().position(|c| c.name == name) {
+            Some(ci) => cols.push(ci),
+            None => {
+                *ERROR.lock().unwrap() = format!("the image has no column {name:?}");
+                return 0;
+            }
+        }
+    }
+    done(facetful_engine::format::split::split(&src, &cols, id | 1).map(|(a, b)| {
+        let mut out = 2u32.to_le_bytes().to_vec();
+        out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        out.extend_from_slice(&a);
+        out.extend_from_slice(&b);
+        out
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn image_error(buf: *mut u8, cap: usize) -> usize {
+    let e = ERROR.lock().unwrap();
+    let n = e.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(e.as_ptr(), buf, n) };
+    n
+}
 }
 
 /// Open a table directly over a compiled image, consuming the handle

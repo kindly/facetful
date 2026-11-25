@@ -150,11 +150,12 @@ export declare class Facetful {
   load(name: string, buffer: ArrayBuffer): Promise<LoadResult>;
 
   /**
-   * Fetch a .facetful image and open it as it arrives. With `searchColumns`
+   * Fetch a .facetful image, plain or packed (`facetful pack`: unpacked a
+   * row group at a time), and open it as it arrives. With `searchColumns`
    * the search index is built a row group at a time during the download and
    * is ready with the table, or finishes in the background when the download
    * outruns indexing (`searchReady: false`; see `searchReady()`). `persist` (an OPFS path) writes the image there
-   * as it arrives, for `loadOpfs` on a later visit. `expectedBytes` sizes the
+   * as it arrives (a packed image is written unpacked), for `loadOpfs` on a later visit. `expectedBytes` sizes the
    * buffer once when the server compresses the response.
    */
   loadUrl(
@@ -177,7 +178,13 @@ export declare class Facetful {
   /** `attach` from a part stored in OPFS (opened lazily, like `loadOpfs`). */
   attachOpfs(path: string, options?: { table?: string; cacheBytes?: number }): Promise<{ columns: number; elapsedMs: number }>;
 
-  /** Resolves when the table's search index, from `loadUrl`, is in use. */
+  /**
+   * Resolves when the table's search index, from `loadUrl`, is in use.
+   * Await it before a `search()` query on a table loaded with
+   * `searchColumns`: when the download outran indexing
+   * (`searchReady: false`), `search()` finds no rows until the index is
+   * finished.
+   */
   searchReady(options?: { table?: string }): Promise<void>;
 
   /**

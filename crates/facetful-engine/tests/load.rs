@@ -125,3 +125,89 @@ fn indexing_a_column_that_is_not_text_is_an_error() {
     }
     assert!(failed, "a non-text column to index fails the load");
 }
+
+/// A packed image is the image to everything that opens it: whole or as it
+/// arrives, alone or as the parts of a split, with the same fingerprint (so
+/// a saved search index still fits).
+#[test]
+fn packed_images_open_as_the_images_they_pack() {
+    use facetful_engine::format::pack::pack;
+    use facetful_engine::format::split::split;
+    let queries = [
+        "select count(*), count(capacity), count(distinct owner), sum(capacity) from t",
+        "select country, count(*) as n, sum(capacity) from t group by country order by n desc, country limit 5",
+        "select id, owner from t where capacity > 250 and status = 'status_1' order by capacity desc, id limit 20",
+    ];
+    // data-1000000 predates the length in the header
+    for file in ["data-200000.facetful", "data-1000000.facetful"] {
+        let bytes = fixture(file);
+        let wire = pack(&bytes).unwrap();
+        assert!(wire.len() < bytes.len(), "{file}: {} packed from {}", wire.len(), bytes.len());
+        let mut whole = Table::open(bytes.clone()).unwrap();
+        let mut opened = Table::open(wire.clone()).unwrap();
+        assert_eq!(opened.fingerprint(), whole.fingerprint(), "{file}");
+        for chunk in [1 << 20, 4099] {
+            let mut load = TableLoad::<Vec<u8>>::new(0);
+            for c in wire.chunks(chunk) {
+                load.push(c).unwrap();
+                assert!(load.bytes() <= bytes.len());
+            }
+            assert!(load.packed());
+            assert_eq!((load.groups_ready(), load.bytes()), (whole.group_count(), bytes.len()), "{file}");
+            let mut t = load.finish().unwrap();
+            assert_eq!(t.fingerprint(), whole.fingerprint(), "{file}");
+            for sql in queries {
+                assert_eq!(rows_of(&mut t, sql), rows_of(&mut whole, sql), "{file}: {sql}");
+                assert_eq!(rows_of(&mut opened, sql), rows_of(&mut whole, sql), "{file}: {sql}");
+            }
+        }
+        // a download cut short is not a table
+        let mut load = TableLoad::<Vec<u8>>::new(0);
+        load.push(&wire[..wire.len() - 1]).unwrap();
+        assert!(load.finish().is_err(), "{file}");
+        // a source that cannot hold the unpacked image says so
+        let borrowed: &[u8] = &wire;
+        assert!(Table::open(borrowed).is_err());
+    }
+    // each part of a split packs on its own
+    let bytes = fixture("data-200000.facetful");
+    let mut whole = Table::open(bytes.clone()).unwrap();
+    let second: Vec<usize> = ["owner", "capacity", "fuel"].iter().map(|n| whole.column_index(n).unwrap()).collect();
+    let src: &[u8] = &bytes;
+    let (a, b) = split(&src, &second, 42).unwrap();
+    let mut parts = [pack(&a).unwrap(), pack(&b).unwrap()].map(|wire| {
+        let mut load = TableLoad::<Vec<u8>>::new(0);
+        for c in wire.chunks(4096) {
+            load.push(c).unwrap();
+        }
+        Some(load.finish().unwrap())
+    });
+    let mut t = parts[0].take().unwrap();
+    t.attach(parts[1].take().unwrap()).unwrap();
+    for sql in queries {
+        assert_eq!(rows_of(&mut t, sql), rows_of(&mut whole, sql), "split: {sql}");
+    }
+}
+
+/// A word index built while a packed image arrives is the one built over
+/// the image.
+#[cfg(feature = "search")]
+#[test]
+fn a_packed_image_indexes_as_it_arrives() {
+    let bytes = fixture("data-200000.facetful");
+    let wire = facetful_engine::format::pack::pack(&bytes).unwrap();
+    let mut whole = Table::open(bytes).unwrap();
+    let country = whole.column_index("country").unwrap();
+    whole.build_search_index(&[country]).unwrap();
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    load.index_columns(&["country"]).unwrap();
+    for c in wire.chunks(1 << 16) {
+        load.push(c).unwrap();
+        load.index_step(1).unwrap();
+    }
+    let mut t = load.finish().unwrap();
+    while t.search_index_step(8).unwrap() > 0 {}
+    assert_eq!(t.save_search_index(), whole.save_search_index());
+    let sql = "select count(*) from t where search('country_3', country)";
+    assert_eq!(rows_of(&mut t, sql), rows_of(&mut whole, sql));
+}
