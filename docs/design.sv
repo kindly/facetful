@@ -31,6 +31,8 @@ Design rule: **the on-disk bytes of a column segment are exactly the in-memory r
 [footer_len: u32 LE] [magic "FCT1"]
 ```
 
+**A packed form for the wire (format version 2, November 2026).** `facetful pack` re-encodes an image so that brotli and gzip do better on it: text and dictionary values end in a 0 byte in place of offsets, common words become one or two byte codes, and identifiers ending in digits, decimals and rising integers are stored as numbers. It is a transfer form only. The loader unpacks it a row group at a time into the version 1 image above, byte for byte, so the design rule holds for what the engine reads and for what OPFS keeps. Layout and measurements: d61 and `docs/file-size.sv`.
+
 **Readable from both ends** (the Arrow IPC trick): the header carries everything known before writing begins (schema, sort order), each row group is **self-framing** (its group header gives row count + segment lengths), and the footer is the random-access index. That yields three consumption modes from one file:
 1. **Streaming GET / no range support**: render the first 64K rows as soon as group 0 arrives, then group by group — no need for the whole file.
 2. **HTTP range**: `tail(8) → footer → exactly the segments a query needs`.
@@ -1326,4 +1328,42 @@ Cold and next-click are the same picture (`bench/facet-fuse.mjs`). The batch bea
 **gratnav on the widened set** (same harness, bca70e6 → 77b43b5): top funder 25 → 19 ms, London 27 → 18, a year bar 23 → 17, search 32 → 20, clear-all 73 → 62, the measure toggle and funder card unchanged; the 13-action sequence's engine time 385 → 311 ms — 540 before batching. Its refresh as one batch in Node: London 32.5 → 18.4 ms, London + a year 22.2 → 7.4, search 16.8 → 4.7, unfiltered 54.0 → 56.6. It slimmed its totals statement to count + sum, deriving the funder count and year span from the facet rows, and reports the remaining number: with `count(distinct funder)` and `min`/`max` in an **unfiltered, ungrouped** totals the ordinary path still costs ~10 ms (56.6 vs 46.1 ms for the unfiltered refresh); filtered, the fusion covers it within 0.5–2 ms. Open, and cheap if it matters: with no WHERE, `min`/`max` of a stored numeric column are the footer's stats folded over the groups, and `count(distinct dictcol)` is the dictionary size less any code no row carries — metadata, not a scan. That belongs in the ordinary aggregate path, not the batch.
 
 **Not done, deliberately.** `avg`, the filters-except-own one-pass trick (no longer the fastest route), and the metadata answer for unfiltered extremes above.
+</sv-prose>
+
+<sv-prose id="d61">
+## Build log 38 — packed images: a smaller download, the same image (2026-11-25)
+
+The research, the prototype and every measurement are in `docs/file-size.sv`. This is the record of what the format and the engine now do.
+
+**The form.** A packed image is the image's header with the version set to 2, then:
+
+```
+image_len: u64                    the unpacked image's length
+prelude_len: u32
+prelude:    the dictionary lens table as it is
+            one: u8               how many word codes are one byte (0xFF: no word codes)
+            per text column:      its word list (count, then words each ending in 0)
+            per dictionary:       tag (stored / values ending in 0 / word codes), then the values
+row groups: wire_len: u32 (not 0), rows: u32, null counts as varints, then per column
+            text:   tag (stored / ending in 0 / numbered / word codes) and payload
+            float:  tag (stored / decimal) and payload
+            int:    tag (stored / delta) and payload
+            codes and bools as stored, without padding; the validity bitmap if there are NULLs
+0: u32                            no more groups
+footer_len: u32, then the footer through the closing magic
+```
+
+The unpacker (`facetful-format/src/packed.rs`) writes version 1 back into the header and rebuilds offsets, padding and group headers, so its output is the image byte for byte. The packer (`pack.rs`) chooses each column's encoding by simple rules (word codes for text of 64 KB or more that is nearly all ASCII; numbered identifiers when 90% of values end in digits; decimals unless a quarter are exceptions; delta when it halves the entropy), stores anything it cannot represent, and unpacks its own output to compare before returning it. A tag this build does not know is refused by name.
+
+**Why a transfer form and not a new image.** The in-memory layout, `Table::attach`, fingerprints, the search index's header and OPFS all hang on the version 1 bytes. Unpacking to exactly those bytes means none of them changed, and a repeat visit, which reads OPFS, never unpacks.
+
+**In the engine.** `TableLoad::push` looks at the first 10 bytes; for version 2 it feeds chunks through an `Unpacker` into the same buffer the streaming load already fills, so `open_prefix`, `next_group` and the per-group search index run as before. `Table::open` unpacks a packed image held in memory. The wasm exports `load_packed`, `load_image_ptr` and `load_image_len`, and `openStream` hands `onChunk` the image's bytes from the engine, which is how `persist` writes OPFS unpacked. An engine from before this reads the version and refuses with "unsupported format version 2".
+
+**Measured.** After brotli 11, grantnav 58.0 → 46.9 MB and GEM units 6.83 → 5.63 MB; after gzip 9, 83.0 → 58.2 MB and 9.35 → 6.96 MB. In Chromium, grantnav is ready in 21.0 s against 27.3 s at 20 Mbit/s and in 2.41 s against 2.32 s with no network; the repeat visit opens from OPFS in 3 ms either way. The unpacker is 7 KB gz in both builds. The packer and `split` are in the full build only (the `write` feature), 21 KB more: 414 KB of the 500.
+
+**Commands**, in the npm command and the Rust CLI: `pack`, `unpack`, `sizes` (each column's share of the download), `order` (a greedy search for a row order that compresses better). `split` moved into the npm command as well.
+
+**A bug worth remembering.** Speeding up the word decoder (fixed 16 byte copies in place of exact ones, which halved unpacking) left stray bytes in a dictionary's padding: 2 bytes of GEM units' image. Row counts and query results did not notice; comparing the unpacked bytes with the image did. The packer's own compare would have refused to pack it, but an image packed earlier unpacked wrong. The test image now has a long dictionary followed by more of the prelude, which is what it took to reach the fast path.
+
+**Open.** A column derived from another (GEM units' wiki URL is the plant name with underscores, 1.03 MB of 6.96 after gzip), a wider order search, a phone measurement, and `search()` finding nothing on a streamed table until its index is finished (older than this work; `searchReady()` is the way round it).
 </sv-prose>

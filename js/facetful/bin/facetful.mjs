@@ -7,6 +7,7 @@
 //   facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
 //   facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf …]
 //   facetful pack|unpack in.facetful out.facetful
+//   facetful split in.facetful first.facetful second.facetful --columns a,b
 //   facetful sizes file.facetful [--gzip] [--quality N]
 //   facetful order file.facetful [--gzip] [--quality N] [--depth N] [--confirm]
 //
@@ -31,6 +32,7 @@ const usage = () => {
        facetful materialize in.facetful "select …" out.facetful [--table name=path …] [--udf module.mjs …]
        facetful pack in.facetful out.facetful      the packed form: smaller to download
        facetful unpack in.facetful out.facetful
+       facetful split in.facetful first.facetful second.facetful --columns a,b
        facetful sizes file.facetful [--gzip] [--quality 0-11] [--jobs N]
        facetful order file.facetful [--gzip] [--quality 0-11] [--depth N] [--jobs N] [--confirm]`);
   process.exit(2);
@@ -276,6 +278,8 @@ try {
     }
   } else if (cmd === "pack" || cmd === "unpack") {
     (await import("./size.mjs")).pack(engine, args, cmd === "pack");
+  } else if (cmd === "split") {
+    (await import("./size.mjs")).split(engine, args);
   } else if (cmd === "sizes") {
     await (await import("./size.mjs")).sizes(engine, args);
   } else if (cmd === "order") {

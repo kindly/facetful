@@ -115,7 +115,8 @@ lite build too. Design and measurements: `docs/result-handles.sv`.
 
 | method | use when |
 |---|---|
-| `loadUrl(name, url)` | the default: a `.facetful` image built ahead of time by `facetful convert`, fetched from a static host |
+| `loadUrl(name, url)` | the default: a `.facetful` image built ahead of time by `facetful convert`, plain or packed (`facetful pack`), fetched from a static host |
+| `attach(url, {table})` | the second file of a split image (`facetful split`): its columns join a table already loaded |
 | `load(name, buf)` | you already hold a `.facetful` image as an ArrayBuffer |
 | `openParquet(name, buf)` | the source is Parquet at runtime: converted in the browser on the first visit, OPFS-cached after |
 | `loadCsv(name, fileOrBuffer, {persist})` | a CSV: streamed through the converter in the worker, types inferred, optionally persisted |
@@ -129,8 +130,14 @@ without one.
 
 ```
 facetful convert in.csv|in.parquet out.facetful [--row-group-size N]
+facetful inspect file.facetful [--json]
 facetful query file.facetful ["select …"] [--table name=other.facetful …] [--udf module.mjs …]
 facetful materialize in.facetful "select …" out.facetful [--table …] [--udf …]
+facetful pack in.facetful out.facetful
+facetful unpack in.facetful out.facetful
+facetful split in.facetful first.facetful second.facetful --columns a,b
+facetful sizes file.facetful [--gzip] [--quality 0-11]
+facetful order file.facetful [--gzip] [--quality 0-11] [--depth N] [--confirm]
 ```
 
 `convert` streams: two passes over the CSV (types and dictionaries, then
@@ -141,6 +148,80 @@ datetime, text; repeated text is dictionary-encoded. `query` without SQL is a
 REPL; tables open lazily, so large files don't load into memory. The
 ready-made functions are registered; a `--udf` module's default export adds
 your own, as an array of `{ name, signature, fn }`.
+
+## A smaller, sooner download: `pack`, `split`, `sizes`, `order`
+
+What a page waits for on a first visit is the download. Four commands cut
+it, and none of them changes the SQL or the results.
+
+**`facetful pack`** writes the image in a packed form that compresses
+better. Serve it with brotli or gzip like any other file.
+
+| after compression | as it is | packed |
+|---|---|---|
+| GEM units (183,125 rows, 52 columns), brotli 11 | 6.83 MB | 5.63 MB |
+| the same, gzip 9 | 9.35 MB | 6.96 MB |
+| grantnav (1.52M rows, long text), brotli 11 | 58.0 MB | 46.9 MB |
+| the same, gzip 9 | 83.0 MB | 58.2 MB |
+
+```js
+await db.loadUrl("plants", "data.packed.facetful", { persist: "plants.facetful" });
+```
+
+- `loadUrl`, `attach` and `load` take either form and tell them apart from
+  the first bytes. Nothing in the page changes.
+- The engine unpacks each row group as it arrives into exactly the bytes of
+  the plain image, so the table and a search index built while loading are
+  ready as before.
+- `persist` writes the unpacked image to OPFS. A repeat visit opens it with
+  `loadOpfs` in a few milliseconds and never unpacks.
+- Unpacking costs processor time, hidden behind the download on any
+  ordinary connection. In Chromium on a laptop, grantnav was ready in 21.0 s
+  packed against 27.3 s plain at 20 Mbit/s, and in 2.41 s against 2.32 s
+  with no network at all.
+- A packed image is format version 2. An engine older than the one that
+  introduced it refuses the file with "unsupported format version 2", so
+  publish packed images only with a matching `facetful` package.
+- `facetful unpack` gives the original image back, byte for byte. `inspect`,
+  `query` and `materialize` read a packed file directly.
+
+**`facetful split`** writes an image as two files with the same rows. The
+columns you name go to the second file; the first keeps the rest.
+
+```
+facetful split units.facetful first.facetful second.facetful \
+  --columns "GEM.Wiki URL,Owner(s),Latitude,Longitude"
+```
+
+```js
+await db.loadUrl("units", "first.facetful");   // filters, totals and charts answer from here
+await db.attach("second.facetful", { table: "units" }); // the table's other columns arrive
+```
+
+This is the pattern for a dashboard. A table cannot answer anything until
+its file has fully arrived, so keep the first file to the columns the
+filters, totals and charts read, and put what only the result table shows
+in the second. For GEM units, a first file with five filter columns,
+capacity and start year is 0.4 MB compressed where the whole image is 5.6 MB
+or more. A query that names a column not yet attached fails with a clear
+error; after `attach` the SQL is unchanged, one table. Both parts can be
+packed, and both take `persist` (`attachOpfs` on later visits).
+
+**`facetful sizes`** prints the download size as it is and packed, then each
+column's share, largest first. A column the page never reads is cheapest
+left out altogether: `facetful materialize`, naming the columns to keep.
+
+**`facetful order`** tries sort keys and reports the row order that makes
+the packed download smallest, with the `materialize` command that writes
+it. It is a greedy search over a few columns, not a proof. On grantnav it
+found an order 4.8% smaller. Row order is also the order rows come back in
+without `ORDER BY`, and what lets a filter on the sort key skip row groups,
+so size is not the only thing to choose it by. `sizes` and `order` compress
+with Node's zlib at brotli window 24 or gzip 9; `--quality` trades accuracy
+for time (default 11 for `sizes`, 5 for `order`).
+
+The measurements and the packed layout are in `docs/file-size.sv` in the
+repository.
 
 ## Derived tables: `materialize`
 

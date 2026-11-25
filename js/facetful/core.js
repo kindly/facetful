@@ -543,7 +543,32 @@ export class Engine {
    *  reports: compress each to see what the column costs to download). */
   packShares(img) {
     this._needsWrite("packing an image");
-    const h = this._image(this.w.image_pack_shares(img));
+    return this._parts(this._image(this.w.image_pack_shares(img)));
+  }
+
+  /**
+   * The image (handle) as the two parts of a split image: `columns` go to
+   * the second part, the rest stay in the first. A page loads the first
+   * and `attach`es the second, and queries them as one table. Returns
+   * [first, second] as bytes.
+   */
+  splitImage(img, columns) {
+    this._needsWrite("splitting an image");
+    const names = this.enc.encode(columns.join("\0"));
+    const p = u32(this.w.alloc(names.byteLength));
+    new Uint8Array(this.mem(), p, names.byteLength).set(names);
+    // the pair's id: random, so that parts of different splits never attach
+    const id = crypto.getRandomValues(new BigUint64Array(1))[0];
+    try {
+      return this._parts(this._image(this.w.image_split(img, p, names.byteLength, id)));
+    } finally {
+      this.w.dealloc(p, names.byteLength);
+    }
+  }
+
+  /** Byte strings out of one handle (a count, their lengths, then each),
+   *  which is freed. */
+  _parts(h) {
     try {
       const at = u32(this.w.image_ptr(h));
       const view = new DataView(this.mem(), at, u32(this.w.image_len(h)));

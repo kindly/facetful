@@ -1,5 +1,5 @@
 // What an image costs to download, and what would make it cost less: the
-// facetful command's pack, unpack, sizes and order (docs/file-size.sv).
+// facetful command's pack, unpack, split, sizes and order (docs/file-size.sv).
 //
 // Size is what a host sends: the packed image after brotli (window 24, the
 // `brotli` command's -w 24) or gzip 9, compressed here by Node's zlib.
@@ -92,6 +92,30 @@ export function pack(engine, argv, packing) {
   if (!packing) engine.openImage(img); // not an image: say so here, not when it is next opened
   writeFileSync(output, out);
   console.error(`${output}: ${out.byteLength} bytes (${packing ? "packed" : "unpacked"} from ${onDisk})`);
+}
+
+/**
+ * `facetful split in first second --columns a,b`: the image as two files a
+ * page loads one after the other (`loadUrl`, then `attach`) and queries as
+ * one table. The columns named go to the second; the first is what the page
+ * needs before it can answer. Either part can then be packed.
+ */
+export function split(engine, argv) {
+  const pos = [];
+  let columns;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--columns") columns = argv[++i];
+    else pos.push(argv[i]);
+  }
+  if (pos.length !== 3 || !columns || pos.some((a) => a.startsWith("--"))) {
+    console.error("usage: facetful split in.facetful first.facetful second.facetful --columns a,b");
+    process.exit(2);
+  }
+  const parts = engine.splitImage(engine.imageFrom(readFileSync(pos[0])), columns.split(",").map((c) => c.trim()));
+  parts.forEach((bytes, i) => {
+    writeFileSync(pos[i + 1], bytes);
+    console.error(`${pos[i + 1]}: ${bytes.byteLength} bytes`);
+  });
 }
 
 /**

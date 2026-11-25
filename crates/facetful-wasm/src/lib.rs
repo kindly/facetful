@@ -1630,6 +1630,38 @@ pub extern "C" fn image_pack_shares(h: usize) -> usize {
     }))
 }
 
+/// The image as the two parts of a split image (`facetful split`): the
+/// columns named (separated by 0 bytes) go to the second part. One handle
+/// laid out like `image_pack_shares`: a count of 2, two lengths, the parts.
+/// `id` is the pair's split id, random and not 0.
+#[no_mangle]
+pub extern "C" fn image_split(h: usize, names: *const u8, names_len: usize, id: u64) -> usize {
+    let src: &[u8] = image(h);
+    let names = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(names, names_len) }).into_owned();
+    let cat = match facetful_engine::format::read::open(&src) {
+        Ok(cat) => cat,
+        Err(e) => return done(Err(e)),
+    };
+    let mut cols = Vec::new();
+    for name in names.split('\0') {
+        match cat.schema.columns.iter().position(|c| c.name == name) {
+            Some(ci) => cols.push(ci),
+            None => {
+                *ERROR.lock().unwrap() = format!("the image has no column {name:?}");
+                return 0;
+            }
+        }
+    }
+    done(facetful_engine::format::split::split(&src, &cols, id | 1).map(|(a, b)| {
+        let mut out = 2u32.to_le_bytes().to_vec();
+        out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+        out.extend_from_slice(&a);
+        out.extend_from_slice(&b);
+        out
+    }))
+}
+
 #[no_mangle]
 pub extern "C" fn image_error(buf: *mut u8, cap: usize) -> usize {
     let e = ERROR.lock().unwrap();

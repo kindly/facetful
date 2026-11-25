@@ -268,9 +268,9 @@ These are the built packer's files, compressed with the commands. They match the
 | grantnav through `openStream` in wasm (Node 26, 64 KB chunks, best of 3) | 217 ms | 360 ms |
 | GEM units, the same | 31 ms | 53 ms |
 | lite build, gz | 243.1 KB | 250.1 KB of 300 |
-| full build, gz | 385.4 KB | 409.1 KB of 500 |
+| full build, gz | 385.4 KB | 414.0 KB of 500 |
 
-The wasm sizes are without `wasm-opt`, which this machine lacks, so CI's numbers will be a little lower on both sides. Packing grantnav takes 3.5 s, which includes unpacking the result and comparing it with the input. The full build carries the packer as well as the unpacker (16 KB of the 24), so that the npm command can pack; the lite build has only the unpacker.
+The wasm sizes are without `wasm-opt`, which this machine lacks, so CI's numbers will be a little lower on both sides. Packing grantnav takes 3.5 s, which includes unpacking the result and comparing it with the input. The full build carries the packer and `split` as well as the unpacker (21 KB of the 29), so that the npm command can pack and split; the lite build has only the unpacker.
 
 **Tests.** In `pack.rs`: every column kind with NULLs and a short last group, under six option sets; the wire cut into chunks of 1, 7 and 4096 bytes with the output checked as a prefix of the image after every push; truncation at every 97th byte; 4,000 single-bit flips, none of which may panic or produce more than the declared length; an empty image. In `tests/load.rs`: a packed image streams in to the same fingerprint and the same query results as the image, split parts pack and attach, and a word index built while a packed image arrives equals the one built over the image.
 
@@ -316,13 +316,41 @@ With no network the packed image costs 30 ms more on units and 80 ms on grantnav
 
 `js/facetful/browser-smoke.mjs` also loads a packed image with `persist` and a search index, compares the OPFS file with the plain image byte for byte, and attaches packed split parts.
 
-**The npm command** has `pack`, `unpack`, `sizes` and `order` (`js/facetful/bin/size.mjs`), and `inspect`, `query` and `materialize` take a packed file. It packs to the same bytes as the Rust CLI on both datasets. Sizes come from Node's zlib, so they differ slightly from the `brotli` and `gzip` commands (grantnav packed at brotli 5: 55.22 MB against 55.60). `order` on grantnav takes 260 s and picks the same order as the Rust CLI.
+**The npm command** has `pack`, `unpack`, `sizes` and `order` (`js/facetful/bin/size.mjs`), and `inspect`, `query` and `materialize` take a packed file. It packs to the same bytes as the Rust CLI on both datasets. Sizes come from Node's zlib, so they differ slightly from the `brotli` and `gzip` commands (grantnav packed at brotli 5: 55.22 MB against 55.60). `order` on grantnav takes 260 s and picks the same order as the Rust CLI. It also has `split`, which was in the Rust CLI only, so that the first-file pattern below can be built from npm.
 
+
+**Against hand-built formats: the agent experiment.** `bench/agent-ab` in the main checkout (11 and 12 November) gave agents the same dashboard brief over GEM units with and without facetful, and measured the pages in a throttled browser. In its last round, with all 52 columns of every unit in the browser, every run got every step right and clicks were as fast either way. Facetful lost on size only:
+
+| arm | total download, gzip | later clicks, median |
+|---|---|---|
+| no guidance: a format of the agent's own | 5.7, 6.3, 7.1 MB | 95 to 168 ms |
+| "static files only": the same | 6.0, 6.3, 7.9 MB | 35 to 132 ms |
+| facetful | 5.7, 8.3, 9.3 MB | 75 to 116 ms |
+| DuckDB-WASM | 10.9 to 23.3 MB | 72 to 225 ms |
+
+The 5.7 MB facetful run kept facetful for the filter columns and wrote its own row file for the table. Where facetful stands on the same data now, gzip as the harness serves it:
+
+| | data | with the engine |
+|---|---|---|
+| as tested | 9.35 MB | about 9.7 MB |
+| packed | 6.96 MB | about 7.4 MB |
+| packed, without the wiki URL column | 5.93 MB | about 6.3 MB |
+
+So packing closes most of the gap and one column is the rest. What the hand-built formats did that the packer does not:
+
+- **A column derived from another.** Three agents separately stored `GEM.Wiki URL` as "the plant name with underscores" and kept only the exceptions (about 12% of plants). It is 1.03 MB of the 6.96, the largest single column. A general encoding, "a prefix plus another column with a substitution, else stored", would cover it. Not built.
+- **Values stored once per plant.** Ten columns never vary within a plant (145,396 plants, 183,125 units). Ordering the rows by location saved 0.12 MB with gzip, which is not a full test of per-plant storage.
+- **A first file with only the filter columns**, 240 to 420 KB, so filters worked after about half a megabyte.
+
+That last point is also the experiment's start-up cost. In its first round a facetful page took 1.2 to 2.0 s to answer the first click where hand-built pages took 0.3 to 1.0 s. The run labelled unthrottled still paced the network at 20 Mbit/s, and the difference is download: 3.03 MB (image and engine) at 20 Mbit/s is 1.21 s, and the measured first click was 1.20 s. The engine's own start is about 100 ms (131 ms against 31 ms on the repeat visit). A table answers nothing until its file has fully arrived, because an image is laid out by row group. `facetful split` is the answer, and the guide the agents were given did not mention it: a first part with the five filter columns, capacity and start year is 449 KB gzipped (389 KB packed) against a 2.7 MB image. That page has not been built and run through the harness. The pattern is now in `js/facetful/README.md`.
+
+Two other things the agents worked around: `LIKE` treats a typed `%` or `_` as a wildcard and has no escape, and it does not match "İ" to "i". And nearly every agent turned capacity into whole kW to sum without float drift.
+
+**Found on the way: `search()` before the index is finished.** A table streamed in faster than its index is built (`searchReady: false`) finds no rows with `search()` until the index is done, where the comments say it scans meanwhile. The engine from before this branch does the same with a plain image, so it is not from packing. Not fixed here; `index.d.ts` now says to await `searchReady()`.
 
 **Not done, and why.**
 
 - **A phone.** The browser runs are a laptop. Firefox was not run on the packed datasets.
-- **README and `docs/design.sv`.** Both READMEs have uncommitted edits on main, and `design.sv` has a lock file beside it. The format's own description is in `packed.rs` and `lib.rs`.
 - **More speed in the unpacker.** Word codes were 0.45 s of a 0.52 s native unpack of grantnav. Copying words and plain runs as a fixed 16 or 8 bytes, where the buffers have room, halved the whole unpack to 0.27 s natively, and took the wasm load from 729 ms to 360 ms (units 78 to 53 ms) for 130 bytes of wasm. What is left: word codes are still about 0.2 s of the 0.27 s, and every output byte is zeroed before it is written.
 
 **Things asked about along the way, and measured.**
