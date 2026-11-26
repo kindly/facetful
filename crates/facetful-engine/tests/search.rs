@@ -1166,3 +1166,46 @@ fn search_means_the_same_everywhere() {
         }
     }
 }
+
+/// A search inside a larger condition (OR, NOT, a comparison with
+/// search_rank) is cached under the whole condition. When the index comes
+/// or goes its answer changes, so what the scan cached must not be reused.
+#[test]
+fn cached_conditions_with_search_follow_the_index() {
+    let mut t = table();
+    t.masks().set_budget(1 << 20);
+    let q = |t: &mut Table<Vec<u8>>, w: &str| count(t, &format!("select count(*) from t where {w}"));
+    let or = format!("search('helth ', {COLS}) or descr = 'absent'");
+    let not = format!("not search('helth ', {COLS})");
+    let total = q(&mut t, "1 = 1");
+    assert_eq!(q(&mut t, &or), 0, "the scan corrects nothing");
+    assert_eq!(q(&mut t, &not), total);
+    t.build_search_index(&[0, 1, 2]).unwrap();
+    let health = q(&mut t, &format!("search('health ', {COLS})"));
+    assert!(health > 0);
+    assert_eq!(q(&mut t, &or), health, "OR: the index's answer, not the scan's cached one");
+    assert_eq!(q(&mut t, &not), total - health, "NOT: likewise");
+}
+
+/// A quoted phrase longer than one phrase can hold keeps every word: a row
+/// with the first 63 words of it but not the 64th does not match.
+#[test]
+fn a_long_phrase_loses_no_words() {
+    let words: Vec<String> = (0..70).map(|i| format!("w{i}")).collect();
+    let all = words.join(" ");
+    let first63 = words[..63].join(" ");
+    let mut t = word_table(&[&first63, &all]);
+    let n = |t: &mut Table<Vec<u8>>, q: &str| count(t, &format!("select count(*) from t where search('\"{q}\"', t)"));
+    let with_absent = format!("{first63} absent");
+    for indexed in [false, true] {
+        if indexed {
+            t.build_search_index(&[0]).unwrap();
+        }
+        assert_eq!(n(&mut t, &with_absent), 0, "indexed {indexed}: the 64th word counts");
+        assert_eq!(n(&mut t, &all), 5, "indexed {indexed}: the whole 70-word phrase");
+        assert_eq!(n(&mut t, &first63), 10, "indexed {indexed}");
+        // pieces must not match out of order: the last 10 words then the first 63
+        let swapped = format!("{} {first63}", words[60..].join(" "));
+        assert_eq!(n(&mut t, &swapped), 0, "indexed {indexed}");
+    }
+}

@@ -535,6 +535,20 @@ pub extern "C" fn table_search_index_begin(t: usize, cols: *const u32, n: usize)
     }
 }
 
+/// Whether an index over `cols` could be built (every column text, the row
+/// groups within the index's limit), without touching the index there is.
+/// 0 yes, -1 no.
+#[cfg(feature = "search")]
+#[no_mangle]
+pub extern "C" fn table_search_index_check(t: usize, cols: *const u32, n: usize) -> i32 {
+    let t = unsafe { &*(t as *const T) };
+    let cols: Vec<usize> = unsafe { core::slice::from_raw_parts(cols, n) }.iter().map(|&c| c as usize).collect();
+    match facetful_engine::search_index::check_table(t.catalog(), &cols) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 /// Index up to `groups` more row groups of the build in progress. Returns
 /// the row groups left (0: finished, the index is in use), or -1 when a
 /// segment cannot be read (the build is dropped; search() keeps scanning).

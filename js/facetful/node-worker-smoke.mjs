@@ -175,6 +175,28 @@ const bad = await send({ cmd: "searchSuggest", table: "t", q: "x", columns: ["co
 if (bad.ok || !/nope/.test(bad.error)) throw new Error(`searchSuggest with a bad filter: ${JSON.stringify(bad)}`);
 await ok({ cmd: "dropSearchIndex", table: "t" });
 
+// index requests that overlap. A typo only the index corrects tells whether
+// it is in use. (No OPFS in Node: a cache path is looked for, not found.)
+{
+  const typo = "select count(*) as n from t where search('countr owner_1', country, owner)";
+  const typoCount = async () => (await ok({ cmd: "query", table: "t", sql: typo })).result.columns[0].values[0];
+  // a request that is refused, cache path or not, changes nothing: the
+  // build under way finishes
+  const building = ok({ cmd: "buildSearchIndex", table: "t", columns: ["country", "owner"] });
+  const refused = await send({ cmd: "buildSearchIndex", table: "t", columns: ["capacity"], cache: "smoke/none.idx" });
+  if (refused.ok || !/text column/.test(refused.error)) throw new Error(`a refused cached request: ${JSON.stringify(refused)}`);
+  await building;
+  if ((await typoCount()) !== 104258) throw new Error("the build a refused request overlapped is not in use");
+  await ok({ cmd: "dropSearchIndex", table: "t" });
+  // searchReady waits for a request with a cache path from its start,
+  // while it looks for the kept index as well as while it builds
+  const cached = ok({ cmd: "buildSearchIndex", table: "t", columns: ["country", "owner"], cache: "smoke/none.idx" });
+  await ok({ cmd: "searchReady", table: "t" });
+  if ((await typoCount()) !== 104258) throw new Error("searchReady resolved before the index was in use");
+  await cached;
+  await ok({ cmd: "dropSearchIndex", table: "t" });
+}
+
 // loadCsv with a buffer source (the Blob path needs a browser); it must
 // reproduce the checked-in image's row count and be queryable by name
 const csv = fs.readFileSync(new URL("data-200000.csv", spike));

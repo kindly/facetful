@@ -392,6 +392,10 @@ impl<S: ReadAt> Table<S> {
         self.search_index = idx;
         self.derived.clear();
         self.derived_bytes = 0;
+        // a search inside OR, NOT or a comparison is cached under the whole
+        // condition, whose answer the index changes (typos, word forms): the
+        // index arrives about once a load, so drop every cached mask
+        self.masks.clear();
         SEARCH_GENERATION.with(|g| g.set(g.get() + 1));
     }
 

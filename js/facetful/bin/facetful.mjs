@@ -338,39 +338,46 @@ async function checkUrl(url, origin) {
   const decoders = { br: () => zlib.createBrotliDecompress(), gzip: () => zlib.createGunzip(), deflate: () => zlib.createInflate() };
   if (enc && !decoders[enc]) throw new CliError(`${url}: Content-Encoding ${enc}, which browsers don't decode`);
   // what fetch hands the page (the host's encoding undone), then a gzip
-  // file undone as loadUrl would
-  let wire = 0, head = Buffer.alloc(0), tail = Buffer.alloc(0), image = 0, fileGzip = null;
-  const stream = enc ? res.pipe(decoders[enc]()) : res;
-  res.on("data", (c) => (wire += c.length));
-  let inner = null;
-  const take = (c) => {
-    if (image < 10) head = Buffer.concat([head, c]).subarray(0, 10);
-    image += c.length;
-    tail = Buffer.concat([tail, c]).subarray(-4);
-  };
-  let broken = null;
-  await new Promise((ok) => {
-    const fail = (e) => ((broken = e), ok());
-    stream.on("error", fail);
-    stream.on("data", (c) => {
-      if (fileGzip === null) {
-        fileGzip = c[0] === 0x1f && c[1] === 0x8b;
-        if (fileGzip) {
-          inner = zlib.createGunzip();
-          inner.on("data", take);
-          inner.on("error", fail);
-          inner.on("end", ok);
-        }
+  // file undone as loadUrl would (recognised by its first two bytes, which
+  // may arrive apart), then the engine's own loader, as the page runs it:
+  // whatever it refuses, the page refuses
+  let wire = 0, head = Buffer.alloc(0), image = 0, fileGzip = false;
+  const raw = enc ? res.pipe(decoders[enc]()) : res;
+  if (enc) res.on("data", (c) => (wire += c.length));
+  async function* body() {
+    const it = raw[Symbol.asyncIterator]();
+    let first = Buffer.alloc(0), r;
+    while (first.length < 2 && !(r = await it.next()).done) {
+      if (!enc) wire += r.value.length;
+      first = Buffer.concat([first, r.value]);
+    }
+    fileGzip = first[0] === 0x1f && first[1] === 0x8b;
+    const rest = (async function* () {
+      if (first.length) yield first;
+      for (let n; !(n = await it.next()).done; ) {
+        if (!enc) wire += n.value.length;
+        yield n.value;
       }
-      if (fileGzip) inner.write(c);
-      else take(c);
-    });
-    stream.on("end", () => (fileGzip ? inner.end() : ok()));
-  });
+    })();
+    const src = fileGzip ? (await import("node:stream")).Readable.from(rest).pipe(zlib.createGunzip()) : rest;
+    for await (const c of src) {
+      if (image < 10) head = Buffer.concat([head, c]).subarray(0, 10);
+      image += c.length;
+      yield c;
+    }
+  }
+  let broken = null, unreadable = null;
+  try {
+    await engine.openStream(body());
+  } catch (e) {
+    // a decompression error has a zlib code; the rest is the loader's
+    if (e.code?.startsWith?.("Z_") || e.code?.startsWith?.("ERR_")) broken = e;
+    else unreadable = e;
+  }
   const secs = (performance.now() - t0) / 1000;
-  const whole = head.toString("latin1", 0, 4) === "FCT1" && tail.toString("latin1") === "FCT1";
+  const whole = !broken && !unreadable;
   // the format version: 2 is the packed form
-  const packed = head.length === 10 && head.readUInt16LE(8) === 2;
+  const packed = head.length === 10 && head.toString("latin1", 0, 4) === "FCT1" && head.readUInt16LE(8) === 2;
   const pct = (a, b) => `${((a / b) * 100).toFixed(1)}%`;
   const lines = [];
   const say = (ok, s) => lines.push(`${ok === true ? "ok  " : ok === false ? "FIX " : "    "}${s}`);
@@ -382,7 +389,7 @@ async function checkUrl(url, origin) {
   else say(false, "not compressed: run facetful publish and serve the .br (S3, Spaces) or the .gz (GitHub Pages)");
   if (enc === "br" && u.protocol !== "https:") say(false, "brotli over plain http: browsers only ask for brotli over https");
   if (broken) say(false, `it doesn't decompress (${broken.code ?? broken.message}): cut short, or not really ${fileGzip ? "gzip" : enc}`);
-  else if (!whole) say(false, `what arrives is not a whole facetful image${fileGzip ? " after gunzip" : ""}: wrong file, or cut short`);
+  else if (!whole) say(false, `what arrives is not a facetful image the page can open${fileGzip ? " after gunzip" : ""} (${unreadable.message}): wrong file, cut short or damaged`);
   else say(true, `a whole facetful image arrives${packed ? ", packed (the page needs facetful 0.8 or later)" : ""}`);
   if (whole && !broken && !packed) say(null, "not packed: facetful publish packs it first, about a fifth less to download");
   say(null, `Content-Type: ${h["content-type"] ?? "(none)"}`);

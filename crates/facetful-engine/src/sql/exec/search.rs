@@ -109,12 +109,21 @@ pub(super) fn parse(q: &str) -> Vec<Item> {
         let mut words: Vec<String> = Vec::new();
         for_each_word(part.as_bytes(), &mut buf, |w| words.push(String::from_utf8_lossy(w).into_owned()));
         if k % 2 == 1 {
-            // inside quotes
-            words.truncate(PHRASE_WORDS);
+            // inside quotes. A phrase longer than a phrase can be is cut
+            // into pieces that overlap by a word, so that no word is lost:
+            // a row then needs every piece
             match words.len() {
                 0 => {}
                 1 => items.push(Item::Word(Word { text: words.pop().unwrap(), prefix: false, literal: true })),
-                _ => items.push(Item::Phrase(Phrase { words, prefix: false })),
+                n if n <= PHRASE_WORDS => items.push(Item::Phrase(Phrase { words, prefix: false })),
+                n => {
+                    let mut at = 0;
+                    while at + 1 < n {
+                        let end = (at + PHRASE_WORDS).min(n);
+                        items.push(Item::Phrase(Phrase { words: words[at..end].to_vec(), prefix: false }));
+                        at = end - 1;
+                    }
+                }
             }
         } else {
             items.extend(words.into_iter().map(|text| Item::Word(Word { text, prefix: false, literal: false })));

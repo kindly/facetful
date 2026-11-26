@@ -337,6 +337,22 @@ export class Engine {
     return { pairs: this.w.table_search_index_pairs(tableHandle), bytes: this.w.table_search_index_bytes(tableHandle) };
   }
 
+  /** Throws what beginSearchIndex would for these columns, without
+   *  touching the table's index or a build under way. */
+  checkSearchIndex(tableHandle, columns) {
+    if (!this.w.table_search_index_check) throw new Error("this facetful build has no search index (lite build)");
+    const idx = columns.map((c) => {
+      const i = this.colByName(tableHandle, c);
+      if (i < 0) throw new Error(`search index: no column ${JSON.stringify(c)}`);
+      return i;
+    });
+    const p = u32(this.w.alloc(Math.max(idx.length, 1) * 4));
+    new Uint32Array(this.mem(), p, idx.length).set(idx);
+    const rc = this.w.table_search_index_check(tableHandle, p, idx.length);
+    this.w.dealloc(p, Math.max(idx.length, 1) * 4);
+    if (rc < 0) throw new Error("search index: every column must be a text column (or the table could not be read)");
+  }
+
   /** Start building the search index a row group at a time (replacing any
    *  index or build in progress). search() scans until it is finished. */
   beginSearchIndex(tableHandle, columns) {

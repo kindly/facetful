@@ -485,26 +485,32 @@ self.onmessage = async (e) => {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
       const t0 = performance.now();
-      let gen = 0;
+      // a request the engine refuses (a column that is not text) changes
+      // nothing: it is checked before it takes over the table's index
+      engine.checkSearchIndex(handle, e.data.columns);
+      const gen = supersede(handle);
       const latest = () => isLatest(handle, gen);
-      // a kept index read back instead of building, when it fits (this
-      // request takes over the table's index before waiting on the file)
-      if (e.data.cache) {
-        gen = supersede(handle);
-        if (await loadSavedIndex(handle, e.data.columns, e.data.cache, latest)) {
+      // searchReady() waits for this request from now on, through the read
+      // of a kept index as well as a build
+      let settle;
+      builds.get(handle).done = new Promise((r) => (settle = r));
+      try {
+        // a kept index read back instead of building, when it fits
+        if (e.data.cache && (await loadSavedIndex(handle, e.data.columns, e.data.cache, latest))) {
           reply({ ok: true, ...engine.searchIndexStats(handle), cached: true, elapsedMs: performance.now() - t0 });
           return;
         }
         if (!latest()) throw new Error(SUPERSEDED);
+        engine.beginSearchIndex(handle, e.data.columns);
+        if (!(await stepToEnd(handle, gen))) throw new Error(SUPERSEDED);
+        const elapsedMs = performance.now() - t0;
+        const savedBytes = e.data.cache ? await saveIndex(handle, e.data.cache, latest) : 0;
+        // superseded while saving: the index in use is another request's
+        if (!latest()) throw new Error(SUPERSEDED);
+        reply({ ok: true, ...engine.searchIndexStats(handle), cached: false, savedBytes, elapsedMs });
+      } finally {
+        settle();
       }
-      // a request the engine refuses (a column that is not text) changes
-      // nothing: it takes over only once its build has begun
-      engine.beginSearchIndex(handle, e.data.columns);
-      gen = supersede(handle);
-      if (!(await stepToEnd(handle, gen))) throw new Error(SUPERSEDED);
-      const elapsedMs = performance.now() - t0;
-      const savedBytes = e.data.cache ? await saveIndex(handle, e.data.cache, latest) : 0;
-      reply({ ok: true, ...engine.searchIndexStats(handle), cached: false, savedBytes, elapsedMs });
     } else if (cmd === "saveSearchIndex") {
       const handle = e.data.table ? tables.get(e.data.table) : lastTable;
       if (!handle) throw new Error("no table loaded");
