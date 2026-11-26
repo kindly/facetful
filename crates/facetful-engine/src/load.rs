@@ -46,10 +46,14 @@ impl<S: ReadAt> TableLoad<S> {
     /// Content-Length), so the buffer is allocated once instead of growing.
     /// Images whose header gives their length need none.
     pub fn new(expected_len: usize) -> TableLoad<S> {
+        // a hint (Content-Length, say): room for it when there is room,
+        // and growth as the bytes arrive when there is not
+        let mut pending = Vec::new();
+        let _ = pending.try_reserve_exact(expected_len);
         TableLoad {
             sniff: Some(Vec::new()),
             unpacker: None,
-            pending: Vec::with_capacity(expected_len),
+            pending,
             table: None,
             next: 0,
             ended: false,
@@ -93,8 +97,13 @@ impl<S: ReadAt> TableLoad<S> {
             let mut bytes = std::mem::take(&mut self.pending);
             // the header says how long the image is: room for all of it
             // now rather than doubling as it arrives
+            // (fallibly: the length comes from the download, and a corrupt
+            // one must end in an error, not an allocation failure)
             if let Some(n) = cat.image_len {
-                bytes.reserve_exact((n as usize).saturating_sub(bytes.len()));
+                let n = usize::try_from(n).map_err(|_| FormatError::Io("not enough memory for the image"))?;
+                bytes
+                    .try_reserve_exact(n.saturating_sub(bytes.len()))
+                    .map_err(|_| FormatError::Io("not enough memory for the image"))?;
             }
             let src = S::from_memory(bytes).ok_or(FormatError::Io("source cannot hold memory"))?;
             self.table = Some(Table::from_catalog(src, cat));

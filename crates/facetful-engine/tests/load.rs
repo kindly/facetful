@@ -211,3 +211,18 @@ fn a_packed_image_indexes_as_it_arrives() {
     let sql = "select count(*) from t where search('country_3', country)";
     assert_eq!(rows_of(&mut t, sql), rows_of(&mut whole, sql));
 }
+
+/// A header whose image length cannot be allocated (a corrupt download)
+/// ends the load with an error, not an allocation failure, and so does an
+/// impossible size hint.
+#[test]
+fn an_impossible_image_length_is_an_error() {
+    let mut bytes = std::fs::read(format!("{}/../../spikes/facet-spike/data-200000.facetful", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let hlen = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let len = (bytes.len() as u64).to_le_bytes();
+    let at = bytes[..hlen].windows(8).position(|w| w == len).expect("the header holds the image's length");
+    bytes[at..at + 8].copy_from_slice(&(u64::MAX >> 2).to_le_bytes());
+    let mut load = TableLoad::<Vec<u8>>::new(usize::MAX >> 2);
+    let err = bytes.chunks(1 << 20).try_for_each(|c| load.push(c));
+    assert!(err.is_err(), "a load that cannot hold its image must fail");
+}
