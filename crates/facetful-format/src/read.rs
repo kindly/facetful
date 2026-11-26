@@ -113,13 +113,13 @@ pub fn parse_header(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32),
 /// Header fields added after the first images, each a u64 after the sort
 /// keys, present when the header (padded to 8 bytes) has room for it; 0
 /// means not set.
-struct Later {
-    image_len: Option<u64>,
-    split_id: Option<u64>,
+pub(crate) struct Later {
+    pub(crate) image_len: Option<u64>,
+    pub(crate) split_id: Option<u64>,
 }
 
 /// `parse_header`, and the fields added since.
-fn parse_header_len(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32, Later), FormatError> {
+pub(crate) fn parse_header_len(buf: &[u8]) -> Result<(Schema, Vec<SortKey>, u16, u32, u32, Later), FormatError> {
     let mut c = Cursor::new(buf);
     if c.take(4)? != MAGIC {
         return Err(FormatError::BadMagic);
@@ -196,6 +196,13 @@ pub fn open(src: &impl ReadAt) -> Result<Catalog, FormatError> {
     let total_rows = c.u64()?;
     let ngroups = c.u32()? as usize;
     let ncols = schema.columns.len();
+    // each group's entry: offset, row count, then per column the null
+    // count, segment lengths and stats; the count comes from the file, so
+    // it must fit the footer before it sizes anything
+    let entry = 12 + ncols * (4 + 4 * MAX_SEGS + 17);
+    if ngroups.checked_mul(entry).is_none_or(|n| n > fbuf.len()) {
+        return Err(FormatError::Corrupt("footer group count exceeds footer"));
+    }
     let mut groups = Vec::with_capacity(ngroups);
     for _ in 0..ngroups {
         let offset = c.u64()?;
@@ -351,12 +358,15 @@ pub fn next_group(cat: &Catalog, bytes: &[u8], at: u64) -> NextGroup {
             *l = c.u32().unwrap();
         }
         let bits = align_up(n.div_ceil(8)) as u32;
-        let expect = |l: usize| Some(align_up(l) as u32);
+        // checked: on wasm32 a corrupt row count must not wrap into a fit
+        let expect = |l: Option<usize>| {
+            l.and_then(|l| l.checked_add(ALIGN - 1)).and_then(|l| u32::try_from(l & !(ALIGN - 1)).ok())
+        };
         let (first, second) = match (def.ty, def.is_dict()) {
-            (ColumnType::Utf8, true) => (expect(n * def.code_width()), Some(0)),
-            (ColumnType::Utf8, false) => (expect((n + 1) * 4), None), // text bytes: any padded length
+            (ColumnType::Utf8, true) => (expect(n.checked_mul(def.code_width())), Some(0)),
+            (ColumnType::Utf8, false) => (expect(n.checked_add(1).and_then(|n| n.checked_mul(4))), None), // text bytes: any padded length
             (ColumnType::Bool, _) => (Some(bits), Some(0)),
-            (ty, _) => (ty.fixed_width().and_then(|w| expect(n * w)), Some(0)),
+            (ty, _) => (ty.fixed_width().and_then(|w| expect(n.checked_mul(w))), Some(0)),
         };
         let validity = if null_count > 0 { bits } else { 0 };
         let fits = null_count <= rows
@@ -367,10 +377,13 @@ pub fn next_group(cat: &Catalog, bytes: &[u8], at: u64) -> NextGroup {
         if !fits {
             return NextGroup::End;
         }
-        len += seg_lens.iter().map(|&l| l as usize).sum::<usize>();
+        let Some(l) = seg_lens.iter().try_fold(len, |a, &l| a.checked_add(l as usize)) else {
+            return NextGroup::End;
+        };
+        len = l;
         cols.push(ColMeta { null_count, seg_lens, stats: Stats::None });
     }
-    if bytes.len() < at + len {
+    if at.checked_add(len).is_none_or(|end| bytes.len() < end) {
         return NextGroup::NeedBytes;
     }
     NextGroup::Ready(GroupMeta { offset: at as u64, row_count: rows, cols }, (at + len) as u64)

@@ -226,3 +226,80 @@ fn an_impossible_image_length_is_an_error() {
     let err = bytes.chunks(1 << 20).try_for_each(|c| load.push(c));
     assert!(err.is_err(), "a load that cannot hold its image must fail");
 }
+
+/// Where an image's footer starts (its row count, then its group count).
+fn footer_at(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    n - 8 - u32::from_le_bytes(bytes[n - 8..n - 4].try_into().unwrap()) as usize
+}
+
+/// Load `bytes` in chunks, as a download would arrive.
+fn load_all(bytes: &[u8]) -> Result<Table<Vec<u8>>, facetful_engine::format::FormatError> {
+    let mut load = TableLoad::<Vec<u8>>::new(0);
+    bytes.chunks(1 << 16).try_for_each(|c| load.push(c))?;
+    load.finish()
+}
+
+/// A damaged group count in the footer is an error, not an allocation of
+/// gigabytes (which aborts). The packed form carries the footer as it is,
+/// at the same distance from the end.
+#[test]
+fn a_damaged_group_count_is_an_error() {
+    let bytes = fixture("data-200000.facetful");
+    let wire = facetful_engine::format::pack::pack(&bytes).unwrap();
+    let from_end = bytes.len() - footer_at(&bytes) - 8;
+    for image in [&bytes, &wire] {
+        for count in [0x0800_0003u32, 0x8000_0003, 0x0100_0003] {
+            let mut damaged = image.clone();
+            let at = damaged.len() - from_end;
+            damaged[at..at + 4].copy_from_slice(&count.to_le_bytes());
+            assert!(load_all(&damaged).is_err(), "{count:#x}");
+            if image == &bytes {
+                assert!(Table::open(damaged).is_err(), "{count:#x}");
+            }
+        }
+    }
+}
+
+/// A footer that disagrees with the row groups that arrived is an error:
+/// queries would trust it and read past the bytes.
+#[test]
+fn a_footer_that_disagrees_is_an_error() {
+    let bytes = fixture("data-200000.facetful");
+    let f = footer_at(&bytes);
+    // the row count, and the first group's row count
+    for (at, by) in [(f, 1u32), (f + 12 + 8, 1)] {
+        let mut damaged = bytes.clone();
+        let v = u32::from_le_bytes(damaged[at..at + 4].try_into().unwrap());
+        damaged[at..at + 4].copy_from_slice(&(v - by).to_le_bytes());
+        assert!(load_all(&damaged).is_err(), "at {at}");
+    }
+    // a group whose segment lengths cannot be: it never arrives, and the
+    // footer's groups are not taken on trust instead
+    let first = u64::from_le_bytes(bytes[f + 12..f + 20].try_into().unwrap()) as usize;
+    let mut damaged = bytes.clone();
+    for s in 0..3 {
+        let at = first + 4 + 4 + s * 4; // first column's segment lengths
+        damaged[at..at + 4].copy_from_slice(&0xFFFF_FFF8u32.to_le_bytes());
+    }
+    assert!(load_all(&damaged).is_err());
+}
+
+/// The length an image's header gives must be the length that arrives; in
+/// a packed image the image's header and the packed one's must agree.
+#[test]
+fn an_image_length_that_differs_is_an_error() {
+    let bytes = fixture("data-200000.facetful");
+    let hlen = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let len = (bytes.len() as u64).to_le_bytes();
+    let at = bytes[..hlen].windows(8).position(|w| w == len).expect("the header holds the image's length");
+    for wrong in [bytes.len() as u64 + 8, bytes.len() as u64 - 8, 1 << 30] {
+        let mut damaged = bytes.clone();
+        damaged[at..at + 8].copy_from_slice(&wrong.to_le_bytes());
+        assert!(load_all(&damaged).is_err(), "plain, {wrong}");
+        let mut wire = facetful_engine::format::pack::pack(&bytes).unwrap();
+        assert_eq!(wire[at..at + 8], len, "the packed header carries the image's header");
+        wire[at..at + 8].copy_from_slice(&wrong.to_le_bytes());
+        assert!(load_all(&wire).is_err(), "packed, {wrong}");
+    }
+}

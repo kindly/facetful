@@ -434,8 +434,14 @@ impl Unpacker {
         out.try_reserve_exact(limit).map_err(|_| FormatError::Io("not enough memory for the image"))?;
         put(out, header, limit)?;
         out[8..10].copy_from_slice(&VERSION.to_le_bytes());
-        let (schema, _, _, target, hlen) = read::parse_header(out)?;
+        let (schema, _, _, target, hlen, later) = read::parse_header_len(out)?;
         if hlen as usize != header.len() {
+            return Err(BAD);
+        }
+        // the image's header gives its length too (images written before it
+        // did have none): the two must agree, or the loader reserves for one
+        // and the unpacker fills to the other
+        if later.image_len.is_some_and(|n| n != limit as u64) {
             return Err(BAD);
         }
         self.row_group_target = target;

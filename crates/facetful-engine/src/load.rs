@@ -112,6 +112,9 @@ impl<S: ReadAt> TableLoad<S> {
             self.start_index()?;
         }
         let t = self.table.as_mut().expect("opened above");
+        if t.cat.image_len.is_some_and(|n| t.src.len() > n) {
+            return Err(FormatError::Corrupt("more bytes than the header's image length"));
+        }
         let bytes = t.src.read_ref(0, t.src.len() as usize).expect("memory source");
         while !self.ended {
             match read::next_group(&t.cat, bytes, self.next) {
@@ -193,29 +196,38 @@ impl<S: ReadAt> TableLoad<S> {
 
     /// The whole image is in: check the streamed groups against the footer
     /// and hand over the table. An index under way continues as the table's
-    /// build (`search_index_step` finishes it). Should the footer disagree
-    /// with what was streamed, the index starts over from the footer's groups.
+    /// build (`search_index_step` finishes it). A footer that disagrees with
+    /// what was streamed, or a length that differs from the header's, is an
+    /// error: the image is damaged.
     pub fn finish(self) -> Result<Table<S>, FormatError> {
         if self.unpacker.as_ref().is_some_and(|un| !un.done()) {
             return Err(FormatError::Truncated);
         }
         let mut t = self.table.ok_or(FormatError::Truncated)?;
         let full = read::open(&t.src)?;
-        let agrees = t.cat.groups.len() <= full.groups.len()
+        if full.image_len.is_some_and(|n| n != t.src.len()) {
+            return Err(FormatError::Corrupt("image length differs from the header's"));
+        }
+        // the groups as they arrived were checked against the image's
+        // layout; a footer that says otherwise is damaged, and queries
+        // trusting it would read past the bytes
+        let agrees = t.cat.groups.len() == full.groups.len()
+            && t.cat.total_rows == full.total_rows
             && t.cat.groups.iter().zip(&full.groups).all(|(a, b)| {
                 a.offset == b.offset
                     && a.row_count == b.row_count
                     && a.cols.iter().zip(&b.cols).all(|(x, y)| x.null_count == y.null_count && x.seg_lens == y.seg_lens)
             });
+        if !agrees {
+            return Err(FormatError::Corrupt("footer disagrees with the row groups"));
+        }
         t.cat = full;
         #[cfg(feature = "search")]
         match self.index {
-            Some(b) if agrees => t.search_builder = Some(b),
-            _ if self.index_names.is_some() => t.begin_search_index(&self.index_cols)?,
-            _ => {}
+            Some(b) => t.search_builder = Some(b),
+            None if self.index_names.is_some() => t.begin_search_index(&self.index_cols)?,
+            None => {}
         }
-        #[cfg(not(feature = "search"))]
-        let _ = agrees;
         Ok(t)
     }
 }
