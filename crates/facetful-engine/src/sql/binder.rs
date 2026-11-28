@@ -479,6 +479,13 @@ impl<'a> Binder<'a> {
         allow_aggregate: bool,
     ) -> Result<Bound, Diagnostic> {
         let Some(func) = lookup_func(name) else {
+            #[cfg(not(feature = "search"))]
+            if matches!(name, "search" | "search_rank") {
+                return Err(Diagnostic::new(
+                    format!("{name}() is not in this build ({}): use the full build", crate::BUILD),
+                    span,
+                ));
+            }
             let mut d = Diagnostic::new(format!("unknown function '{name}'"), span);
             if let Some(s) = suggest(name, FUNCS.iter().map(|f| f.name).chain(crate::udf::names())) {
                 d = d.with_hint(format!("did you mean '{s}()'?"));

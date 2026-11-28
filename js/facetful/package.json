@@ -1,7 +1,7 @@
 {
   "name": "facetful",
-  "version": "0.8.0",
-  "description": "Tiny columnar SQL engine for browser faceting and full-text search — Rust/wasm, under 400 KB gz (lite 250 KB), nothing else loaded in the browser unless you open Parquet there. Images stream in from a static host, packed and compressed; facet 1M rows in milliseconds, persist to OPFS; one install gives the library and the `facetful` command.",
+  "version": "0.8.1",
+  "description": "Tiny columnar SQL engine for browser faceting and full-text search — Rust/wasm, under 400 KB gz, with 300 KB (no search) and 250 KB (single-table) builds in the package; nothing else loaded in the browser unless you open Parquet there. Images stream in from a static host, packed and compressed; facet 1M rows in milliseconds, persist to OPFS; one install gives the library and the `facetful` command.",
   "license": "MIT",
   "author": "David Raznick",
   "type": "module",
@@ -33,6 +33,8 @@
     "bin/facetful.mjs",
     "bin/size.mjs",
     "facetful_wasm.wasm",
+    "facetful_sql.wasm",
+    "facetful_lite.wasm",
     "facetful_cli.wasm",
     "README.md",
     "LICENSE"

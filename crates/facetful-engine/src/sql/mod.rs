@@ -859,7 +859,7 @@ fn expand_in_subqueries<S: ReadAt>(
 /// images written on the fly.
 #[cfg(not(feature = "write"))]
 fn not_in_lite(span: span::Span) -> Diagnostic {
-    Diagnostic::new("joins, CTEs and subqueries are not in this build (lite): use the full build".to_string(), span)
+    Diagnostic::new("joins, CTEs and subqueries are not in this build (lite): use the sql or full build".to_string(), span)
 }
 
 #[cfg(not(feature = "write"))]

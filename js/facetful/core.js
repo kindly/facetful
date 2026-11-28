@@ -42,6 +42,9 @@ const D_KIND = 0, D_LEN = 1, D_FLAGS = 2, D_DATA = 3, D_AUX = 4, D_VALID = 5, D_
 export class Engine {
   constructor(exports) {
     this.w = exports;
+    // which build: "full" has search(), "sql" writes images (joins, CTEs,
+    // subqueries, Parquet, CSV), "lite" has neither
+    this.build = exports.table_search_index_begin ? "full" : exports.compile_begin ? "sql" : "lite";
     this.scratch = u32(this.w.alloc(4096));
     this.enc = new TextEncoder();
     this.dec = new TextDecoder();
@@ -202,7 +205,7 @@ export class Engine {
    * `stepSearchIndex` finishes them, search() scans until then).
    */
   async openStream(chunks, { expectedBytes = 0, searchColumns, onChunk } = {}) {
-    if (searchColumns && !this.w.load_index_columns) throw new Error("this facetful build has no search index (lite build)");
+    if (searchColumns && !this.w.load_index_columns) throw new Error(`this facetful build (${this.build}) has no search index: use the full build`);
     const h = this.w.load_begin(expectedBytes);
     let indexed = 0;
     // image bytes already given to onChunk
@@ -265,7 +268,7 @@ export class Engine {
    *  wasm memory valid only during the call (write it out there, without a
    *  copy). Returns `use`'s result, or null when there is no index. */
   withSavedSearchIndex(tableHandle, use) {
-    if (!this.w.table_search_index_save) throw new Error("this facetful build has no search index (lite build)");
+    if (!this.w.table_search_index_save) throw new Error(`this facetful build (${this.build}) has no search index: use the full build`);
     const h = this.w.table_search_index_save(tableHandle);
     if (!h) return null;
     try {
@@ -281,7 +284,7 @@ export class Engine {
    *  by another version, for another table or other columns, or damaged):
    *  build the index instead. */
   loadSearchIndex(tableHandle, columns, len, fill) {
-    if (!this.w.table_search_index_load) throw new Error("this facetful build has no search index (lite build)");
+    if (!this.w.table_search_index_load) throw new Error(`this facetful build (${this.build}) has no search index: use the full build`);
     const idx = columns.map((c) => {
       const i = this.colByName(tableHandle, c);
       if (i < 0) throw new Error(`search index: no column ${JSON.stringify(c)}`);
@@ -340,7 +343,7 @@ export class Engine {
   /** Throws what beginSearchIndex would for these columns, without
    *  touching the table's index or a build under way. */
   checkSearchIndex(tableHandle, columns) {
-    if (!this.w.table_search_index_check) throw new Error("this facetful build has no search index (lite build)");
+    if (!this.w.table_search_index_check) throw new Error(`this facetful build (${this.build}) has no search index: use the full build`);
     const idx = columns.map((c) => {
       const i = this.colByName(tableHandle, c);
       if (i < 0) throw new Error(`search index: no column ${JSON.stringify(c)}`);
@@ -356,7 +359,7 @@ export class Engine {
   /** Start building the search index a row group at a time (replacing any
    *  index or build in progress). search() scans until it is finished. */
   beginSearchIndex(tableHandle, columns) {
-    if (!this.w.table_search_index_begin) throw new Error("this facetful build has no search index (lite build)");
+    if (!this.w.table_search_index_begin) throw new Error(`this facetful build (${this.build}) has no search index: use the full build`);
     const idx = columns.map((c) => {
       const i = this.colByName(tableHandle, c);
       if (i < 0) throw new Error(`search index: no column ${JSON.stringify(c)}`);
@@ -385,7 +388,7 @@ export class Engine {
    *  { indexed, prefixRows, completions: [{ word, query }], corrected:
    *  [{ word, to }], didYouMean: query | null }. */
   searchSuggest(tableHandle, columns, q, { where = "", limit = 8, didYouMean = false } = {}) {
-    if (!this.w.table_search_suggest) throw new Error("this facetful build has no search (lite build)");
+    if (!this.w.table_search_suggest) throw new Error(`this facetful build (${this.build}) has no search: use the full build`);
     const idx = columns.map((c) => {
       const i = this.colByName(tableHandle, c);
       if (i < 0) throw new Error(`searchSuggest: no column ${JSON.stringify(c)}`);
@@ -680,7 +683,7 @@ export class Engine {
   /** The lite build writes no images: no compiling (Parquet), CSV
    *  conversion, materialize, joins, CTEs or subqueries. */
   _needsWrite(what) {
-    if (!this.w.compile_begin) throw new Error(`${what} needs the full facetful build (this one is lite)`);
+    if (!this.w.compile_begin) throw new Error(`${what} needs the sql or full facetful build (this one is lite)`);
   }
 
   _needsPublish(what) {

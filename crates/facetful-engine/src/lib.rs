@@ -12,6 +12,19 @@ pub mod mask_cache;
 pub mod search_index;
 #[cfg(feature = "search")]
 mod unicode_tables;
+/// Which build this is: "lite" (single-table queries), "sql" (lite with
+/// joins, CTEs, subqueries and writing images), "full" (sql with search()),
+/// named in errors that a bigger build would not give.
+pub const BUILD: &str = if cfg!(feature = "search") && cfg!(feature = "write") {
+    "full"
+} else if cfg!(feature = "write") {
+    "sql"
+} else if cfg!(feature = "search") {
+    "lite + search"
+} else {
+    "lite"
+};
+
 #[cfg(feature = "write")]
 pub mod join;
 pub mod load;
