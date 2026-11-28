@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Size-budget gate: the wasm engine must stay within BUDGET_GZ bytes gzipped,
-# and the lite build (no default features: no search(), and nothing that writes
+# the lite build (no default features: no search(), and nothing that writes
 # an image: no joins, CTEs, subqueries, materialize, Parquet compiling or CSV
-# conversion) within LITE_BUDGET_GZ.
+# conversion) within LITE_BUDGET_GZ, and the sql build (lite with writing:
+# everything but search()) within SQL_BUDGET_GZ. All three ship.
 # The command's build (the full build plus the publishing commands: pack,
 # unpack, split, size reports) is built too and kept as facetful_cli.wasm
 # beside the others; no page downloads it, so it has no budget.
@@ -13,6 +14,7 @@ cd "$(dirname "$0")/.."
 
 BUDGET_GZ=${BUDGET_GZ:-512000}           # 500 KB (raised from 300 KB on 2026-09-30 for search)
 LITE_BUDGET_GZ=${LITE_BUDGET_GZ:-307200} # 300 KB: the lite build keeps the old budget
+SQL_BUDGET_GZ=${SQL_BUDGET_GZ:-358400}   # 350 KB: lite with joins, CTEs, subqueries and writing images
 
 WASM=target/wasm32-unknown-unknown/release/facetful_wasm.wasm
 status=0
@@ -49,7 +51,9 @@ check() { # <label> <budget> <cargo feature flags…>
     fi
 }
 
-check lite "$LITE_BUDGET_GZ" --no-default-features
-KEEP=${WASM%facetful_wasm.wasm}facetful_cli.wasm check command none --features publish
+DIR=${WASM%facetful_wasm.wasm}
+KEEP=${DIR}facetful_lite.wasm check lite "$LITE_BUDGET_GZ" --no-default-features
+KEEP=${DIR}facetful_sql.wasm check sql "$SQL_BUDGET_GZ" --no-default-features --features write
+KEEP=${DIR}facetful_cli.wasm check command none --features publish
 check full "$BUDGET_GZ"
 exit $status

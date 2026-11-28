@@ -1,7 +1,8 @@
 # facetful
 
-A tiny columnar SQL engine for browser faceting. Rust compiled to ~290 KB gz
-of WebAssembly, nothing else to load in the browser, running in a dedicated worker.
+A tiny columnar SQL engine for browser faceting. Rust compiled to 250–390 KB gz
+of WebAssembly (three builds, below), nothing else to load in the browser,
+running in a dedicated worker.
 
 Built for one job and fast at it: **exploring 100K–5M row datasets in the
 browser** — facet counts, pivots, top-k, filters — at interaction speed.
@@ -109,8 +110,29 @@ results are kept whole in the worker and sliced. `h.generation` counts
 sorts, and each page carries the value it was asked under, so a late page
 from before a sort can be dropped. Close a handle
 when its grid goes: 5 may be open at once (`maxHandles` at `open`), and
-`prepare` rejects beyond that, naming the open statements. It is in the
-lite build too. Design and measurements: `docs/result-handles.sv`.
+`prepare` rejects beyond that, naming the open statements. It is in every
+build, lite included. Design and measurements: `docs/result-handles.sv`.
+
+## Three builds: full, sql, lite
+
+The package carries three engines, and a page downloads only the one it
+opens:
+
+```js
+const db = await Facetful.open({ build: "lite" }); // "full" (the default), "sql" or "lite"
+db.build; // "lite"
+```
+
+| build | gzipped | has |
+|---|---|---|
+| `full` | about 390 KB | everything |
+| `sql` | about 300 KB | all but `search()`, `search_rank()` and the word index |
+| `lite` | about 250 KB | single-table queries over images, result handles, functions you register; no joins, CTEs, subqueries, `materialize`, Parquet or CSV |
+
+Calling what a build leaves out is an error naming the build that has it,
+such as `search() is not in this build (sql): use the full build`. Bundlers
+copy all three files, since each is written as its own `new URL(...)`; pass
+`wasmUrl` instead to serve one from elsewhere.
 
 ## The ways in
 
@@ -398,8 +420,9 @@ positions. Numbers may use exponents (`1e6`). Quote column names with spaces:
 ## Building the wasm from source
 
 The engine lives in the same repository (Rust workspace, zero dependencies).
-`scripts/build-package.sh` builds the wasm (with wasm-opt when available),
-copies it next to this package, and runs `npm pack`.
+`scripts/build-package.sh` builds the three wasm engines and the command's
+own (with wasm-opt when available), copies them next to this package, and
+runs `npm pack`.
 
 ## License
 

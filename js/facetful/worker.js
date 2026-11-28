@@ -337,7 +337,7 @@ self.onmessage = async (e) => {
         if (!Number.isInteger(e.data.maxHandles) || e.data.maxHandles < 1) throw new Error(`maxHandles must be a whole number of 1 or more, not ${e.data.maxHandles}`);
         maxHandles = e.data.maxHandles;
       }
-      reply({ ok: true });
+      reply({ ok: true, build: engine.build });
     } else if (cmd === "load") {
       const { handle, rows } = engine.openTable(e.data.buffer);
       setTable(e.data.name, handle);

@@ -4,7 +4,16 @@
 export type ColumnKind = "int" | "float" | "bool" | "text" | "date" | "timestamp";
 
 export interface OpenOptions {
-  /** URL of the engine wasm. Default: facetful_wasm.wasm next to the package. */
+  /**
+   * Which engine to load, gzipped size in brackets: "full" (about 390 KB)
+   * has everything; "sql" (about 300 KB) leaves out search() and the word
+   * index; "lite" (about 250 KB) also leaves out joins, CTEs, subqueries,
+   * materialize, Parquet and CSV, and runs single-table queries over
+   * images. Default "full". Calling what a build leaves out is an error
+   * naming the build that has it.
+   */
+  build?: "full" | "sql" | "lite";
+  /** URL of the engine wasm, instead of `build`'s file next to the package. */
   wasmUrl?: string | URL;
   /** URL of the worker module. Default: worker.js next to the package. */
   workerUrl?: string | URL;
@@ -145,6 +154,9 @@ export interface OpenParquetResult {
 export declare class Facetful {
   /** Start the engine (spawns the worker, instantiates wasm). */
   static open(options?: OpenOptions): Promise<Facetful>;
+
+  /** The engine build loaded: "full", "sql" or "lite". */
+  readonly build: "full" | "sql" | "lite";
 
   /** Load a .facetful image from an ArrayBuffer (transferred). */
   load(name: string, buffer: ArrayBuffer): Promise<LoadResult>;

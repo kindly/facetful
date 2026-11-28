@@ -136,7 +136,7 @@ facetful inspect data.facetful
 
 ```
 cargo test --workspace          # engine, format, SQL, differential vs sqlite3 (if on PATH)
-./scripts/size-check.sh         # wasm build + wasm-opt, enforces the size budgets (500 KB gz, lite 300 KB)
+./scripts/size-check.sh         # wasm build + wasm-opt, enforces the size budgets (gzipped: full 500 KB, sql 350 KB, lite 300 KB)
 ./scripts/build-package.sh      # the release gate: budget + smokes + differentials + npm pack
 node js/facetful/node-smoke.mjs # JS boundary protocol, compile round-trip
 ```

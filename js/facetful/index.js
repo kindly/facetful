@@ -9,7 +9,15 @@
 //   [...r.rows()]              // row objects, materialized lazily
 
 export class Facetful {
-  static async open({ wasmUrl, workerUrl, hyparquetUrl, udfs = true, maxHandles } = {}) {
+  static async open({ build = "full", wasmUrl, workerUrl, hyparquetUrl, udfs = true, maxHandles } = {}) {
+    // each build a literal `new URL(...)`, so bundlers copy all three and
+    // a page downloads only the one it asks for
+    if (!wasmUrl) {
+      if (build === "full") wasmUrl = new URL("./facetful_wasm.wasm", import.meta.url);
+      else if (build === "sql") wasmUrl = new URL("./facetful_sql.wasm", import.meta.url);
+      else if (build === "lite") wasmUrl = new URL("./facetful_lite.wasm", import.meta.url);
+      else throw new Error(`build: "full", "sql" or "lite", not ${JSON.stringify(build)}`);
+    }
     // the no-argument form must stay a literal `new Worker(new URL(...))`
     // expression: bundlers (Vite, webpack) statically analyze exactly that
     // pattern to compile the worker graph
@@ -17,13 +25,15 @@ export class Facetful {
       ? new Worker(workerUrl, { type: "module" })
       : new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     const db = new Facetful(worker);
-    await db._call({
+    const { build: loaded } = await db._call({
       cmd: "init",
-      wasmUrl: String(wasmUrl ?? new URL("./facetful_wasm.wasm", import.meta.url)),
+      wasmUrl: String(wasmUrl),
       hyparquetUrl,
       udfs,
       maxHandles,
     });
+    /** the build loaded: "full", "sql" or "lite" */
+    db.build = loaded;
     return db;
   }
 
