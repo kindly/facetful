@@ -10,7 +10,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
-
+      - run: cargo test -p facetful-engine --no-default-features
+      - run: cargo test -p facetful-engine --no-default-features --features write
   size:
     runs-on: ubuntu-latest
     steps:
